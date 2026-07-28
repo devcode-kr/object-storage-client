@@ -93,13 +93,36 @@ download directory — do not bypass it when adding download paths.
 throttled to ~5/sec per item. Each transfer is independent — one failure never stops the queue,
 which is what makes the failed/successful tabs meaningful.
 
-### Credential storage
+### Storage locations and the master password
 
-Profiles are JSON in the per-user config directory (`AppPaths`: `%APPDATA%` / `~/Library/
-Application Support` / `$XDG_CONFIG_HOME`). Secrets go through `ISecretProtector`; the default
-`AesGcmSecretProtector` encrypts with a machine-local key file. **This protects against casual
-disclosure, not against an attacker who can read the user's home directory** — the key lives
-there too. Replacing it with an OS-keychain implementation only requires a new `ISecretProtector`.
+Both files live in one fixed directory on every platform — `AppPaths.ConfigDirectory`, i.e.
+`$HOME/.devcode/object-storage-client/` (`%USERPROFILE%` on Windows). This deliberately ignores
+per-platform conventions so the directory can be moved between machines.
+
+| File | Contents |
+| --- | --- |
+| `sites.json` | Saved connections; credentials encrypted |
+| `config.json` | Preferences plus the master-password salt, iteration count and verifier |
+
+`MasterPasswordVault` derives a 32-byte AES key from the master password with PBKDF2-HMAC-SHA256
+(600k iterations). The key exists only in memory and the password is never written anywhere, so
+`config.json` cannot be used to recover it. `TryUnlock` proves a password by decrypting the
+`Verifier` blob — a wrong password fails the GCM tag check, which `AesGcmSecretProtector` reports
+as an empty string.
+
+**Startup order matters** and is why `App.OnFrameworkInitializationCompleted` does not build the
+container directly: `config.json` must be read, the password taken, and the key derived *before*
+`JsonConnectionProfileStore` can be constructed. `StartAsync` therefore runs
+`ShutdownMode.OnExplicitShutdown` while the gate window is up (otherwise closing it with no
+`MainWindow` would exit the app), then switches to `OnMainWindowClose`. Quitting at the prompt
+shuts the app down — there is no usable session without the key.
+
+If the user forgets the password, `MasterPasswordViewModel` offers a reset that creates a new
+vault and sets `DiscardedPreviousVault`; startup then deletes `sites.json`, whose secrets are no
+longer decryptable. The same path handles a `config.json` whose vault definition is corrupt.
+
+Note `MasterPasswordViewModel.OnPasswordChanged` clears `ErrorMessage`, so any code that both
+clears the password box and reports an error must clear the box **first**.
 
 ## Conventions specific to this codebase
 

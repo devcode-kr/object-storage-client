@@ -1,4 +1,5 @@
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Microsoft.Extensions.DependencyInjection;
@@ -6,6 +7,7 @@ using ObjectStorageClient.App.Services;
 using ObjectStorageClient.App.ViewModels;
 using ObjectStorageClient.App.Views;
 using ObjectStorageClient.Core.Abstractions;
+using ObjectStorageClient.Core.Models;
 using ObjectStorageClient.Core.Profiles;
 using ObjectStorageClient.Core.Storage;
 using ObjectStorageClient.Core.Transfers;
@@ -23,28 +25,74 @@ public partial class App : Application
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            ServiceCollection services = new();
-            ConfigureServices(services);
-            ServiceProvider provider = services.BuildServiceProvider();
-            Services = provider;
+            // The master-password window is shown before MainWindow exists, so the app must not
+            // treat "no main window" as a reason to exit while the user is still typing.
+            desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-            MainWindowViewModel viewModel = provider.GetRequiredService<MainWindowViewModel>();
-            desktop.MainWindow = new MainWindow { DataContext = viewModel };
-
-            // Tear the transfer queue and the live connection down before the process exits.
-            desktop.ShutdownRequested += async (_, _) =>
-            {
-                await viewModel.DisposeAsync().ConfigureAwait(false);
-                await provider.DisposeAsync().ConfigureAwait(false);
-            };
+            base.OnFrameworkInitializationCompleted();
+            _ = StartAsync(desktop);
+            return;
         }
 
         base.OnFrameworkInitializationCompleted();
     }
 
-    private static void ConfigureServices(IServiceCollection services)
+    /// <summary>
+    /// Startup sequence: load <c>config.json</c>, take the master password, derive the key,
+    /// and only then build the services that depend on it.
+    /// </summary>
+    private static async Task StartAsync(IClassicDesktopStyleApplicationLifetime desktop)
     {
-        services.AddSingleton<ISecretProtector>(_ => new AesGcmSecretProtector());
+        JsonAppSettingsStore settingsStore = new();
+        AppSettings settings = await settingsStore.LoadAsync().ConfigureAwait(true);
+
+        MasterPasswordViewModel gate = new(settings, AppPaths.ConfigDirectory);
+        MasterPasswordWindow gateWindow = new() { DataContext = gate };
+        gateWindow.Show();
+
+        MasterPasswordVault.UnlockedVault? vault = await gate.Completion.ConfigureAwait(true);
+
+        if (vault is null)
+        {
+            // The user quit at the password prompt; there is nothing to run without the key.
+            desktop.Shutdown();
+            return;
+        }
+
+        if (gate.DiscardedPreviousVault)
+        {
+            // The old sites.json is encrypted with a key nobody has any more.
+            DiscardUnreadableProfiles();
+        }
+
+        settings = settings with { MasterPassword = vault.Settings };
+        await settingsStore.SaveAsync(settings).ConfigureAwait(true);
+
+        ServiceProvider provider = BuildServices(settingsStore, vault.Protector);
+        Services = provider;
+
+        MainWindowViewModel viewModel = provider.GetRequiredService<MainWindowViewModel>();
+        await viewModel.ApplySettingsAsync(settings).ConfigureAwait(true);
+
+        MainWindow window = new() { DataContext = viewModel };
+        desktop.MainWindow = window;
+        desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+        window.Show();
+
+        desktop.ShutdownRequested += async (_, _) =>
+        {
+            await settingsStore.SaveAsync(viewModel.CaptureSettings(settings)).ConfigureAwait(false);
+            await viewModel.DisposeAsync().ConfigureAwait(false);
+            await provider.DisposeAsync().ConfigureAwait(false);
+        };
+    }
+
+    private static ServiceProvider BuildServices(IAppSettingsStore settingsStore, ISecretProtector protector)
+    {
+        ServiceCollection services = new();
+
+        services.AddSingleton(settingsStore);
+        services.AddSingleton(protector);
         services.AddSingleton<IConnectionProfileStore>(provider =>
             new JsonConnectionProfileStore(provider.GetRequiredService<ISecretProtector>()));
 
@@ -57,5 +105,22 @@ public partial class App : Application
 
         // Transient: the Site Manager gets a fresh editor every time it is opened.
         services.AddTransient<SiteManagerViewModel>();
+
+        return services.BuildServiceProvider();
+    }
+
+    private static void DiscardUnreadableProfiles()
+    {
+        try
+        {
+            if (File.Exists(AppPaths.ProfilesFile))
+            {
+                File.Delete(AppPaths.ProfilesFile);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Leaving the file in place is harmless: its secrets simply decrypt to empty.
+        }
     }
 }

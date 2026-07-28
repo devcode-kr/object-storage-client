@@ -23,6 +23,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
     private readonly IDialogService _dialogs;
 
     private IObjectStorageClient? _client;
+    private Guid? _lastSiteId;
 
     public MainWindowViewModel(
         IObjectStorageClientFactory clientFactory,
@@ -101,6 +102,29 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
         QuickEndpoint = value.BuildEndpoint(value.DefaultRegion, accountId: null);
     }
 
+    /// <summary>Applies persisted preferences from <c>config.json</c> at startup.</summary>
+    public Task ApplySettingsAsync(AppSettings settings)
+    {
+        Local.ShowHiddenFiles = settings.ShowHiddenFiles;
+
+        if (!string.IsNullOrWhiteSpace(settings.LastLocalDirectory) &&
+            Directory.Exists(settings.LastLocalDirectory))
+        {
+            Local.Navigate(settings.LastLocalDirectory);
+        }
+
+        _lastSiteId = settings.LastSiteId;
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Folds the current UI state back into <paramref name="settings"/> for saving on exit.</summary>
+    public AppSettings CaptureSettings(AppSettings settings) => settings with
+    {
+        LastLocalDirectory = Local.CurrentPath,
+        ShowHiddenFiles = Local.ShowHiddenFiles,
+        LastSiteId = _lastSiteId,
+    };
+
     [RelayCommand]
     private async Task QuickConnectAsync()
     {
@@ -155,6 +179,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
             }
 
             _client = client;
+            _lastSiteId = profile.Id;
             _queue.Attach(client, profile.MaxConcurrentTransfers);
 
             IsConnected = true;

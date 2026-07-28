@@ -13,9 +13,18 @@ public interface IConnectionProfileStore
     Task DeleteAsync(Guid id, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Persistence for application settings (<c>config.json</c>).</summary>
+public interface IAppSettingsStore
+{
+    /// <summary>Returns defaults when the file is missing or unreadable, never throws for those cases.</summary>
+    Task<AppSettings> LoadAsync(CancellationToken cancellationToken = default);
+
+    Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default);
+}
+
 /// <summary>
-/// Encrypts credentials at rest. The default implementation uses a machine-local AES-GCM key;
-/// an OS keychain implementation can be substituted without touching the store.
+/// Encrypts credentials at rest. The default implementation derives its AES-GCM key from the
+/// master password; an OS keychain implementation can be substituted without touching the store.
 /// </summary>
 public interface ISecretProtector
 {

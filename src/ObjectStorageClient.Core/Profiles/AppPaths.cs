@@ -3,34 +3,41 @@ using System.Runtime.InteropServices;
 namespace ObjectStorageClient.Core.Profiles;
 
 /// <summary>
-/// Per-user configuration locations, following each platform's convention:
-/// <c>%APPDATA%</c> on Windows, <c>~/Library/Application Support</c> on macOS,
-/// and <c>$XDG_CONFIG_HOME</c> (default <c>~/.config</c>) on Linux.
+/// On-disk locations for the two files the app owns, both under a single fixed directory:
+/// <c>$HOME/.devcode/object-storage-client/</c>.
 /// </summary>
+/// <remarks>
+/// The path is deliberately identical on Windows, Linux and macOS rather than following each
+/// platform's convention, so a profile directory can be moved or synced between machines and
+/// keep working. <c>$HOME</c> resolves to <c>%USERPROFILE%</c> on Windows.
+/// </remarks>
 public static class AppPaths
 {
-    public const string ApplicationFolderName = "ObjectStorageClient";
+    public const string VendorFolderName = ".devcode";
+
+    public const string ApplicationFolderName = "object-storage-client";
 
     public static string ConfigDirectory { get; } = ResolveConfigDirectory();
 
+    /// <summary>Saved connections shown in the Site Manager.</summary>
     public static string ProfilesFile => Path.Combine(ConfigDirectory, "sites.json");
 
-    public static string KeyFile => Path.Combine(ConfigDirectory, "secret.key");
+    /// <summary>Application settings, including the master-password key-derivation parameters.</summary>
+    public static string SettingsFile => Path.Combine(ConfigDirectory, "config.json");
 
     /// <summary>Creates the config directory, restricting it to the current user where the OS allows it.</summary>
     public static string EnsureConfigDirectory()
     {
         Directory.CreateDirectory(ConfigDirectory);
 
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            TryRestrictToOwner(ConfigDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        }
+        TryRestrictToOwner(
+            ConfigDirectory,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         return ConfigDirectory;
     }
 
-    /// <summary>Best-effort chmod 600/700. Silently ignored on filesystems that do not support it.</summary>
+    /// <summary>Best-effort chmod 600/700. Silently ignored on Windows and on filesystems without POSIX modes.</summary>
     public static void TryRestrictToOwner(string path, UnixFileMode mode)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -50,24 +57,14 @@ public static class AppPaths
 
     private static string ResolveConfigDirectory()
     {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        if (string.IsNullOrEmpty(home))
         {
-            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            return Path.Combine(home, "Library", "Application Support", ApplicationFolderName);
+            // Falls back only in unusual hosts (service accounts, some containers).
+            home = Environment.GetEnvironmentVariable("HOME") ?? Directory.GetCurrentDirectory();
         }
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-        {
-            string xdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME") ?? string.Empty;
-            string root = string.IsNullOrWhiteSpace(xdg)
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config")
-                : xdg;
-
-            return Path.Combine(root, ApplicationFolderName);
-        }
-
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            ApplicationFolderName);
+        return Path.Combine(home, VendorFolderName, ApplicationFolderName);
     }
 }

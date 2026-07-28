@@ -21,6 +21,8 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
   `*` / `?` wildcards.
 - **Site Manager** — saved connections with credentials encrypted at rest, plus a
   "Test connection" button.
+- **Master password** — asked for at every launch; credentials are encrypted under a key derived
+  from it, and the key is never written to disk.
 
 ## Requirements
 
@@ -64,21 +66,29 @@ dotnet publish src/ObjectStorageClient.App -c Release -r linux-x64 --self-contai
 dotnet publish src/ObjectStorageClient.App -c Release -r osx-arm64 --self-contained
 ```
 
+## Master password
+
+On first launch the app asks you to choose a master password; every launch after that asks for it
+again to decrypt your saved sites. The password is never stored — only a salt, an iteration count
+and a verifier blob are — so **there is no way to recover it.** If you forget it, the unlock
+screen offers to start over, which discards the saved sites along with the old key.
+
+Quitting at the password prompt closes the app: there is no usable session without the key.
+
 ## Where your data is stored
 
-Connection profiles live in the per-user configuration directory:
+Both files live in the same directory on every platform (`%USERPROFILE%` stands in for `$HOME`
+on Windows):
 
-| Platform | Location |
+| File | Contents |
 | --- | --- |
-| Windows | `%APPDATA%\ObjectStorageClient\sites.json` |
-| macOS | `~/Library/Application Support/ObjectStorageClient/sites.json` |
-| Linux | `$XDG_CONFIG_HOME/ObjectStorageClient/sites.json` (default `~/.config`) |
+| `$HOME/.devcode/object-storage-client/sites.json` | Saved connections from the Site Manager |
+| `$HOME/.devcode/object-storage-client/config.json` | Preferences and master-password parameters |
 
-Secret keys, session tokens and proxy passwords are encrypted with AES-256-GCM using a key file
-stored alongside them, with owner-only permissions where the OS supports it. This keeps
-credentials out of plaintext backups and sync folders, but it is **not** protection against an
-attacker who can already read your home directory — the key is there too. Integration with the
-OS keychain is a natural next step.
+Secret keys, session tokens and proxy passwords are encrypted with AES-256-GCM under a key
+derived from your master password using PBKDF2-HMAC-SHA256 (600,000 iterations). Both files are
+written with owner-only permissions where the OS supports it. Because the key never touches the
+disk, copying these files to another machine does not expose your credentials.
 
 ## Project layout
 

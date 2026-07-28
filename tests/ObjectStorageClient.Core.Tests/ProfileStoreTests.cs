@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using ObjectStorageClient.Core.Abstractions;
 using ObjectStorageClient.Core.Models;
 using ObjectStorageClient.Core.Profiles;
@@ -5,14 +6,14 @@ using Xunit;
 
 namespace ObjectStorageClient.Core.Tests;
 
-public sealed class AesGcmSecretProtectorTests : IDisposable
+public sealed class AesGcmSecretProtectorTests
 {
-    private readonly string _keyFile = Path.Combine(Path.GetTempPath(), $"osc-key-{Guid.NewGuid():N}.bin");
+    private static byte[] Key() => RandomNumberGenerator.GetBytes(AesGcmSecretProtector.KeySize);
 
     [Fact]
     public void ProtectThenUnprotect_RoundTrips()
     {
-        AesGcmSecretProtector protector = new(_keyFile);
+        AesGcmSecretProtector protector = new(Key());
 
         string protectedValue = protector.Protect("hunter2");
 
@@ -21,9 +22,18 @@ public sealed class AesGcmSecretProtectorTests : IDisposable
     }
 
     [Fact]
+    public void Protect_ProducesADifferentCiphertextEachTime()
+    {
+        AesGcmSecretProtector protector = new(Key());
+
+        // A fresh nonce per call: identical secrets must not be recognisable on disk.
+        Assert.NotEqual(protector.Protect("same"), protector.Protect("same"));
+    }
+
+    [Fact]
     public void Protect_ReturnsEmptyForEmptyInput()
     {
-        AesGcmSecretProtector protector = new(_keyFile);
+        AesGcmSecretProtector protector = new(Key());
 
         Assert.Empty(protector.Protect(string.Empty));
         Assert.Empty(protector.Unprotect(string.Empty));
@@ -32,30 +42,135 @@ public sealed class AesGcmSecretProtectorTests : IDisposable
     [Fact]
     public void Unprotect_ReturnsEmptyRatherThanThrowingOnCorruptedInput()
     {
-        AesGcmSecretProtector protector = new(_keyFile);
+        AesGcmSecretProtector protector = new(Key());
 
         Assert.Empty(protector.Unprotect("not-base64!"));
         Assert.Empty(protector.Unprotect(Convert.ToBase64String([1, 2, 3])));
     }
 
     [Fact]
-    public void Unprotect_ReturnsEmptyWhenTheValueWasEncryptedWithAnotherKey()
+    public void Unprotect_ReturnsEmptyUnderADifferentKey()
     {
-        string otherKeyFile = Path.Combine(Path.GetTempPath(), $"osc-key-{Guid.NewGuid():N}.bin");
+        string protectedValue = new AesGcmSecretProtector(Key()).Protect("hunter2");
 
-        try
-        {
-            string protectedValue = new AesGcmSecretProtector(_keyFile).Protect("hunter2");
-
-            Assert.Empty(new AesGcmSecretProtector(otherKeyFile).Unprotect(protectedValue));
-        }
-        finally
-        {
-            File.Delete(otherKeyFile);
-        }
+        Assert.Empty(new AesGcmSecretProtector(Key()).Unprotect(protectedValue));
     }
 
-    public void Dispose() => File.Delete(_keyFile);
+    [Theory]
+    [InlineData(0)]
+    [InlineData(16)]
+    [InlineData(64)]
+    public void Constructor_RejectsKeysThatAreNotAes256(int length) =>
+        Assert.Throws<ArgumentException>(() => new AesGcmSecretProtector(new byte[length]));
+}
+
+public sealed class MasterPasswordVaultTests
+{
+    // Real vaults use 600k PBKDF2 iterations; tests use a token count to stay fast.
+    private const int TestIterations = 1_000;
+
+    [Fact]
+    public void Create_ProducesAUsableVaultDefinition()
+    {
+        MasterPasswordVault.UnlockedVault vault = MasterPasswordVault.Create("correct horse", TestIterations);
+
+        Assert.True(vault.Settings.IsConfigured);
+        Assert.True(MasterPasswordVault.IsUsable(vault.Settings));
+        Assert.Equal(TestIterations, vault.Settings.Iterations);
+        Assert.NotEmpty(vault.Settings.Salt);
+        Assert.NotEmpty(vault.Settings.Verifier);
+    }
+
+    [Fact]
+    public void Create_NeverStoresThePasswordItself()
+    {
+        MasterPasswordVault.UnlockedVault vault = MasterPasswordVault.Create("correct horse", TestIterations);
+
+        string serialized = vault.Settings.Salt + vault.Settings.Verifier;
+        Assert.DoesNotContain("correct horse", serialized, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Create_UsesAFreshSaltPerVault()
+    {
+        MasterPasswordVault.UnlockedVault first = MasterPasswordVault.Create("same password", TestIterations);
+        MasterPasswordVault.UnlockedVault second = MasterPasswordVault.Create("same password", TestIterations);
+
+        Assert.NotEqual(first.Settings.Salt, second.Settings.Salt);
+    }
+
+    [Fact]
+    public void TryUnlock_ReturnsAWorkingProtectorForTheCorrectPassword()
+    {
+        MasterPasswordVault.UnlockedVault created = MasterPasswordVault.Create("correct horse", TestIterations);
+        string ciphertext = created.Protector.Protect("my-secret-key");
+
+        MasterPasswordVault.UnlockedVault? unlocked =
+            MasterPasswordVault.TryUnlock("correct horse", created.Settings, out bool isUsable);
+
+        Assert.True(isUsable);
+        Assert.NotNull(unlocked);
+        Assert.Equal("my-secret-key", unlocked!.Protector.Unprotect(ciphertext));
+    }
+
+    [Fact]
+    public void TryUnlock_ReturnsNullForTheWrongPassword()
+    {
+        MasterPasswordVault.UnlockedVault created = MasterPasswordVault.Create("correct horse", TestIterations);
+
+        Assert.Null(MasterPasswordVault.TryUnlock("battery staple", created.Settings, out bool isUsable));
+        Assert.True(isUsable);
+    }
+
+    [Fact]
+    public void TryUnlock_ReturnsNullForAnEmptyPassword()
+    {
+        MasterPasswordVault.UnlockedVault created = MasterPasswordVault.Create("correct horse", TestIterations);
+
+        Assert.Null(MasterPasswordVault.TryUnlock(string.Empty, created.Settings, out _));
+    }
+
+    [Fact]
+    public void TryUnlock_ReportsAnUnconfiguredVaultAsUnusable()
+    {
+        Assert.Null(MasterPasswordVault.TryUnlock("anything", new MasterPasswordSettings(), out bool isUsable));
+        Assert.False(isUsable);
+    }
+
+    [Fact]
+    public void TryUnlock_ReportsACorruptedSaltAsUnusableRatherThanThrowing()
+    {
+        MasterPasswordVault.UnlockedVault created = MasterPasswordVault.Create("correct horse", TestIterations);
+        MasterPasswordSettings broken = created.Settings with { Salt = "not-base64!" };
+
+        Assert.Null(MasterPasswordVault.TryUnlock("correct horse", broken, out bool isUsable));
+        Assert.False(isUsable);
+    }
+
+    [Theory]
+    [InlineData("", 1000, "verifier")]
+    [InlineData("c2FsdA==", 0, "verifier")]
+    [InlineData("c2FsdA==", 1000, "")]
+    public void IsUsable_RequiresEveryVaultField(string salt, int iterations, string verifier)
+    {
+        MasterPasswordSettings settings = new()
+        {
+            IsConfigured = true,
+            Salt = salt,
+            Iterations = iterations,
+            Verifier = verifier,
+        };
+
+        Assert.False(MasterPasswordVault.IsUsable(settings));
+    }
+
+    [Fact]
+    public void Create_RejectsABlankPassword() =>
+        Assert.Throws<ArgumentException>(() => MasterPasswordVault.Create("   ", TestIterations));
+
+    [Fact]
+    public void Reset_ClearsTheVaultDefinition() =>
+        Assert.False(MasterPasswordVault.IsUsable(MasterPasswordVault.Reset()));
 }
 
 public sealed class JsonConnectionProfileStoreTests : IDisposable
@@ -68,7 +183,7 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
     {
         Directory.CreateDirectory(_directory);
         _file = Path.Combine(_directory, "sites.json");
-        _protector = new AesGcmSecretProtector(Path.Combine(_directory, "secret.key"));
+        _protector = MasterPasswordVault.Create("test-master-password", iterations: 1_000).Protector;
     }
 
     private JsonConnectionProfileStore CreateStore() => new(_protector, _file);
@@ -119,6 +234,19 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         // Non-secret fields stay readable, which is what makes the file diffable and portable.
         Assert.Contains("MinIO dev", json, StringComparison.Ordinal);
         Assert.Contains("minioadmin", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadAsync_YieldsEmptySecretsUnderADifferentMasterPassword()
+    {
+        await CreateStore().SaveAsync(SampleProfile());
+
+        ISecretProtector otherProtector = MasterPasswordVault.Create("a-different-password", 1_000).Protector;
+        ConnectionProfile actual = Assert.Single(await new JsonConnectionProfileStore(otherProtector, _file).LoadAsync());
+
+        Assert.Empty(actual.SecretAccessKey);
+        Assert.Empty(actual.Proxy.Password);
+        Assert.Equal("MinIO dev", actual.Name);
     }
 
     [Fact]
