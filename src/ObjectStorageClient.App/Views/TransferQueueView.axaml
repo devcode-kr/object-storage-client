@@ -1,0 +1,71 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ObjectStorageClient.App.ViewModels"
+             x:Class="ObjectStorageClient.App.Views.TransferQueueView"
+             x:DataType="vm:TransferQueueViewModel">
+
+  <Border Classes="pane">
+    <Grid RowDefinitions="Auto,*">
+
+      <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6" Margin="6,4">
+        <Button Content="Cancel selected" Command="{Binding CancelSelectedCommand}" />
+        <Button Content="Cancel all" Command="{Binding CancelAllCommand}" />
+        <Button Content="Retry selected" Command="{Binding RetrySelectedCommand}" />
+        <Button Content="Retry all failed" Command="{Binding RetryAllFailedCommand}" />
+        <Button Content="Clear finished" Command="{Binding ClearFinishedCommand}" />
+      </StackPanel>
+
+      <TabControl Grid.Row="1" Padding="0">
+        <TabItem Header="{Binding ActiveHeader}">
+          <DataGrid ItemsSource="{Binding Active}"
+                    SelectedItem="{Binding SelectedItem, Mode=TwoWay}"
+                    SelectionMode="Single">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="" Width="30" Binding="{Binding DirectionGlyph}" />
+              <DataGridTextColumn Header="Local file" Width="2*" Binding="{Binding LocalPath}" />
+              <DataGridTextColumn Header="Remote file" Width="2*" Binding="{Binding RemotePath}" />
+              <DataGridTextColumn Header="Size" Width="150" Binding="{Binding SizeText}" />
+              <DataGridTemplateColumn Header="Progress" Width="140">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate x:DataType="vm:TransferItemViewModel">
+                    <ProgressBar Value="{Binding Percentage}" Maximum="100"
+                                 Height="12" Margin="4,0" VerticalAlignment="Center" />
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
+              <DataGridTextColumn Header="Status" Width="100" Binding="{Binding StatusText}" />
+            </DataGrid.Columns>
+          </DataGrid>
+        </TabItem>
+
+        <TabItem Header="{Binding FailedHeader}">
+          <DataGrid ItemsSource="{Binding Failed}"
+                    SelectedItem="{Binding SelectedItem, Mode=TwoWay}"
+                    SelectionMode="Single">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="" Width="30" Binding="{Binding DirectionGlyph}" />
+              <DataGridTextColumn Header="Local file" Width="*" Binding="{Binding LocalPath}" />
+              <DataGridTextColumn Header="Remote file" Width="*" Binding="{Binding RemotePath}" />
+              <DataGridTextColumn Header="Status" Width="100" Binding="{Binding StatusText}" />
+              <DataGridTextColumn Header="Reason" Width="2*" Binding="{Binding ErrorMessage}" />
+            </DataGrid.Columns>
+          </DataGrid>
+        </TabItem>
+
+        <TabItem Header="{Binding SuccessfulHeader}">
+          <DataGrid ItemsSource="{Binding Successful}"
+                    SelectedItem="{Binding SelectedItem, Mode=TwoWay}"
+                    SelectionMode="Single">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="" Width="30" Binding="{Binding DirectionGlyph}" />
+              <DataGridTextColumn Header="Local file" Width="2*" Binding="{Binding LocalPath}" />
+              <DataGridTextColumn Header="Remote file" Width="2*" Binding="{Binding RemotePath}" />
+              <DataGridTextColumn Header="Size" Width="150" Binding="{Binding SizeText}" />
+            </DataGrid.Columns>
+          </DataGrid>
+        </TabItem>
+      </TabControl>
+    </Grid>
+  </Border>
+
+</UserControl>

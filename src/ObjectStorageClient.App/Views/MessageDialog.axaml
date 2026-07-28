@@ -1,0 +1,33 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ObjectStorageClient.App.ViewModels"
+        x:Class="ObjectStorageClient.App.Views.MessageDialog"
+        x:DataType="vm:MessageDialogViewModel"
+        Title="{Binding Title}"
+        Width="440"
+        SizeToContent="Height"
+        MinHeight="150"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False"
+        ShowInTaskbar="False">
+
+  <StackPanel Margin="20" Spacing="14">
+    <TextBlock Text="{Binding Message}" TextWrapping="Wrap" />
+
+    <TextBox Text="{Binding InputText, Mode=TwoWay}"
+             IsVisible="{Binding ShowInput}"
+             x:Name="InputBox" />
+
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button Content="Cancel"
+              IsVisible="{Binding ShowCancel}"
+              IsCancel="True"
+              Command="{Binding CancelCommand}" />
+      <Button Content="{Binding AcceptText}"
+              IsDefault="True"
+              Classes="accent"
+              Command="{Binding AcceptCommand}" />
+    </StackPanel>
+  </StackPanel>
+
+</Window>

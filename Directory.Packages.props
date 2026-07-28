@@ -1,0 +1,42 @@
+<Project>
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <!--
+      Pinned to the 11.3 line: Avalonia 12's Roslyn analyzers require the .NET 10 SDK
+      (compiler 4.14), while this repo targets the .NET 9 SDK. See CLAUDE.md for the
+      upgrade path.
+    -->
+    <AvaloniaVersion>11.3.18</AvaloniaVersion>
+    <AvaloniaDataGridVersion>11.3.13</AvaloniaDataGridVersion>
+  </PropertyGroup>
+
+  <ItemGroup Label="UI">
+    <PackageVersion Include="Avalonia" Version="$(AvaloniaVersion)" />
+    <PackageVersion Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
+    <PackageVersion Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
+    <PackageVersion Include="Avalonia.Fonts.Inter" Version="$(AvaloniaVersion)" />
+    <PackageVersion Include="Avalonia.Controls.DataGrid" Version="$(AvaloniaDataGridVersion)" />
+    <PackageVersion Include="Avalonia.Headless.XUnit" Version="$(AvaloniaVersion)" />
+    <PackageVersion Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+
+  <ItemGroup Label="Storage">
+    <PackageVersion Include="AWSSDK.S3" Version="4.0.101.5" />
+  </ItemGroup>
+
+  <ItemGroup Label="Platform">
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="9.0.18" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="9.0.18" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.18" />
+  </ItemGroup>
+
+  <ItemGroup Label="Testing">
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,85 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ObjectStorageClient.App.ViewModels"
+             xmlns:local="using:ObjectStorageClient.Core.Local"
+             xmlns:conv="using:ObjectStorageClient.App.Converters"
+             x:Class="ObjectStorageClient.App.Views.LocalPaneView"
+             x:DataType="vm:LocalBrowserViewModel">
+
+  <UserControl.Resources>
+    <conv:ByteSizeConverter x:Key="ByteSize" />
+  </UserControl.Resources>
+
+  <Border Classes="pane">
+    <Grid RowDefinitions="Auto,Auto,*,Auto">
+
+      <TextBlock Grid.Row="0" Classes="paneHeader" Text="Local site" />
+
+      <!-- Root selector plus the editable current path, as in FileZilla's local pane. -->
+      <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto,Auto" Margin="6,0,6,6" ColumnSpacing="4">
+        <ComboBox Grid.Column="0"
+                  Width="110"
+                  ItemsSource="{Binding Roots}"
+                  SelectionChanged="OnRootSelected"
+                  PlaceholderText="Roots">
+          <ComboBox.ItemTemplate>
+            <DataTemplate x:DataType="local:LocalEntry">
+              <TextBlock Text="{Binding Name}" />
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+
+        <TextBox Grid.Column="1"
+                 Text="{Binding CurrentPath, Mode=TwoWay}"
+                 KeyDown="OnPathKeyDown"
+                 ToolTip.Tip="Type a path and press Enter" />
+
+        <Button Grid.Column="2" Content="↑" ToolTip.Tip="Parent directory"
+                Command="{Binding NavigateUpCommand}" />
+        <Button Grid.Column="3" Content="⟳" ToolTip.Tip="Refresh"
+                Command="{Binding RefreshCommand}" />
+      </Grid>
+
+      <DataGrid Grid.Row="2"
+                x:Name="EntryGrid"
+                ItemsSource="{Binding Entries}"
+                SelectionChanged="OnSelectionChanged"
+                DoubleTapped="OnDoubleTapped">
+        <DataGrid.ContextMenu>
+          <ContextMenu>
+            <MenuItem Header="Upload" Command="{Binding UploadCommand}" />
+            <Separator />
+            <MenuItem Header="Create directory…" Command="{Binding CreateDirectoryCommand}" />
+            <MenuItem Header="Delete" Command="{Binding DeleteSelectedCommand}" />
+            <Separator />
+            <MenuItem Header="Refresh" Command="{Binding RefreshCommand}" />
+            <MenuItem Header="Show hidden files"
+                      ToggleType="CheckBox"
+                      IsChecked="{Binding ShowHiddenFiles, Mode=TwoWay}" />
+          </ContextMenu>
+        </DataGrid.ContextMenu>
+
+        <DataGrid.Columns>
+          <DataGridTemplateColumn Header="Filename" Width="2*">
+            <DataGridTemplateColumn.CellTemplate>
+              <DataTemplate x:DataType="local:LocalEntry">
+                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" Margin="4,0">
+                  <TextBlock Text="{Binding IsDirectory, Converter={x:Static conv:GlyphConverters.DirectoryGlyph}}" />
+                  <TextBlock Text="{Binding Name}" />
+                </StackPanel>
+              </DataTemplate>
+            </DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+
+          <DataGridTextColumn Header="Size" Width="90"
+                              Binding="{Binding Size, Converter={StaticResource ByteSize}}" />
+          <DataGridTextColumn Header="Modified" Width="150"
+                              Binding="{Binding LastModified, StringFormat='{}{0:yyyy-MM-dd HH:mm}'}" />
+        </DataGrid.Columns>
+      </DataGrid>
+
+      <TextBlock Grid.Row="3" Margin="6,4" Classes="hint" Text="{Binding StatusText}" />
+    </Grid>
+  </Border>
+
+</UserControl>

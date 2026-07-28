@@ -1,0 +1,130 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ObjectStorageClient.App.ViewModels"
+        xmlns:models="using:ObjectStorageClient.Core.Models"
+        xmlns:views="using:ObjectStorageClient.App.Views"
+        x:Class="ObjectStorageClient.App.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{Binding ConnectionTitle, StringFormat='Object Storage Client — {0}'}"
+        Width="1280" Height="820"
+        MinWidth="900" MinHeight="600"
+        WindowStartupLocation="CenterScreen">
+
+  <!--
+    FileZilla-style shell, top to bottom:
+      menu / toolbar / quickconnect / message log / [local | remote] / transfer queue / status bar
+  -->
+  <Grid RowDefinitions="Auto,Auto,Auto,140,4,*,4,190,Auto">
+
+    <Menu Grid.Row="0">
+      <MenuItem Header="_File">
+        <MenuItem Header="Site Manager…" Command="{Binding OpenSiteManagerCommand}" InputGesture="Ctrl+S" />
+        <Separator />
+        <MenuItem Header="Disconnect" Command="{Binding DisconnectCommand}" />
+        <Separator />
+        <MenuItem Header="Exit" Command="{Binding ExitCommand}" />
+      </MenuItem>
+      <MenuItem Header="_Server">
+        <MenuItem Header="Refresh remote listing" Command="{Binding Remote.RefreshCommand}" />
+        <MenuItem Header="Create remote directory…" Command="{Binding Remote.CreateFolderCommand}" />
+      </MenuItem>
+      <MenuItem Header="_Transfer">
+        <MenuItem Header="Cancel all transfers" Command="{Binding Transfers.CancelAllCommand}" />
+        <MenuItem Header="Retry all failed" Command="{Binding Transfers.RetryAllFailedCommand}" />
+        <MenuItem Header="Clear finished" Command="{Binding Transfers.ClearFinishedCommand}" />
+      </MenuItem>
+      <MenuItem Header="_View">
+        <MenuItem Header="Clear message log" Command="{Binding ClearLogCommand}" />
+        <MenuItem Header="Show hidden local files"
+                  ToggleType="CheckBox"
+                  IsChecked="{Binding Local.ShowHiddenFiles, Mode=TwoWay}" />
+      </MenuItem>
+    </Menu>
+
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="6,4">
+      <Button Content="Site Manager" Command="{Binding OpenSiteManagerCommand}" />
+      <Button Content="Disconnect" Command="{Binding DisconnectCommand}" IsEnabled="{Binding IsConnected}" />
+      <Separator />
+      <Button Content="Refresh" Command="{Binding Remote.RefreshCommand}" IsEnabled="{Binding IsConnected}" />
+      <Button Content="Cancel transfers" Command="{Binding Transfers.CancelAllCommand}" />
+    </StackPanel>
+
+    <!-- Quickconnect: a preset seeds these fields, and every one of them stays editable. -->
+    <Border Grid.Row="2" Padding="6,4" Background="{DynamicResource SystemControlBackgroundListLowBrush}">
+      <Grid ColumnDefinitions="Auto,150,Auto,*,Auto,130,Auto,140,Auto,140,Auto,120,Auto"
+            ColumnSpacing="4">
+        <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Provider:" />
+        <ComboBox Grid.Column="1"
+                  ItemsSource="{Binding Providers}"
+                  SelectedItem="{Binding SelectedProvider, Mode=TwoWay}">
+          <ComboBox.ItemTemplate>
+            <DataTemplate x:DataType="models:StorageProviderPreset">
+              <TextBlock Text="{Binding DisplayName}" />
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+
+        <TextBlock Grid.Column="2" Classes="fieldLabel" Text="Endpoint:" />
+        <TextBox Grid.Column="3" Text="{Binding QuickEndpoint, Mode=TwoWay}"
+                 Watermark="https://s3.example.com" />
+
+        <TextBlock Grid.Column="4" Classes="fieldLabel" Text="Region:" />
+        <TextBox Grid.Column="5" Text="{Binding QuickRegion, Mode=TwoWay}" />
+
+        <TextBlock Grid.Column="6" Classes="fieldLabel" Text="Access key:" />
+        <TextBox Grid.Column="7" Text="{Binding QuickAccessKey, Mode=TwoWay}" />
+
+        <TextBlock Grid.Column="8" Classes="fieldLabel" Text="Secret:" />
+        <TextBox Grid.Column="9" Text="{Binding QuickSecretKey, Mode=TwoWay}" PasswordChar="•" />
+
+        <TextBlock Grid.Column="10" Classes="fieldLabel" Text="Bucket:" />
+        <TextBox Grid.Column="11" Text="{Binding QuickBucket, Mode=TwoWay}" />
+
+        <Button Grid.Column="12" Content="Quickconnect"
+                Classes="accent"
+                Command="{Binding QuickConnectCommand}"
+                IsEnabled="{Binding !IsConnecting}" />
+      </Grid>
+    </Border>
+
+    <!-- Message log -->
+    <Border Grid.Row="3" Classes="pane" Margin="6,4,6,0">
+      <ScrollViewer x:Name="LogScroller">
+        <ItemsControl ItemsSource="{Binding Log.Entries}" Margin="6,4">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate x:DataType="vm:LogEntry">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="{Binding TimeText}" Classes="log" Opacity="0.6" />
+                <TextBlock Text="{Binding Message}" Classes="log" TextWrapping="Wrap"
+                           Classes.command="{Binding Level, Converter={x:Static vm:LogLevelConverters.IsCommand}}"
+                           Classes.response="{Binding Level, Converter={x:Static vm:LogLevelConverters.IsResponse}}"
+                           Classes.error="{Binding Level, Converter={x:Static vm:LogLevelConverters.IsError}}" />
+              </StackPanel>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </ScrollViewer>
+    </Border>
+
+    <GridSplitter Grid.Row="4" ResizeDirection="Rows" Background="Transparent" />
+
+    <!-- File panes -->
+    <Grid Grid.Row="5" ColumnDefinitions="*,4,*" Margin="6,0">
+      <views:LocalPaneView Grid.Column="0" DataContext="{Binding Local}" MinWidth="320" />
+      <GridSplitter Grid.Column="1" ResizeDirection="Columns" Background="Transparent" />
+      <views:RemotePaneView Grid.Column="2" DataContext="{Binding Remote}" MinWidth="320" />
+    </Grid>
+
+    <GridSplitter Grid.Row="6" ResizeDirection="Rows" Background="Transparent" />
+
+    <views:TransferQueueView Grid.Row="7" DataContext="{Binding Transfers}" Margin="6,0,6,4" />
+
+    <Border Grid.Row="8" Padding="8,3" Background="{DynamicResource SystemControlBackgroundListLowBrush}">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Grid.Column="0" Text="{Binding StatusText}" VerticalAlignment="Center" />
+        <TextBlock Grid.Column="1" Text="{Binding ConnectionTitle}" VerticalAlignment="Center" Opacity="0.7" />
+      </Grid>
+    </Border>
+  </Grid>
+
+</Window>

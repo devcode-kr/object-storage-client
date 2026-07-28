@@ -1,0 +1,38 @@
+## .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+*.suo
+*.userprefs
+project.lock.json
+project.fragment.lock.json
+
+## Publish output
+publish/
+*.nupkg
+*.snupkg
+
+## Test / coverage
+TestResults/
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.trx
+
+## IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.DS_Store
+
+## Rider
+_ReSharper*/
+*.DotSettings.user
+
+## Local tooling state
+.omc/

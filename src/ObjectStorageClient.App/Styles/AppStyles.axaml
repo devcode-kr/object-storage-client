@@ -1,0 +1,63 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Message log rows: colour by severity, the way an FTP client colours its log. -->
+  <Style Selector="TextBlock.log">
+    <Setter Property="FontFamily" Value="Consolas, Menlo, DejaVu Sans Mono, monospace" />
+    <Setter Property="FontSize" Value="12" />
+  </Style>
+
+  <Style Selector="TextBlock.log.command">
+    <Setter Property="Foreground" Value="#1B6AC9" />
+  </Style>
+
+  <Style Selector="TextBlock.log.response">
+    <Setter Property="Foreground" Value="#1E7B34" />
+  </Style>
+
+  <Style Selector="TextBlock.log.error">
+    <Setter Property="Foreground" Value="#C42B1C" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <!-- Pane chrome shared by the local and remote halves. -->
+  <Style Selector="Border.pane">
+    <Setter Property="BorderBrush" Value="{DynamicResource SystemControlForegroundBaseLowBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="3" />
+  </Style>
+
+  <Style Selector="TextBlock.paneHeader">
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="Margin" Value="6,4" />
+  </Style>
+
+  <Style Selector="TextBlock.fieldLabel">
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="Margin" Value="0,0,6,0" />
+  </Style>
+
+  <Style Selector="TextBlock.hint">
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="Opacity" Value="0.7" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+  </Style>
+
+  <Style Selector="TextBlock.sectionHeader">
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="Margin" Value="0,12,0,4" />
+  </Style>
+
+  <Style Selector="DataGrid">
+    <Setter Property="GridLinesVisibility" Value="Horizontal" />
+    <Setter Property="HeadersVisibility" Value="Column" />
+    <Setter Property="IsReadOnly" Value="True" />
+    <Setter Property="CanUserReorderColumns" Value="True" />
+    <Setter Property="CanUserResizeColumns" Value="True" />
+    <Setter Property="CanUserSortColumns" Value="True" />
+    <Setter Property="SelectionMode" Value="Extended" />
+    <Setter Property="RowHeight" Value="22" />
+    <Setter Property="FontSize" Value="12" />
+  </Style>
+
+</Styles>

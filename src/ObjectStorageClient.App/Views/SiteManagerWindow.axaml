@@ -1,0 +1,176 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ObjectStorageClient.App.ViewModels"
+        xmlns:models="using:ObjectStorageClient.Core.Models"
+        x:Class="ObjectStorageClient.App.Views.SiteManagerWindow"
+        x:DataType="vm:SiteManagerViewModel"
+        Title="Site Manager"
+        Width="900" Height="660"
+        MinWidth="760" MinHeight="560"
+        WindowStartupLocation="CenterOwner">
+
+  <Grid RowDefinitions="*,Auto" Margin="12">
+
+    <Grid Grid.Row="0" ColumnDefinitions="240,4,*">
+
+      <!-- Saved sites -->
+      <Grid Grid.Column="0" RowDefinitions="Auto,*,Auto">
+        <TextBlock Grid.Row="0" Classes="paneHeader" Text="Saved sites" />
+        <ListBox Grid.Row="1"
+                 ItemsSource="{Binding Sites}"
+                 SelectedItem="{Binding SelectedSite, Mode=TwoWay}">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="models:ConnectionProfile">
+              <StackPanel Margin="0,2">
+                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding ServiceUrl}" Classes="hint" />
+              </StackPanel>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="4" Margin="0,6,0,0">
+          <Button Content="New" Command="{Binding NewSiteCommand}" />
+          <Button Content="Duplicate" Command="{Binding DuplicateSiteCommand}" />
+          <Button Content="Delete" Command="{Binding DeleteSiteCommand}" />
+        </StackPanel>
+      </Grid>
+
+      <GridSplitter Grid.Column="1" ResizeDirection="Columns" Background="Transparent" />
+
+      <!-- Connection form. Presets only seed these fields; all of them stay editable. -->
+      <ScrollViewer Grid.Column="2" Margin="8,0,0,0">
+        <StackPanel DataContext="{Binding Editor}" x:DataType="vm:ConnectionEditorViewModel" Spacing="4">
+
+          <TextBlock Classes="sectionHeader" Text="General" Margin="0,0,0,4" />
+
+          <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto"
+                ColumnSpacing="8" RowSpacing="6">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Site name" />
+            <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Name, Mode=TwoWay}" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Provider" />
+            <ComboBox Grid.Row="1" Grid.Column="1"
+                      HorizontalAlignment="Stretch"
+                      ItemsSource="{Binding Providers}"
+                      SelectedItem="{Binding SelectedProvider, Mode=TwoWay}">
+              <ComboBox.ItemTemplate>
+                <DataTemplate x:DataType="models:StorageProviderPreset">
+                  <TextBlock Text="{Binding DisplayName}" />
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Account ID"
+                       IsVisible="{Binding ShowAccountId}" />
+            <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding AccountId, Mode=TwoWay}"
+                     IsVisible="{Binding ShowAccountId}" />
+
+            <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Endpoint URL" />
+            <StackPanel Grid.Row="3" Grid.Column="1" Spacing="2">
+              <TextBox Text="{Binding ServiceUrl, Mode=TwoWay}" Watermark="https://s3.example.com" />
+              <TextBlock Classes="hint" Text="{Binding EndpointHint}" />
+            </StackPanel>
+
+            <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Region" />
+            <ComboBox Grid.Row="4" Grid.Column="1"
+                      HorizontalAlignment="Stretch"
+                      IsEditable="True"
+                      ItemsSource="{Binding SuggestedRegions}"
+                      Text="{Binding Region, Mode=TwoWay}" />
+
+            <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Default bucket" />
+            <Grid Grid.Row="5" Grid.Column="1" ColumnDefinitions="*,8,*">
+              <TextBox Grid.Column="0" Text="{Binding DefaultBucket, Mode=TwoWay}" Watermark="optional" />
+              <TextBox Grid.Column="2" Text="{Binding DefaultPrefix, Mode=TwoWay}" Watermark="default prefix (optional)" />
+            </Grid>
+          </Grid>
+
+          <TextBlock Classes="sectionHeader" Text="Credentials" />
+
+          <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="8" RowSpacing="6">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Access key ID" />
+            <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding AccessKeyId, Mode=TwoWay}" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Secret access key" />
+            <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding SecretAccessKey, Mode=TwoWay}" PasswordChar="•" />
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Session token" />
+            <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding SessionToken, Mode=TwoWay}"
+                     Watermark="optional (STS temporary credentials)" />
+          </Grid>
+
+          <TextBlock Classes="sectionHeader" Text="Proxy (optional)" />
+
+          <CheckBox Content="Connect through an HTTP proxy" IsChecked="{Binding ProxyEnabled, Mode=TwoWay}" />
+
+          <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto"
+                ColumnSpacing="8" RowSpacing="6"
+                IsEnabled="{Binding ProxyEnabled}">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Host / port" />
+            <Grid Grid.Row="0" Grid.Column="1" ColumnDefinitions="*,8,90">
+              <TextBox Grid.Column="0" Text="{Binding ProxyHost, Mode=TwoWay}" Watermark="proxy.example.com" />
+              <NumericUpDown Grid.Column="2" Value="{Binding ProxyPort, Mode=TwoWay}"
+                             Minimum="1" Maximum="65535" FormatString="0" ShowButtonSpinner="False" />
+            </Grid>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Credentials" />
+            <Grid Grid.Row="1" Grid.Column="1" ColumnDefinitions="*,8,*">
+              <TextBox Grid.Column="0" Text="{Binding ProxyUsername, Mode=TwoWay}" Watermark="username (optional)" />
+              <TextBox Grid.Column="2" Text="{Binding ProxyPassword, Mode=TwoWay}"
+                       PasswordChar="•" Watermark="password (optional)" />
+            </Grid>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Bypass for" />
+            <StackPanel Grid.Row="2" Grid.Column="1" Spacing="2">
+              <TextBox Text="{Binding ProxyBypassList, Mode=TwoWay}" Watermark="localhost;127.0.0.1;*.internal" />
+              <TextBlock Classes="hint" Text="Semicolon-separated host patterns. Wildcards * and ? are supported." />
+            </StackPanel>
+          </Grid>
+
+          <TextBlock Classes="sectionHeader" Text="Advanced" />
+
+          <CheckBox Content="Use path-style addressing (required by MinIO, Ceph and most self-hosted gateways)"
+                    IsChecked="{Binding ForcePathStyle, Mode=TwoWay}" />
+          <CheckBox Content="Disable request checksums (needed by R2, B2 and some gateways)"
+                    IsChecked="{Binding DisableRequestChecksums, Mode=TwoWay}" />
+          <CheckBox Content="Accept any TLS certificate (development endpoints only)"
+                    IsChecked="{Binding AllowInsecureCertificates, Mode=TwoWay}" />
+
+          <Grid ColumnDefinitions="140,120,Auto,120" ColumnSpacing="8" Margin="0,6,0,0">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Timeout (seconds)" />
+            <NumericUpDown Grid.Column="1" Value="{Binding TimeoutSeconds, Mode=TwoWay}"
+                           Minimum="5" Maximum="3600" FormatString="0" />
+            <TextBlock Grid.Column="2" Classes="fieldLabel" Text="Concurrent transfers" Margin="12,0,6,0" />
+            <NumericUpDown Grid.Column="3" Value="{Binding MaxConcurrentTransfers, Mode=TwoWay}"
+                           Minimum="1" Maximum="16" FormatString="0" />
+          </Grid>
+
+          <TextBlock Text="{Binding ValidationMessage}"
+                     Foreground="#C42B1C"
+                     TextWrapping="Wrap"
+                     Margin="0,8,0,0"
+                     IsVisible="{Binding ValidationMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+
+    <!-- Footer -->
+    <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,12,0,0">
+      <TextBlock Grid.Column="0"
+                 Text="{Binding TestResult}"
+                 VerticalAlignment="Center"
+                 TextWrapping="Wrap" />
+
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+        <ProgressBar IsIndeterminate="True" Width="90" Height="4"
+                     VerticalAlignment="Center"
+                     IsVisible="{Binding IsBusy}" />
+        <Button Content="Test connection" Command="{Binding TestConnectionCommand}" />
+        <Button Content="Save" Command="{Binding SaveCommand}" />
+        <Button Content="Cancel" IsCancel="True" Command="{Binding CancelCommand}" />
+        <Button Content="Connect" Classes="accent" IsDefault="True" Command="{Binding ConnectCommand}" />
+      </StackPanel>
+    </Grid>
+  </Grid>
+
+</Window>
