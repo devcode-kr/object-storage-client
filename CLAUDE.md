@@ -168,14 +168,22 @@ stale temp left by an interrupted save, whose mode `FileMode.Create` would other
   routes through `RefreshDebouncer` because a folder produces one completion per file.
 - Activating a row (`OpenCommand`, bound to double-click) descends into directories and prefixes
   but transfers anything else. Both panes must keep that split in step.
-- The master password fields keep the IME out in two layers, which do different jobs:
-  `InputMethod.IsInputMethodEnabled="False"` on the `TextBox` stops composed input at the source
-  (`TextInputMethodManager` drops the client, and every target platform implements
-  `ITextInputMethodImpl` — `AvaloniaNativeTextInputMethod` on macOS, `Imm32InputMethod` on
-  Windows, XIM/IBus/Fcitx on Linux). That does nothing to the clipboard, so
-  `MasterPasswordViewModel.RemoveDisallowed` still strips non-ASCII on the way into the property,
-  which is what covers pasting. `OnPasswordChanged` clears `ErrorMessage`, so the
-  reassign-then-report order there is deliberate.
+- The master password fields accept printable ASCII only. Three things matter here, all verified
+  by `MasterPasswordInputTests` (headless, driving the real input pipeline):
+  - `InputMethod.IsInputMethodEnabled="False"` is set but **does not work on macOS** — the
+    Avalonia.Native backend lets the system IME commit anyway. It is kept for Windows/Linux.
+  - The `TextInput` handler must be attached with `RoutingStrategies.Tunnel`, in code-behind.
+    `TextInputEvent` routes `Tunnel, Bubble`, and `TextBox.OnTextInput` is a **bubble-stage class
+    handler** — so a XAML `TextInput="..."` handler runs *after* the text is already inserted and
+    setting `Handled` there does nothing. This is the layer that actually holds.
+  - A `TextChanged` correction strips whatever never raised `TextInput` at all (pasting), so what
+    the box shows always equals the password that gets used.
+
+  Sanitising only in the view model does **not** work: the coerced value does not propagate back
+  to the `TextBox` while the binding is updating from target to source, so the box keeps the
+  rejected characters. `MasterPasswordViewModel.RemoveDisallowed` remains the shared rule and the
+  backstop for code that sets the property directly. `OnPasswordChanged` clears `ErrorMessage`,
+  so the reassign-then-report order there is deliberate.
 - Code-behind is limited to view-state plumbing with no MVVM equivalent: `DataGrid.SelectedItems`
   is not a bindable property, so `LocalPaneView`/`RemotePaneView` sync selection into the view
   model, and they handle double-click activation. No business logic belongs there.

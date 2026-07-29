@@ -71,10 +71,9 @@ public sealed partial class MasterPasswordViewModel : ViewModelBase
 
     /// <summary>Only printable ASCII is accepted in the master password.</summary>
     /// <remarks>
-    /// The IME itself is switched off on the fields via
-    /// <c>InputMethod.IsInputMethodEnabled="False"</c>, which stops composed input at the source
-    /// on all three platforms. This filter covers what that cannot: pasting. Disabling the input
-    /// method does nothing to the clipboard, so a paste could still carry Hangul.
+    /// Enforced in the view (see <c>MasterPasswordWindow</c>) because that is the only place that
+    /// can stop the text before <c>TextBox</c> inserts it. This method is the shared rule both
+    /// layers apply, and the backstop for anything that sets the property directly.
     /// </remarks>
     public const string NonAsciiRejectedMessage =
         "The master password accepts English letters, digits and symbols only.";
