@@ -119,6 +119,38 @@ public sealed class MasterPasswordInputTests
         Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, viewModel.ErrorMessage);
     }
 
+    /// <summary>
+    /// Asserts what the user actually sees, not just the view-model state: the red warning
+    /// TextBlock has to become visible and carry the message.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheWarningTextBlock_BecomesVisibleWithTheMessage()
+    {
+        (MasterPasswordWindow window, _, _) = Open();
+        TextBlock warning = window.GetControl<TextBlock>("ErrorText");
+
+        Assert.False(warning.IsVisible);
+
+        window.KeyTextInput("비밀번호");
+
+        Assert.True(warning.IsVisible);
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, warning.Text);
+    }
+
+    [AvaloniaFact]
+    public void TheWarningTextBlock_HidesAgainOnValidInput()
+    {
+        (MasterPasswordWindow window, _, _) = Open();
+        TextBlock warning = window.GetControl<TextBlock>("ErrorText");
+
+        window.KeyTextInput("비밀");
+        Assert.True(warning.IsVisible);
+
+        window.KeyTextInput("a");
+
+        Assert.False(warning.IsVisible);
+    }
+
     [AvaloniaFact]
     public void RejectedPaste_AlsoWarns()
     {
