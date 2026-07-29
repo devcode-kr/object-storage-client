@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ObjectStorageClient.Core.Abstractions;
@@ -35,7 +36,11 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
                 return new AppSettings();
             }
 
-            await using FileStream stream = File.OpenRead(_filePath);
+            // ConfigureAwait(false) on the disposal too: `await using` alone captures the caller's
+            // SynchronizationContext, which deadlocks anyone blocking on this from a UI thread.
+            FileStream stream = File.OpenRead(_filePath);
+            await using ConfiguredAsyncDisposable _ = stream.ConfigureAwait(false);
+
             AppSettings? settings = await JsonSerializer
                 .DeserializeAsync<AppSettings>(stream, SerializerOptions, cancellationToken)
                 .ConfigureAwait(false);
@@ -65,7 +70,8 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
             // definition, which would lock the user out of their own credentials.
             string temporaryPath = _filePath + ".tmp";
 
-            await using (FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath))
+            FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath);
+            await using (stream.ConfigureAwait(false))
             {
                 await JsonSerializer.SerializeAsync(stream, settings, SerializerOptions, cancellationToken)
                     .ConfigureAwait(false);

@@ -151,11 +151,17 @@ clears the password box and reports an error must clear the box **first**.
 initialiser on load, so a saved "off" silently reloaded as "on".
 
 `ShutdownRequested` is a **synchronous** event: an `async` handler returns at its first `await`
-and the runtime tears the process down with the work still in flight. `App.ShutdownAsync` is
-therefore blocked on deliberately — every path it awaits uses `ConfigureAwait(false)`, so nothing
-is waiting on the UI thread it occupies. Making it `async void` again silently loses the session's
-settings and leaves a half-written `config.json.tmp` behind, because the file gets written but
-never renamed.
+and the runtime tears the process down with the work still in flight, silently losing the
+session's settings and leaving a half-written `config.json.tmp` behind. `App.ShutdownAsync` is
+therefore blocked on — but via `Task.Run`, **not** awaited directly. `await using` disposals do not
+carry `ConfigureAwait(false)`, so `FileStream.DisposeAsync` posts its continuation back to the
+blocked UI thread and hangs the app. `Task.Run` clears the synchronization context and fixes the
+whole class of problem instead of one await at a time.
+
+The stores are also blocked on from the UI thread, so **every** await in them — including
+`await using` disposals, which need the `stream.ConfigureAwait(false)` form — must avoid capturing
+the context. `BlockingCallerTests` reproduces the deadlock with a context that cannot pump and
+names the offending await in its failure message.
 
 Both stores write through a `.tmp` file and rename. Always open it with
 `AppPaths.CreateOwnerOnlyFile`, never `File.Create`: the latter applies the umask (0644 on a

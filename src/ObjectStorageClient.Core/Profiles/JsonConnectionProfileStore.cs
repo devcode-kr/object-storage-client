@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ObjectStorageClient.Core.Abstractions;
@@ -93,7 +94,11 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
             return [];
         }
 
-        await using FileStream stream = File.OpenRead(_filePath);
+        // ConfigureAwait(false) on the disposal too: `await using` alone captures the caller's
+        // SynchronizationContext, which deadlocks anyone blocking on this from a UI thread.
+        FileStream stream = File.OpenRead(_filePath);
+        await using ConfiguredAsyncDisposable _ = stream.ConfigureAwait(false);
+
         ProfileDocument? document;
 
         try
@@ -129,7 +134,8 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         // Write-then-replace so an interrupted save cannot truncate the existing site list.
         string temporaryPath = _filePath + ".tmp";
 
-        await using (FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath))
+        FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath);
+        await using (stream.ConfigureAwait(false))
         {
             await JsonSerializer.SerializeAsync(stream, document, SerializerOptions, cancellationToken)
                 .ConfigureAwait(false);

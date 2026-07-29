@@ -19,6 +19,9 @@ public partial class App : Application
     /// <summary>Composition root. Available to views that must resolve a dialog view model.</summary>
     public static IServiceProvider? Services { get; private set; }
 
+    /// <summary>Upper bound on shutdown work, so the window always closes.</summary>
+    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(10);
+
     public override void Initialize() => AvaloniaXamlLoader.Load(this);
 
     public override void OnFrameworkInitializationCompleted()
@@ -79,21 +82,41 @@ public partial class App : Application
         desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
         window.Show();
 
-        desktop.ShutdownRequested += (_, _) => ShutdownAsync(settingsStore, viewModel, provider, settings)
-            .GetAwaiter()
-            .GetResult();
+        desktop.ShutdownRequested += (_, _) =>
+        {
+            // Snapshot on the UI thread: CaptureSettings reads view-model state.
+            AppSettings finalSettings = viewModel.CaptureSettings(settings);
+
+            // Task.Run so the teardown runs without the UI thread's SynchronizationContext.
+            // Awaiting it directly deadlocks: `await using` disposals do not carry
+            // ConfigureAwait(false), so FileStream.DisposeAsync posts its continuation back to
+            // the very thread this handler is blocking.
+            if (!Task.Run(() => ShutdownAsync(settingsStore, viewModel, provider, finalSettings))
+                    .Wait(ShutdownTimeout))
+            {
+                // Never wedge the app closed. A save that has not finished by now is not worth
+                // trapping the user in a window that will not shut.
+            }
+        };
     }
 
     /// <summary>
     /// Saves settings and tears down the connection and transfer queue before the process exits.
     /// </summary>
     /// <remarks>
-    /// Deliberately blocking. <c>ShutdownRequested</c> is a synchronous event, so an <c>async</c>
-    /// handler returns at its first <c>await</c> and the runtime carries on tearing the process
-    /// down with the work still in flight — which left a half-written <c>config.json.tmp</c>
-    /// behind and lost the session's settings, because the file was written but never renamed.
-    /// Blocking here is safe: every path below awaits with <c>ConfigureAwait(false)</c>, so no
-    /// continuation is waiting on the UI thread this call occupies.
+    /// <para>
+    /// <c>ShutdownRequested</c> is a synchronous event, so an <c>async</c> handler returns at its
+    /// first <c>await</c> and the runtime carries on tearing the process down with the work still
+    /// in flight — which left a half-written <c>config.json.tmp</c> behind and lost the session's
+    /// settings, because the file was written but never renamed.
+    /// </para>
+    /// <para>
+    /// The caller must therefore block, but must not await this directly from the UI thread:
+    /// <c>await using</c> disposals do not carry <c>ConfigureAwait(false)</c>, so
+    /// <c>FileStream.DisposeAsync</c> posts its continuation back to the blocked thread and hangs
+    /// the app. Running it through <c>Task.Run</c> clears the synchronization context, which fixes
+    /// the whole class of problem rather than one await at a time.
+    /// </para>
     /// </remarks>
     private static async Task ShutdownAsync(
         IAppSettingsStore settingsStore,
