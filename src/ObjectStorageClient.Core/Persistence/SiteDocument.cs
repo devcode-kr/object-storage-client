@@ -7,10 +7,10 @@ namespace ObjectStorageClient.Core.Persistence;
 /// </summary>
 internal sealed record SiteDocument
 {
-    /// <summary>Bumped whenever the layout changes; <see cref="Version1"/> is still readable.</summary>
-    internal const int CurrentVersion = 2;
-
-    internal const int Version1 = 1;
+    /// <summary>
+    /// Still 1: nothing has shipped, so the layout change does not need a new version number.
+    /// </summary>
+    internal const int CurrentVersion = 1;
 
     public int Version { get; init; } = CurrentVersion;
 
@@ -94,13 +94,19 @@ internal sealed record StoredProxy
 }
 
 /// <summary>
-/// Version 1 layout: the whole profile in the clear, with three separately encrypted secrets
-/// beside it. Kept only so existing files migrate to <see cref="SiteDocument.CurrentVersion"/>
-/// on their next save; it can be deleted once no version 1 files are expected in the wild.
+/// The pre-release layout: the whole profile in the clear, with three separately encrypted
+/// secrets beside it.
 /// </summary>
+/// <remarks>
+/// TEMPORARY. This exists only to convert files written before the connection was encrypted as a
+/// single blob, which happens automatically the first time such a file is read. Both formats
+/// claim version 1 — the layout changed before anything shipped — so they are told apart by shape:
+/// a legacy entry has <c>profile</c>, a current one has <c>connection</c>. Delete this record,
+/// its siblings and <c>SiteMapper</c>'s legacy overload once no such files remain.
+/// </remarks>
 internal sealed record LegacySiteDocument
 {
-    public int Version { get; init; } = SiteDocument.Version1;
+    public int Version { get; init; } = SiteDocument.CurrentVersion;
 
     public IReadOnlyList<LegacyStoredSite> Sites { get; init; } = [];
 }

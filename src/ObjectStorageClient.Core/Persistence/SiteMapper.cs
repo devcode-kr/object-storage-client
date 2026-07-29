@@ -111,12 +111,27 @@ internal static class SiteMapper
     /// Reads a version 1 entry, where the profile sat in the clear beside three separately
     /// encrypted secrets. Timestamps did not exist then, so they are seeded from the file itself.
     /// </summary>
+    /// <param name="secretsRecovered">
+    /// False when a stored ciphertext decrypted to nothing, which means the key does not match
+    /// this file. Converting anyway would re-encrypt the blanks and destroy the credentials, so
+    /// the caller must not rewrite the file in that case.
+    /// </param>
     internal static ConnectionProfile ToProfile(
         LegacyStoredSite stored,
         ISecretProtector protector,
-        DateTimeOffset migratedAt)
+        DateTimeOffset migratedAt,
+        out bool secretsRecovered)
     {
         LegacyProfile profile = stored.Profile;
+
+        string secretAccessKey = protector.Unprotect(stored.SecretAccessKey);
+        string sessionToken = protector.Unprotect(stored.SessionToken);
+        string proxyPassword = protector.Unprotect(stored.ProxyPassword);
+
+        secretsRecovered =
+            Recovered(stored.SecretAccessKey, secretAccessKey)
+            && Recovered(stored.SessionToken, sessionToken)
+            && Recovered(stored.ProxyPassword, proxyPassword);
 
         return new ConnectionProfile
         {
@@ -127,8 +142,8 @@ internal static class SiteMapper
             Region = profile.Region,
             AccountId = profile.AccountId,
             AccessKeyId = profile.AccessKeyId,
-            SecretAccessKey = protector.Unprotect(stored.SecretAccessKey),
-            SessionToken = protector.Unprotect(stored.SessionToken),
+            SecretAccessKey = secretAccessKey,
+            SessionToken = sessionToken,
             DefaultBucket = profile.DefaultBucket,
             DefaultPrefix = profile.DefaultPrefix,
             ForcePathStyle = profile.ForcePathStyle,
@@ -146,11 +161,15 @@ internal static class SiteMapper
                 Host = profile.Proxy.Host,
                 Port = profile.Proxy.Port,
                 Username = profile.Proxy.Username,
-                Password = protector.Unprotect(stored.ProxyPassword),
+                Password = proxyPassword,
                 BypassList = profile.Proxy.BypassList,
             },
         };
     }
+
+    /// <summary>A ciphertext that yields nothing was encrypted under a different key.</summary>
+    private static bool Recovered(string ciphertext, string plaintext) =>
+        string.IsNullOrEmpty(ciphertext) || !string.IsNullOrEmpty(plaintext);
 
     private static StoredConnection ReadConnection(string encrypted, ISecretProtector protector)
     {

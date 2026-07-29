@@ -374,7 +374,7 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         JsonElement root = document.RootElement;
         JsonElement site = root.GetProperty("sites")[0];
 
-        Assert.Equal(2, root.GetProperty("version").GetInt32());
+        Assert.Equal(1, root.GetProperty("version").GetInt32());
 
         // Readable: enough to list and describe a site.
         Assert.Equal("MinIO dev", site.GetProperty("name").GetString());
@@ -415,11 +415,13 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
     }
 
     /// <summary>
-    /// Version 1 kept the profile in the clear beside three separately encrypted secrets. Those
-    /// files must still open, and be rewritten in the current layout on the next save.
+    /// The pre-release layout kept the profile in the clear beside three separately encrypted
+    /// secrets. Such a file must open with its credentials intact and be converted on the spot,
+    /// since re-encrypting the connection needs the master password. Both layouts carry version 1,
+    /// so this also covers telling them apart by shape. TEMPORARY, with the migration itself.
     /// </summary>
     [Fact]
-    public async Task LoadAsync_MigratesAVersion1File()
+    public async Task LoadAsync_ConvertsAPreReleaseFileOnFirstRead()
     {
         string secret = _protector.Protect("s3cr3t-access-key");
         string proxyPassword = _protector.Protect("proxypass");
@@ -459,13 +461,64 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.Equal("proxypass", migrated.Proxy.Password);
         Assert.Equal(3128, migrated.Proxy.Port);
 
-        // Saving rewrites it in the current layout, and the endpoint stops being readable.
-        await store.SaveAsync(migrated);
+        // Reading is enough: the file has already been rewritten, with nothing left in the clear.
         string json = await File.ReadAllTextAsync(_file);
 
-        Assert.Contains("\"version\": 2", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"profile\"", json, StringComparison.Ordinal);
         Assert.DoesNotContain("http://localhost:9000", json, StringComparison.Ordinal);
-        Assert.Equal("s3cr3t-access-key", Assert.Single(await store.LoadAsync()).SecretAccessKey);
+        Assert.DoesNotContain("minioadmin", json, StringComparison.Ordinal);
+        Assert.Contains("\"connection\"", json, StringComparison.Ordinal);
+
+        // ...and it still opens, now through the current path.
+        ConnectionProfile reopened = Assert.Single(await CreateStore().LoadAsync());
+        Assert.Equal("s3cr3t-access-key", reopened.SecretAccessKey);
+        Assert.Equal("proxypass", reopened.Proxy.Password);
+        Assert.Equal("http://localhost:9000", reopened.ServiceUrl);
+    }
+
+    /// <summary>
+    /// Converting is irreversible: it re-encrypts whatever was decrypted. Under a key that does
+    /// not open the file that would be blanks, so the original must be left untouched.
+    /// </summary>
+    [Fact]
+    public async Task LoadAsync_LeavesAPreReleaseFileAloneWhenTheKeyDoesNotOpenIt()
+    {
+        await File.WriteAllTextAsync(_file, $$"""
+            {
+              "version": 1,
+              "sites": [
+                {
+                  "profile": { "id": "8a1c1d1e-0000-4000-8000-000000000001", "name": "MinIO dev" },
+                  "secretAccessKey": "{{_protector.Protect("s3cr3t-access-key")}}"
+                }
+              ]
+            }
+            """);
+        string before = await File.ReadAllTextAsync(_file);
+
+        ISecretProtector wrongKey = MasterPasswordVault.Create("a-different-password", 1_000).Protector;
+        ConnectionProfile opened = Assert.Single(await new JsonConnectionProfileStore(wrongKey, _file).LoadAsync());
+
+        Assert.Empty(opened.SecretAccessKey);
+        Assert.Equal(before, await File.ReadAllTextAsync(_file));
+
+        // The right key still converts it, with the credential intact.
+        Assert.Equal("s3cr3t-access-key", Assert.Single(await CreateStore().LoadAsync()).SecretAccessKey);
+        Assert.Contains("\"connection\"", await File.ReadAllTextAsync(_file), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadAsync_DoesNotRewriteAFileThatIsAlreadyCurrent()
+    {
+        JsonConnectionProfileStore store = CreateStore();
+        await store.SaveAsync(SampleProfile());
+
+        string before = await File.ReadAllTextAsync(_file);
+        await store.LoadAsync();
+        await store.LoadAsync();
+
+        // Only the one-time conversion writes during a load.
+        Assert.Equal(before, await File.ReadAllTextAsync(_file));
     }
 
     [Fact]

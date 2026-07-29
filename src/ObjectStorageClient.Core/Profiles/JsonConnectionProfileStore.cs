@@ -31,6 +31,9 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
     private readonly string _filePath;
     private readonly SemaphoreSlim _fileLock = new(1, 1);
 
+    /// <summary>Set while reading a pre-release file, so it gets rewritten once. TEMPORARY.</summary>
+    private bool _readLegacyLayout;
+
     public JsonConnectionProfileStore(ISecretProtector protector, string? filePath = null)
     {
         _protector = protector;
@@ -42,7 +45,19 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await ReadAsync(cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<ConnectionProfile> profiles = await ReadAsync(cancellationToken).ConfigureAwait(false);
+
+            // The one write this store performs without being asked, and only ever once: a file in
+            // the pre-release layout is converted the first time it is opened. Re-encrypting the
+            // connection needs the master password, so it can only happen here, with the key to
+            // hand. TEMPORARY — remove with the legacy records.
+            if (_readLegacyLayout)
+            {
+                _readLegacyLayout = false;
+                await WriteAsync(profiles, cancellationToken).ConfigureAwait(false);
+            }
+
+            return profiles;
         }
         finally
         {
@@ -139,29 +154,43 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
 
     private IReadOnlyList<ConnectionProfile> ReadDocument(JsonElement root)
     {
-        int version = root.TryGetProperty("version", out JsonElement versionElement)
-            && versionElement.TryGetInt32(out int parsed)
-                ? parsed
-                : SiteDocument.Version1;
-
-        if (version >= SiteDocument.CurrentVersion)
+        // Told apart by shape, not by version: the layout changed before anything shipped, so both
+        // carry version 1. A legacy entry has `profile`; a current one has `connection`.
+        if (IsLegacyLayout(root))
         {
-            SiteDocument? document = root.Deserialize<SiteDocument>(SerializerOptions);
-            return document?.Sites is null
-                ? []
-                : [.. document.Sites.Select(site => SiteMapper.ToProfile(site, _protector))];
+            LegacySiteDocument? legacy = root.Deserialize<LegacySiteDocument>(SerializerOptions);
+            if (legacy?.Sites is null)
+            {
+                return [];
+            }
+
+            DateTimeOffset migratedAt = DateTimeOffset.Now;
+            List<ConnectionProfile> migrated = [];
+            bool everySecretRecovered = true;
+
+            foreach (LegacyStoredSite site in legacy.Sites)
+            {
+                migrated.Add(SiteMapper.ToProfile(site, _protector, migratedAt, out bool recovered));
+                everySecretRecovered &= recovered;
+            }
+
+            // Only convert when the key actually opened the file. Rewriting after a failed
+            // decrypt would re-encrypt the blanks and destroy the credentials for good.
+            _readLegacyLayout = everySecretRecovered;
+            return migrated;
         }
 
-        // Version 1 is rewritten in the current layout the next time the site is saved.
-        LegacySiteDocument? legacy = root.Deserialize<LegacySiteDocument>(SerializerOptions);
-        if (legacy?.Sites is null)
-        {
-            return [];
-        }
-
-        DateTimeOffset migratedAt = DateTimeOffset.Now;
-        return [.. legacy.Sites.Select(site => SiteMapper.ToProfile(site, _protector, migratedAt))];
+        SiteDocument? document = root.Deserialize<SiteDocument>(SerializerOptions);
+        return document?.Sites is null
+            ? []
+            : [.. document.Sites.Select(site => SiteMapper.ToProfile(site, _protector))];
     }
+
+    /// <summary>TEMPORARY: remove with the legacy records.</summary>
+    private static bool IsLegacyLayout(JsonElement root) =>
+        root.TryGetProperty("sites", out JsonElement sites)
+        && sites.ValueKind == JsonValueKind.Array
+        && sites.EnumerateArray().Any(site => site.TryGetProperty("profile", out _));
 
     private async Task WriteAsync(IReadOnlyList<ConnectionProfile> profiles, CancellationToken cancellationToken)
     {
