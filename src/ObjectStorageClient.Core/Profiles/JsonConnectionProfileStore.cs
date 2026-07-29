@@ -3,21 +3,26 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using ObjectStorageClient.Core.Abstractions;
 using ObjectStorageClient.Core.Models;
+using ObjectStorageClient.Core.Persistence;
 
 namespace ObjectStorageClient.Core.Profiles;
 
 /// <summary>
 /// Saved sites persisted as JSON in the per-user config directory.
-/// Secrets are written through <see cref="ISecretProtector"/> and never appear in plaintext on disk.
 /// </summary>
+/// <remarks>
+/// The file layout is <see cref="SiteDocument"/>, kept separate from
+/// <see cref="ConnectionProfile"/> and reached only through <see cref="SiteMapper"/>. Everything
+/// describing how to reach an endpoint — URL, region, credentials, bucket, proxy — is encrypted
+/// together as one blob, so nothing sensitive can appear in the clear by being added to the model.
+/// </remarks>
 public sealed class JsonConnectionProfileStore : IConnectionProfileStore
 {
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         WriteIndented = true,
-        // Must not be WhenWritingDefault: that omits `false` and `0`, while several profile
-        // properties initialise to `true`/non-zero. An omitted property falls back to the
-        // initialiser on load, so writing ForcePathStyle=false would silently reload as true.
+        // Not WhenWritingDefault: that omits `false` and `0`, and several settings default to
+        // `true`/non-zero, so an omitted property would reload as the opposite of what was saved.
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
@@ -37,7 +42,7 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await LoadUnsynchronizedAsync(cancellationToken).ConfigureAwait(false);
+            return await ReadAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -50,30 +55,36 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            List<ConnectionProfile> profiles = [.. await LoadUnsynchronizedAsync(cancellationToken).ConfigureAwait(false)];
+            List<ConnectionProfile> profiles = [.. await ReadAsync(cancellationToken).ConfigureAwait(false)];
             int index = profiles.FindIndex(existing => existing.Id == profile.Id);
+
+            // The store owns the timestamps: created once, modified on every save.
+            DateTimeOffset now = DateTimeOffset.Now;
+            ConnectionProfile stamped = profile with
+            {
+                CreatedAt = index >= 0 ? profiles[index].CreatedAt : now,
+                LastModifiedAt = now,
+            };
 
             if (index >= 0)
             {
-                profiles[index] = profile;
+                profiles[index] = stamped;
             }
             else
             {
-                profiles.Add(profile);
+                profiles.Add(stamped);
             }
 
             await WriteAsync(profiles, cancellationToken).ConfigureAwait(false);
 
             // Read it back and compare, secrets included. This is what catches a save that
-            // silently drops a field — the serializer once omitted `false` values, so turning
-            // path-style addressing off appeared to work and reloaded as on.
-            IReadOnlyList<ConnectionProfile> written =
-                await LoadUnsynchronizedAsync(cancellationToken).ConfigureAwait(false);
+            // reports success without the file actually holding the new values.
+            IReadOnlyList<ConnectionProfile> written = await ReadAsync(cancellationToken).ConfigureAwait(false);
 
-            if (written.FirstOrDefault(saved => saved.Id == profile.Id) != profile)
+            if (written.FirstOrDefault(saved => saved.Id == stamped.Id) != stamped)
             {
                 throw new IOException(
-                    $"Site '{profile.Name}' was written to '{_filePath}' but did not read back identical.");
+                    $"Site '{stamped.Name}' was written to '{_filePath}' but did not read back identical.");
             }
         }
         finally
@@ -87,7 +98,7 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            List<ConnectionProfile> profiles = [.. await LoadUnsynchronizedAsync(cancellationToken).ConfigureAwait(false)];
+            List<ConnectionProfile> profiles = [.. await ReadAsync(cancellationToken).ConfigureAwait(false)];
             if (profiles.RemoveAll(profile => profile.Id == id) > 0)
             {
                 await WriteAsync(profiles, cancellationToken).ConfigureAwait(false);
@@ -99,48 +110,66 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         }
     }
 
-    private async Task<IReadOnlyList<ConnectionProfile>> LoadUnsynchronizedAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ConnectionProfile>> ReadAsync(CancellationToken cancellationToken)
     {
         if (!File.Exists(_filePath))
         {
             return [];
         }
 
-        // ConfigureAwait(false) on the disposal too: `await using` alone captures the caller's
-        // SynchronizationContext, which deadlocks anyone blocking on this from a UI thread.
-        FileStream stream = File.OpenRead(_filePath);
-        await using ConfiguredAsyncDisposable _ = stream.ConfigureAwait(false);
-
-        ProfileDocument? document;
-
         try
         {
-            document = await JsonSerializer
-                .DeserializeAsync<ProfileDocument>(stream, SerializerOptions, cancellationToken)
+            // ConfigureAwait(false) on the disposal too: `await using` alone captures the caller's
+            // SynchronizationContext, which deadlocks anyone blocking on this from a UI thread.
+            FileStream stream = File.OpenRead(_filePath);
+            await using ConfiguredAsyncDisposable _ = stream.ConfigureAwait(false);
+
+            using JsonDocument document = await JsonDocument
+                .ParseAsync(stream, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+
+            return ReadDocument(document.RootElement);
         }
         catch (JsonException)
         {
             // A corrupted file must not prevent the app from starting.
             return [];
         }
+    }
 
-        if (document?.Sites is null)
+    private IReadOnlyList<ConnectionProfile> ReadDocument(JsonElement root)
+    {
+        int version = root.TryGetProperty("version", out JsonElement versionElement)
+            && versionElement.TryGetInt32(out int parsed)
+                ? parsed
+                : SiteDocument.Version1;
+
+        if (version >= SiteDocument.CurrentVersion)
+        {
+            SiteDocument? document = root.Deserialize<SiteDocument>(SerializerOptions);
+            return document?.Sites is null
+                ? []
+                : [.. document.Sites.Select(site => SiteMapper.ToProfile(site, _protector))];
+        }
+
+        // Version 1 is rewritten in the current layout the next time the site is saved.
+        LegacySiteDocument? legacy = root.Deserialize<LegacySiteDocument>(SerializerOptions);
+        if (legacy?.Sites is null)
         {
             return [];
         }
 
-        return [.. document.Sites.Select(Decrypt)];
+        DateTimeOffset migratedAt = DateTimeOffset.Now;
+        return [.. legacy.Sites.Select(site => SiteMapper.ToProfile(site, _protector, migratedAt))];
     }
 
     private async Task WriteAsync(IReadOnlyList<ConnectionProfile> profiles, CancellationToken cancellationToken)
     {
         AppPaths.EnsureConfigDirectory();
 
-        ProfileDocument document = new()
+        SiteDocument document = new()
         {
-            Version = 1,
-            Sites = [.. profiles.Select(Encrypt)],
+            Sites = [.. profiles.Select(profile => SiteMapper.ToStored(profile, _protector))],
         };
 
         // Write-then-replace so an interrupted save cannot truncate the existing site list.
@@ -154,39 +183,5 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         }
 
         File.Move(temporaryPath, _filePath, overwrite: true);
-    }
-
-    private StoredProfile Encrypt(ConnectionProfile profile) => new()
-    {
-        Profile = profile.WithoutSecrets(),
-        SecretAccessKey = _protector.Protect(profile.SecretAccessKey),
-        SessionToken = _protector.Protect(profile.SessionToken),
-        ProxyPassword = _protector.Protect(profile.Proxy.Password),
-    };
-
-    private ConnectionProfile Decrypt(StoredProfile stored) => stored.Profile with
-    {
-        SecretAccessKey = _protector.Unprotect(stored.SecretAccessKey),
-        SessionToken = _protector.Unprotect(stored.SessionToken),
-        Proxy = stored.Profile.Proxy with { Password = _protector.Unprotect(stored.ProxyPassword) },
-    };
-
-    private sealed record ProfileDocument
-    {
-        public int Version { get; init; } = 1;
-
-        public IReadOnlyList<StoredProfile> Sites { get; init; } = [];
-    }
-
-    /// <summary>On-disk shape: the profile minus secrets, plus the encrypted secret blobs.</summary>
-    private sealed record StoredProfile
-    {
-        public ConnectionProfile Profile { get; init; } = new();
-
-        public string SecretAccessKey { get; init; } = string.Empty;
-
-        public string SessionToken { get; init; } = string.Empty;
-
-        public string ProxyPassword { get; init; } = string.Empty;
     }
 }

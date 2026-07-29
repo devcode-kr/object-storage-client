@@ -1,5 +1,3 @@
-using System.Text.Json.Serialization;
-
 namespace ObjectStorageClient.Core.Models;
 
 /// <summary>
@@ -26,16 +24,10 @@ public sealed record ConnectionProfile
 
     public string AccessKeyId { get; init; } = string.Empty;
 
-    /// <summary>
-    /// Held in plaintext in memory only. Never serialised: the profile store writes it encrypted
-    /// alongside the profile, so ignoring it here makes "no plaintext secret on disk" structural
-    /// rather than something each caller has to remember.
-    /// </summary>
-    [JsonIgnore]
+    /// <summary>Held in plaintext in memory only; stored inside the encrypted connection blob.</summary>
     public string SecretAccessKey { get; init; } = string.Empty;
 
-    /// <summary>Optional temporary-credential session token (STS). Persisted encrypted; see above.</summary>
-    [JsonIgnore]
+    /// <summary>Optional temporary-credential session token (STS).</summary>
     public string SessionToken { get; init; } = string.Empty;
 
     /// <summary>Bucket opened right after connecting. Empty means "show the bucket list".</summary>
@@ -69,15 +61,16 @@ public sealed record ConnectionProfile
 
     public ProxySettings Proxy { get; init; } = ProxySettings.Disabled;
 
+    /// <summary>Set by the store the first time the site is saved.</summary>
+    public DateTimeOffset CreatedAt { get; init; }
+
+    /// <summary>Set by the store on every save.</summary>
+    public DateTimeOffset LastModifiedAt { get; init; }
+
+    /// <summary>Reserved for ordering the site list by recency; nothing writes it yet.</summary>
     public DateTimeOffset? LastUsedAt { get; init; }
 
-    /// <summary>
-    /// The preset backing <see cref="ProviderId"/>. Derived, so it must not be serialised —
-    /// System.Text.Json writes any public getter, and this one wrote a whole copy of the preset
-    /// into every saved site. Nothing read it back, and it went stale the moment a preset's
-    /// defaults changed in the catalog.
-    /// </summary>
-    [JsonIgnore]
+    /// <summary>The preset backing <see cref="ProviderId"/>, resolved on demand.</summary>
     public StorageProviderPreset Preset => StorageProviderCatalog.Resolve(ProviderId);
 
     /// <summary>

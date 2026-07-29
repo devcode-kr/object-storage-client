@@ -222,19 +222,32 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.Equal(3128, actual.Proxy.Port);
     }
 
+    /// <summary>
+    /// Everything describing how to reach the endpoint is inside one encrypted blob, so none of
+    /// it — not just the credentials — appears in the file.
+    /// </summary>
     [Fact]
-    public async Task SaveAsync_NeverWritesSecretsInPlaintext()
+    public async Task SaveAsync_KeepsTheWholeConnectionOutOfThePlaintext()
     {
-        await CreateStore().SaveAsync(SampleProfile());
+        await CreateStore().SaveAsync(SampleProfile() with { SessionToken = "session-token" });
 
         string json = await File.ReadAllTextAsync(_file);
 
-        Assert.DoesNotContain("s3cr3t-access-key", json, StringComparison.Ordinal);
-        Assert.DoesNotContain("proxypass", json, StringComparison.Ordinal);
+        foreach (string secret in new[]
+                 {
+                     "s3cr3t-access-key", "proxypass", "session-token",   // credentials
+                     "minioadmin",                                        // access key id
+                     "http://localhost:9000",                             // endpoint
+                     "assets",                                            // bucket
+                     "proxy",                                             // proxy host
+                 })
+        {
+            Assert.DoesNotContain(secret, json, StringComparison.Ordinal);
+        }
 
-        // Non-secret fields stay readable, which is what makes the file diffable and portable.
+        // Only what the Site Manager needs to list a site stays readable.
         Assert.Contains("MinIO dev", json, StringComparison.Ordinal);
-        Assert.Contains("minioadmin", json, StringComparison.Ordinal);
+        Assert.Contains("minio", json, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -351,53 +364,108 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.Equal("legacy", actual.Name);
     }
 
-    /// <summary>
-    /// Pins the on-disk shape. System.Text.Json serialises every public getter, so a derived
-    /// property silently becomes a stored field — <c>Preset</c> wrote a whole stale copy of the
-    /// provider catalog into each site, and the proxy's computed flags leaked the same way.
-    /// </summary>
+    /// <summary>Pins the on-disk shape: which fields are readable, and which are inside the blob.</summary>
     [Fact]
-    public async Task SaveAsync_WritesNeitherDerivedNorPlaintextSecretFields()
+    public async Task SaveAsync_WritesOnlyTheListingFieldsInTheClear()
     {
-        await CreateStore().SaveAsync(SampleProfile() with { SessionToken = "session-token" });
+        await CreateStore().SaveAsync(SampleProfile());
 
         using JsonDocument document = JsonDocument.Parse(await File.ReadAllTextAsync(_file));
-        JsonElement site = document.RootElement.GetProperty("sites")[0];
-        JsonElement profile = site.GetProperty("profile");
+        JsonElement root = document.RootElement;
+        JsonElement site = root.GetProperty("sites")[0];
 
-        // Derived: recomputed from providerId on load.
-        Assert.False(profile.TryGetProperty("preset", out _));
-        Assert.False(profile.GetProperty("proxy").TryGetProperty("isUsable", out _));
-        Assert.False(profile.GetProperty("proxy").TryGetProperty("hasCredentials", out _));
+        Assert.Equal(2, root.GetProperty("version").GetInt32());
 
-        // Secrets only exist encrypted, on the wrapper — never inside the profile.
-        Assert.False(profile.TryGetProperty("secretAccessKey", out _));
-        Assert.False(profile.TryGetProperty("sessionToken", out _));
-        Assert.False(profile.GetProperty("proxy").TryGetProperty("password", out _));
+        // Readable: enough to list and describe a site.
+        Assert.Equal("MinIO dev", site.GetProperty("name").GetString());
+        Assert.Equal("minio", site.GetProperty("providerId").GetString());
+        Assert.True(site.GetProperty("forcePathStyle").GetBoolean());
+        Assert.NotEmpty(site.GetProperty("connection").GetString()!);
 
-        Assert.NotEmpty(site.GetProperty("secretAccessKey").GetString()!);
-        Assert.NotEmpty(site.GetProperty("sessionToken").GetString()!);
+        // Encrypted: no connection detail has its own field any more.
+        foreach (string gone in new[]
+                 {
+                     "profile", "serviceUrl", "region", "accessKeyId", "secretAccessKey",
+                     "sessionToken", "defaultBucket", "proxy", "proxyPassword", "preset",
+                 })
+        {
+            Assert.False(site.TryGetProperty(gone, out _), $"'{gone}' should not be a stored field.");
+        }
     }
 
     [Fact]
-    public async Task LoadAsync_StillReadsAFileThatContainsTheOldDerivedFields()
+    public async Task SaveAsync_StampsCreatedAndModified()
     {
-        // Files written before those fields were suppressed must keep working.
         JsonConnectionProfileStore store = CreateStore();
-        await store.SaveAsync(SampleProfile());
+        ConnectionProfile profile = SampleProfile();
 
+        await store.SaveAsync(profile);
+        ConnectionProfile first = Assert.Single(await store.LoadAsync());
+
+        Assert.NotEqual(default, first.CreatedAt);
+        Assert.NotEqual(default, first.LastModifiedAt);
+
+        await Task.Delay(20);
+        await store.SaveAsync(profile with { Name = "Renamed" });
+        ConnectionProfile second = Assert.Single(await store.LoadAsync());
+
+        // Created is preserved across edits; modified moves.
+        Assert.Equal(first.CreatedAt, second.CreatedAt);
+        Assert.True(second.LastModifiedAt > first.LastModifiedAt);
+    }
+
+    /// <summary>
+    /// Version 1 kept the profile in the clear beside three separately encrypted secrets. Those
+    /// files must still open, and be rewritten in the current layout on the next save.
+    /// </summary>
+    [Fact]
+    public async Task LoadAsync_MigratesAVersion1File()
+    {
+        string secret = _protector.Protect("s3cr3t-access-key");
+        string proxyPassword = _protector.Protect("proxypass");
+
+        await File.WriteAllTextAsync(_file, $$"""
+            {
+              "version": 1,
+              "sites": [
+                {
+                  "profile": {
+                    "id": "8a1c1d1e-0000-4000-8000-000000000001",
+                    "name": "MinIO dev",
+                    "providerId": "minio",
+                    "serviceUrl": "http://localhost:9000",
+                    "region": "us-east-1",
+                    "accessKeyId": "minioadmin",
+                    "defaultBucket": "assets",
+                    "forcePathStyle": true,
+                    "timeoutSeconds": 100,
+                    "maxConcurrentTransfers": 3,
+                    "proxy": { "enabled": true, "host": "proxy", "port": 3128 }
+                  },
+                  "secretAccessKey": "{{secret}}",
+                  "proxyPassword": "{{proxyPassword}}"
+                }
+              ]
+            }
+            """);
+
+        JsonConnectionProfileStore store = CreateStore();
+        ConnectionProfile migrated = Assert.Single(await store.LoadAsync());
+
+        Assert.Equal("MinIO dev", migrated.Name);
+        Assert.Equal("http://localhost:9000", migrated.ServiceUrl);
+        Assert.Equal("minioadmin", migrated.AccessKeyId);
+        Assert.Equal("s3cr3t-access-key", migrated.SecretAccessKey);
+        Assert.Equal("proxypass", migrated.Proxy.Password);
+        Assert.Equal(3128, migrated.Proxy.Port);
+
+        // Saving rewrites it in the current layout, and the endpoint stops being readable.
+        await store.SaveAsync(migrated);
         string json = await File.ReadAllTextAsync(_file);
-        json = json.Replace(
-            "\"providerId\": \"minio\"",
-            "\"providerId\": \"minio\",\n        \"preset\": { \"id\": \"stale\", \"displayName\": \"Stale\" },\n        \"secretAccessKey\": \"\"",
-            StringComparison.Ordinal);
-        await File.WriteAllTextAsync(_file, json);
 
-        ConnectionProfile actual = Assert.Single(await CreateStore().LoadAsync());
-
-        Assert.Equal("minio", actual.ProviderId);
-        Assert.Equal("MinIO", actual.Preset.DisplayName);
-        Assert.Equal("s3cr3t-access-key", actual.SecretAccessKey);
+        Assert.Contains("\"version\": 2", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("http://localhost:9000", json, StringComparison.Ordinal);
+        Assert.Equal("s3cr3t-access-key", Assert.Single(await store.LoadAsync()).SecretAccessKey);
     }
 
     [Fact]

@@ -93,10 +93,12 @@ on Windows):
 | `$HOME/.devcode/object-storage-client/sites.json` | Saved connections from the Site Manager |
 | `$HOME/.devcode/object-storage-client/config.json` | Preferences and master-password parameters |
 
-Secret keys, session tokens and proxy passwords are encrypted with AES-256-GCM under a key
-derived from your master password using PBKDF2-HMAC-SHA256 (600,000 iterations). Both files are
-written with owner-only permissions where the OS supports it. Because the key never touches the
-disk, copying these files to another machine does not expose your credentials.
+For each saved site, the entire connection — endpoint, region, access key, secret key, session
+token, bucket and proxy settings — is encrypted as a single block with AES-256-GCM, under a key
+derived from your master password using PBKDF2-HMAC-SHA256 (600,000 iterations). Only the site
+name, the provider and a few non-sensitive switches stay readable, so the list can be shown before
+you unlock. Both files are written with owner-only permissions where the OS supports it. Because
+the key never touches the disk, copying these files to another machine does not expose anything.
 
 ## Project layout
 

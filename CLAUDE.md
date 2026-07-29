@@ -161,6 +161,27 @@ Both stores verify their own writes: after the rename they read the file back an
 throw if it does not match. That is what catches a save which reports success without the file
 holding the new values — a half-written temporary file, or a serializer dropping properties.
 
+### The sites.json contract
+
+`Core/Persistence` holds the on-disk shape (`SiteDocument`/`StoredSite`), deliberately separate
+from `ConnectionProfile`, which is what the UI binds to. `SiteMapper` is the only place the two
+meet. Keep it that way: when the domain model *was* the serialization contract, every public
+getter became a stored field — a derived `Preset` wrote a stale copy of the provider catalog into
+every site, and the proxy's computed flags leaked the same way.
+
+Everything describing how to reach an endpoint — URL, region, account and access key, secret,
+session token, bucket, prefix, the whole proxy — is serialized together and encrypted as the
+single `connection` blob. Only what the Site Manager needs to list a site (id, name, providerId),
+the non-sensitive behaviour switches, and the timestamps stay readable. **Adding a connection
+setting therefore needs no decision about whether it is secret**, and no new encrypted field.
+
+The store owns `CreatedAt` (first save) and `LastModifiedAt` (every save); `LastUsedAt` is
+reserved for ordering by recency and nothing writes it yet.
+
+`SiteDocument.CurrentVersion` is 2. Version 1 — profile in the clear beside three separately
+encrypted secrets — is still read via the `Legacy*` records and rewritten on the next save. Those
+records exist only for that migration and can go once no version 1 files are expected.
+
 Shutdown is **just `provider.DisposeAsync()`**. The container owns the view model, the transfer
 queue and the rest, and disposes singletons in reverse registration order. Disposing any of them
 explicitly as well disposes them twice — which crashed the app on exit with
