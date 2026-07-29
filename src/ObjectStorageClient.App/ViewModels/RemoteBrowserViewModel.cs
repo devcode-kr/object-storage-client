@@ -240,11 +240,21 @@ public sealed partial class RemoteBrowserViewModel : ViewModelBase
         await RefreshAsync().ConfigureAwait(true);
     }
 
+    /// <summary>
+    /// Double-click / Enter: descend into a prefix, or queue an object for download.
+    /// Mirrors <c>LocalBrowserViewModel.Open</c> so both panes behave the same way.
+    /// </summary>
     [RelayCommand]
     private async Task OpenAsync(RemoteEntry? entry)
     {
-        if (entry is not { IsFolder: true })
+        if (entry is null)
         {
+            return;
+        }
+
+        if (!entry.IsFolder)
+        {
+            Coordinator.QueueDownload([entry]);
             return;
         }
 

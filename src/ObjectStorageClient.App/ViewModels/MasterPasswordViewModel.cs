@@ -69,10 +69,47 @@ public sealed partial class MasterPasswordViewModel : ViewModelBase
     [ObservableProperty]
     private bool _canReset;
 
+    /// <summary>
+    /// Only printable ASCII is accepted, so an IME left in Hangul (or any other composing) mode
+    /// cannot put characters into the master password.
+    /// </summary>
+    /// <remarks>
+    /// There is no cross-platform way to switch the OS input method to English from Avalonia, so
+    /// the guarantee is enforced by rejecting the characters instead. Filtering here rather than
+    /// in the view also covers pasting.
+    /// </remarks>
+    public const string NonAsciiRejectedMessage =
+        "The master password accepts English letters, digits and symbols only.";
+
+    internal static bool IsAllowed(char character) => character is >= ' ' and <= '~';
+
+    internal static string RemoveDisallowed(string value) =>
+        value.All(IsAllowed) ? value : new string([.. value.Where(IsAllowed)]);
+
     partial void OnPasswordChanged(string value)
     {
-        _ = value;
+        string allowed = RemoveDisallowed(value);
+
+        if (!string.Equals(allowed, value, StringComparison.Ordinal))
+        {
+            // Re-assigning re-enters this method, which clears ErrorMessage — so report afterwards.
+            Password = allowed;
+            ErrorMessage = NonAsciiRejectedMessage;
+            return;
+        }
+
         ErrorMessage = string.Empty;
+    }
+
+    partial void OnConfirmPasswordChanged(string value)
+    {
+        string allowed = RemoveDisallowed(value);
+
+        if (!string.Equals(allowed, value, StringComparison.Ordinal))
+        {
+            ConfirmPassword = allowed;
+            ErrorMessage = NonAsciiRejectedMessage;
+        }
     }
 
     [RelayCommand]

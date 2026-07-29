@@ -99,14 +99,25 @@ public sealed partial class LocalBrowserViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Double-click / Enter: descend into directories, ignore files.</summary>
+    /// <summary>
+    /// Double-click / Enter: descend into a directory, or queue a file for upload — the same
+    /// split FileZilla uses, so activating a file is the quickest way to transfer it.
+    /// </summary>
     [RelayCommand]
     private void Open(LocalEntry? entry)
     {
-        if (entry is { IsDirectory: true })
+        if (entry is null)
+        {
+            return;
+        }
+
+        if (entry.IsDirectory)
         {
             Navigate(entry.FullPath);
+            return;
         }
+
+        Coordinator.QueueUpload([entry]);
     }
 
     [RelayCommand]

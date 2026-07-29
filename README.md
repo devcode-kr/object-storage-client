@@ -7,7 +7,8 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 ## Features
 
 - **Two-pane transfers** — local file system on the left, buckets and prefixes on the right,
-  with upload/download through a background queue.
+  with upload/download through a background queue. Double-click a folder to open it, or a file
+  to transfer it; the opposite pane refreshes itself once the transfer finishes.
 - **Transfer queue** — queued / failed / successful tabs, per-item progress, cancel and retry.
   Each transfer succeeds or fails on its own; one failure never stalls the rest. Right-click a
   failed transfer to copy its error message, paths, or the whole failure list.
@@ -77,6 +78,9 @@ and a verifier blob are — so **there is no way to recover it.** If you forget 
 screen offers to start over, which discards the saved sites along with the old key.
 
 Quitting at the password prompt closes the app: there is no usable session without the key.
+
+The password field accepts English letters, digits and symbols only, so an input method left in a
+composing mode cannot put unexpected characters into it.
 
 ## Where your data is stored
 

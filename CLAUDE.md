@@ -162,7 +162,16 @@ stale temp left by an interrupted save, whose mode `FileMode.Create` would other
   (`AvaloniaUseCompiledBindingsByDefault`), so every view and `DataTemplate` needs `x:DataType`.
 - `MainWindowViewModel` implements `ITransferCoordinator`. Uploads need the remote pane's prefix
   and downloads need the local pane's directory, so only the level that owns both panes can
-  queue transfers — the panes themselves stay unaware of each other.
+  queue transfers — the panes themselves stay unaware of each other. It also owns the
+  post-transfer auto-refresh: completions arrive on worker threads, so the handler marshals to
+  the dispatcher, refreshes only the pane whose *current* location the transfer landed in, and
+  routes through `RefreshDebouncer` because a folder produces one completion per file.
+- Activating a row (`OpenCommand`, bound to double-click) descends into directories and prefixes
+  but transfers anything else. Both panes must keep that split in step.
+- The master password fields accept printable ASCII only. Avalonia has no cross-platform way to
+  switch the OS input method, so `MasterPasswordViewModel.RemoveDisallowed` strips the rest —
+  in the view model rather than the view, so pasting is covered too. `OnPasswordChanged` clears
+  `ErrorMessage`, so the reassign-then-report order there is deliberate.
 - Code-behind is limited to view-state plumbing with no MVVM equivalent: `DataGrid.SelectedItems`
   is not a bindable property, so `LocalPaneView`/`RemotePaneView` sync selection into the view
   model, and they handle double-click activation. No business logic belongs there.

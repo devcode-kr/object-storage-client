@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using ObjectStorageClient.App.Services;
@@ -21,6 +22,12 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
     private readonly IConnectionProfileStore _profileStore;
     private readonly ITransferQueue _queue;
     private readonly IDialogService _dialogs;
+
+    /// <summary>Long enough to swallow a folder's worth of completions, short enough to feel instant.</summary>
+    private static readonly TimeSpan RefreshDelay = TimeSpan.FromMilliseconds(400);
+
+    private readonly RefreshDebouncer _remotePaneRefresh;
+    private readonly RefreshDebouncer _localPaneRefresh;
 
     private IObjectStorageClient? _client;
     private Guid? _lastSiteId;
@@ -49,6 +56,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
         }
 
         _selectedProvider = StorageProviderCatalog.Custom;
+
+        _remotePaneRefresh = new RefreshDebouncer(
+            RefreshDelay,
+            () => Dispatcher.UIThread.InvokeAsync(() => Remote.RefreshCommand.Execute(null)).GetTask());
+
+        _localPaneRefresh = new RefreshDebouncer(
+            RefreshDelay,
+            () => Dispatcher.UIThread.InvokeAsync(() => Local.RefreshCommand.Execute(null)).GetTask());
+
+        _queue.ItemUpdated += OnTransferUpdated;
 
         Log.Info("Object Storage Client ready. Use Quickconnect or the Site Manager to connect.");
     }
@@ -101,6 +118,70 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
         // Seed the quick-connect fields; the user can overwrite any of them.
         QuickRegion = value.DefaultRegion;
         QuickEndpoint = value.BuildEndpoint(value.DefaultRegion, accountId: null);
+    }
+
+    /// <summary>
+    /// Refreshes the pane a finished transfer landed in, so the new object or file appears
+    /// without the user hitting Refresh.
+    /// </summary>
+    /// <remarks>
+    /// The queue raises this from worker threads, so the whole decision is marshalled onto the UI
+    /// thread — it reads pane state. Only the destination the user is actually looking at is
+    /// refreshed: a transfer into some other bucket, prefix or directory changes nothing on screen.
+    /// </remarks>
+    private void OnTransferUpdated(object? sender, TransferItem item)
+    {
+        if (item.Status != TransferStatus.Completed)
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (item.Direction == TransferDirection.Upload)
+            {
+                if (IsShowingUploadDestination(item))
+                {
+                    _remotePaneRefresh.Request();
+                }
+            }
+            else if (IsShowingDownloadDestination(item))
+            {
+                _localPaneRefresh.Request();
+            }
+        });
+    }
+
+    private bool IsShowingUploadDestination(TransferItem item) =>
+        string.Equals(item.Bucket, Remote.CurrentBucket, StringComparison.Ordinal)
+        && string.Equals(
+            ObjectKey.GetParentPrefix(item.RemoteKey),
+            ObjectKey.NormalizePrefix(Remote.CurrentPrefix),
+            StringComparison.Ordinal);
+
+    private bool IsShowingDownloadDestination(TransferItem item) =>
+        Path.GetDirectoryName(item.LocalPath) is { } directory
+        && IsSamePath(directory, Local.CurrentPath);
+
+    /// <summary>Compares directories ignoring case and a trailing separator, as Windows and macOS do.</summary>
+    private static bool IsSamePath(string left, string right)
+    {
+        if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Applies persisted preferences from <c>config.json</c> at startup.</summary>
@@ -358,6 +439,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
 
     public async ValueTask DisposeAsync()
     {
+        _queue.ItemUpdated -= OnTransferUpdated;
         Transfers.Dispose();
         await _queue.DisposeAsync().ConfigureAwait(false);
 

@@ -191,6 +191,68 @@ public sealed class MasterPasswordViewModelTests
     }
 
     [Fact]
+    public void HangulInput_IsRejectedAndReported()
+    {
+        MasterPasswordViewModel gate = Create(new AppSettings());
+
+        gate.Password = "비밀번호";
+
+        Assert.Empty(gate.Password);
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, gate.ErrorMessage);
+    }
+
+    [Fact]
+    public void MixedInput_KeepsOnlyTheAsciiCharacters()
+    {
+        MasterPasswordViewModel gate = Create(new AppSettings());
+
+        gate.Password = "pass비밀word123";
+
+        Assert.Equal("password123", gate.Password);
+    }
+
+    [Theory]
+    [InlineData("correct horse battery staple")]
+    [InlineData("P@ssw0rd!#$%^&*()")]
+    [InlineData("abcXYZ0189~`{}[]|\\:;\"'<>,.?/")]
+    public void PrintableAsciiPasswords_PassThroughUnchanged(string password)
+    {
+        MasterPasswordViewModel gate = Create(new AppSettings());
+
+        gate.Password = password;
+
+        Assert.Equal(password, gate.Password);
+        Assert.Empty(gate.ErrorMessage);
+    }
+
+    [Fact]
+    public void ConfirmationField_IsFilteredTheSameWay()
+    {
+        MasterPasswordViewModel gate = Create(new AppSettings());
+
+        gate.ConfirmPassword = "테스트pw";
+
+        Assert.Equal("pw", gate.ConfirmPassword);
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, gate.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task AVaultCreatedThroughTheFilteredFields_UnlocksWithTheSameTypedText()
+    {
+        MasterPasswordViewModel gate = Create(new AppSettings());
+
+        // What the user typed with an IME active, and what should actually be stored.
+        gate.Password = "secret비밀123";
+        gate.ConfirmPassword = "secret비밀123";
+        await gate.SubmitCommand.ExecuteAsync(null);
+
+        MasterPasswordVault.UnlockedVault? vault = await gate.Completion;
+
+        Assert.NotNull(vault);
+        Assert.NotNull(MasterPasswordVault.TryUnlock("secret123", vault!.Settings, out _));
+    }
+
+    [Fact]
     public async Task TypingAgain_ClearsThePreviousErrorMessage()
     {
         MasterPasswordViewModel gate = Create(ConfiguredSettings("correct horse"));
