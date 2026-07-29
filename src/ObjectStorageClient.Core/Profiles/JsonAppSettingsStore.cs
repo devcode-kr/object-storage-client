@@ -65,13 +65,12 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
             // definition, which would lock the user out of their own credentials.
             string temporaryPath = _filePath + ".tmp";
 
-            await using (FileStream stream = File.Create(temporaryPath))
+            await using (FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath))
             {
                 await JsonSerializer.SerializeAsync(stream, settings, SerializerOptions, cancellationToken)
                     .ConfigureAwait(false);
             }
 
-            AppPaths.TryRestrictToOwner(temporaryPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporaryPath, _filePath, overwrite: true);
         }
         finally

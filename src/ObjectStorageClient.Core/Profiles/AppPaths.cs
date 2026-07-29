@@ -37,6 +37,50 @@ public static class AppPaths
         return ConfigDirectory;
     }
 
+    /// <summary>
+    /// Creates (or truncates) a file that only the owner can read, from the moment it exists.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>File.Create</c> applies the process umask, which on a typical Unix system yields 0644 —
+    /// so a chmod issued after writing leaves a window where the file is world-readable. Both
+    /// stores write through a temporary file and one of them holds encrypted credentials, so the
+    /// mode is set before any content is written.
+    /// </para>
+    /// <para>
+    /// Two steps are needed. <see cref="FileStreamOptions.UnixCreateMode"/> only applies when the
+    /// file is genuinely created; for an existing path <see cref="FileMode.Create"/> truncates but
+    /// keeps the old mode. An interrupted save leaves exactly such a stale 0644 temporary file, so
+    /// the mode is also applied explicitly — still ahead of the first byte.
+    /// </para>
+    /// </remarks>
+    public static FileStream CreateOwnerOnlyFile(string path)
+    {
+        const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        bool isUnix = !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        FileStreamOptions options = new()
+        {
+            Mode = FileMode.Create,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+        };
+
+        if (isUnix)
+        {
+            options.UnixCreateMode = ownerOnly;
+        }
+
+        FileStream stream = new(path, options);
+
+        if (isUnix)
+        {
+            TryRestrictToOwner(path, ownerOnly);
+        }
+
+        return stream;
+    }
+
     /// <summary>Best-effort chmod 600/700. Silently ignored on Windows and on filesystems without POSIX modes.</summary>
     public static void TryRestrictToOwner(string path, UnixFileMode mode)
     {

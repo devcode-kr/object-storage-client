@@ -126,13 +126,12 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
         // Write-then-replace so an interrupted save cannot truncate the existing site list.
         string temporaryPath = _filePath + ".tmp";
 
-        await using (FileStream stream = File.Create(temporaryPath))
+        await using (FileStream stream = AppPaths.CreateOwnerOnlyFile(temporaryPath))
         {
             await JsonSerializer.SerializeAsync(stream, document, SerializerOptions, cancellationToken)
                 .ConfigureAwait(false);
         }
 
-        AppPaths.TryRestrictToOwner(temporaryPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         File.Move(temporaryPath, _filePath, overwrite: true);
     }
 
