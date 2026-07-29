@@ -56,10 +56,10 @@ For a local MinIO instance:
 
 Path-style addressing is enabled automatically for MinIO and other self-hosted gateways.
 
-**Disable request checksums** is on by default for every provider except Amazon S3. The AWS SDK
-otherwise sends `x-amz-checksum-*` headers that many S3-compatible gateways do not implement,
-which makes uploads fail with a bare `NotImplemented`. Both toggles are under *Advanced* in the
-Site Manager.
+**Disable request checksums** and **Disable chunked upload encoding** are both on by default for
+every provider except Amazon S3. The AWS SDK otherwise sends `x-amz-checksum-*` headers and
+`aws-chunked` request bodies, which many S3-compatible gateways do not implement — uploads then
+fail with a bare `NotImplemented`. All of these toggles live under *Advanced* in the Site Manager.
 
 ## Packaging
 

@@ -133,6 +133,8 @@
                     IsChecked="{Binding ForcePathStyle, Mode=TwoWay}" />
           <CheckBox Content="Disable request checksums (turn off only for Amazon S3 — other gateways answer NotImplemented)"
                     IsChecked="{Binding DisableRequestChecksums, Mode=TwoWay}" />
+          <CheckBox Content="Disable chunked upload encoding (turn off only for Amazon S3)"
+                    IsChecked="{Binding DisableChunkedEncoding, Mode=TwoWay}" />
           <CheckBox Content="Accept any TLS certificate (development endpoints only)"
                     IsChecked="{Binding AllowInsecureCertificates, Mode=TwoWay}" />
 

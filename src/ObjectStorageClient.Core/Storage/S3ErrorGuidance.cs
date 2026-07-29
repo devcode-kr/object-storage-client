@@ -36,10 +36,11 @@ public static class S3ErrorGuidance
     public static string? HintFor(string? errorCode) => errorCode switch
     {
         "NotImplemented" =>
-            "The endpoint does not implement something this request used. Most often that is the "
-            + "AWS SDK's checksum headers: enable \"Disable request checksums\" in the site's "
-            + "Advanced settings. If it persists on large files only, the gateway likely does not "
-            + "support multipart uploads.",
+            "The endpoint does not implement something this request used. Check that both "
+            + "\"Disable request checksums\" and \"Disable chunked upload encoding\" are switched on "
+            + "in the site's Advanced settings — the AWS SDK sends checksum headers and aws-chunked "
+            + "bodies by default, and many gateways reject them. If it happens only on files above "
+            + "16 MB, the gateway likely does not support multipart uploads.",
 
         "AccessDenied" =>
             "The credentials are valid but not allowed this operation. Check the key's policy and "

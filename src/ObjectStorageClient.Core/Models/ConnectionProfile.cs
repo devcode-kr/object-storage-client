@@ -48,6 +48,13 @@ public sealed record ConnectionProfile
     /// </summary>
     public bool DisableRequestChecksums { get; init; } = true;
 
+    /// <summary>
+    /// Send uploads as a single signed payload instead of an <c>aws-chunked</c> body.
+    /// Defaults to <c>true</c>: chunked upload encoding is the other thing gateways answer
+    /// <c>NotImplemented</c> to, and it cannot be turned off through <c>TransferUtility</c>.
+    /// </summary>
+    public bool DisableChunkedEncoding { get; init; } = true;
+
     public int TimeoutSeconds { get; init; } = 100;
 
     public int MaxConcurrentTransfers { get; init; } = 3;

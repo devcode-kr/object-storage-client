@@ -29,8 +29,9 @@ public static class StorageProviderCatalog
             DisplayName = "Amazon S3",
             EndpointTemplate = "https://s3.{region}.amazonaws.com",
             DefaultRegion = "us-east-1",
-            // The only provider known to implement the SDK's checksum headers.
+            // The only provider known to implement the SDK's checksum headers and aws-chunked bodies.
             DisableRequestChecksums = false,
+            DisableChunkedEncoding = false,
             Regions =
             [
                 "us-east-1", "us-east-2", "us-west-1", "us-west-2",

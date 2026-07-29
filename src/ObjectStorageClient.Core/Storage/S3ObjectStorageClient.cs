@@ -16,6 +16,9 @@ namespace ObjectStorageClient.Core.Storage;
 /// </summary>
 public sealed class S3ObjectStorageClient : IObjectStorageClient
 {
+    /// <summary>Matches <c>TransferUtilityConfig.MinSizeBeforePartUpload</c> (16 MiB).</summary>
+    internal const long MultipartThresholdBytes = 16 * 1024 * 1024;
+
     private readonly AmazonS3Client _client;
     private readonly TransferUtility _transferUtility;
 
@@ -305,10 +308,20 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
         IProgress<TransferProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        string normalizedKey = ObjectKey.Normalize(key);
+
+        if (Profile.DisableChunkedEncoding)
+        {
+            await InvokeAsync(() =>
+                UploadWithoutChunkEncodingAsync(bucket, normalizedKey, sourcePath, progress, cancellationToken))
+                .ConfigureAwait(false);
+            return;
+        }
+
         TransferUtilityUploadRequest request = new()
         {
             BucketName = bucket,
-            Key = ObjectKey.Normalize(key),
+            Key = normalizedKey,
             FilePath = sourcePath,
         };
 
@@ -319,6 +332,143 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
         }
 
         await InvokeAsync(() => _transferUtility.UploadAsync(request, cancellationToken)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Uploads without <c>aws-chunked</c> transfer encoding, which many S3-compatible gateways
+    /// answer <c>NotImplemented</c> to.
+    /// </summary>
+    /// <remarks>
+    /// <c>TransferUtility</c> cannot do this: <c>UseChunkEncoding</c> exists on
+    /// <see cref="PutObjectRequest"/> and <see cref="UploadPartRequest"/> but not on
+    /// <c>TransferUtilityUploadRequest</c>, so the requests are issued directly instead.
+    /// Parts are uploaded sequentially — slower than the parallel <c>TransferUtility</c> path, but
+    /// the queue already runs several files at once, and correctness matters more here.
+    /// </remarks>
+    private async Task UploadWithoutChunkEncodingAsync(
+        string bucket,
+        string key,
+        string sourcePath,
+        IProgress<TransferProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        long length = new FileInfo(sourcePath).Length;
+
+        if (length < MultipartThresholdBytes)
+        {
+            PutObjectRequest request = new()
+            {
+                BucketName = bucket,
+                Key = key,
+                FilePath = sourcePath,
+                UseChunkEncoding = false,
+            };
+
+            if (progress is not null)
+            {
+                request.StreamTransferProgress += (_, args) =>
+                    progress.Report(new TransferProgress(args.TransferredBytes, args.TotalBytes));
+            }
+
+            await _client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await UploadMultipartAsync(bucket, key, sourcePath, length, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task UploadMultipartAsync(
+        string bucket,
+        string key,
+        string sourcePath,
+        long length,
+        IProgress<TransferProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        InitiateMultipartUploadResponse initiated = await _client.InitiateMultipartUploadAsync(
+            new InitiateMultipartUploadRequest { BucketName = bucket, Key = key },
+            cancellationToken).ConfigureAwait(false);
+
+        long partSize = CalculatePartSize(length);
+        List<PartETag> parts = [];
+        long completedBytes = 0;
+
+        try
+        {
+            int partNumber = 1;
+
+            for (long offset = 0; offset < length; offset += partSize, partNumber++)
+            {
+                long thisPart = Math.Min(partSize, length - offset);
+
+                UploadPartRequest request = new()
+                {
+                    BucketName = bucket,
+                    Key = key,
+                    UploadId = initiated.UploadId,
+                    PartNumber = partNumber,
+                    FilePath = sourcePath,
+                    FilePosition = offset,
+                    PartSize = thisPart,
+                    UseChunkEncoding = false,
+                };
+
+                if (progress is not null)
+                {
+                    long alreadyDone = completedBytes;
+                    request.StreamTransferProgress += (_, args) =>
+                        progress.Report(new TransferProgress(alreadyDone + args.TransferredBytes, length));
+                }
+
+                UploadPartResponse response = await _client.UploadPartAsync(request, cancellationToken)
+                    .ConfigureAwait(false);
+
+                parts.Add(new PartETag(partNumber, response.ETag));
+                completedBytes += thisPart;
+                progress?.Report(new TransferProgress(completedBytes, length));
+            }
+
+            await _client.CompleteMultipartUploadAsync(
+                new CompleteMultipartUploadRequest
+                {
+                    BucketName = bucket,
+                    Key = key,
+                    UploadId = initiated.UploadId,
+                    PartETags = parts,
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Abandoned parts keep consuming storage and are billed, so clean up even when the
+            // caller cancelled — hence CancellationToken.None.
+            try
+            {
+                await _client.AbortMultipartUploadAsync(
+                    new AbortMultipartUploadRequest
+                    {
+                        BucketName = bucket,
+                        Key = key,
+                        UploadId = initiated.UploadId,
+                    },
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception)
+            {
+                // Nothing more to do; surface the original failure instead.
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>Keeps the part count inside S3's 10,000-part limit.</summary>
+    internal static long CalculatePartSize(long length)
+    {
+        const int maxParts = 10_000;
+        long minimum = (length / maxParts) + 1;
+
+        return Math.Max(MultipartThresholdBytes, minimum);
     }
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken = default) =>

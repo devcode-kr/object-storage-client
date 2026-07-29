@@ -80,6 +80,19 @@ Provider quirks also flow through `BuildConfig`: `DisableRequestChecksums` sets
 implement them answer `NotImplemented` with no further detail, which fails every upload. Amazon
 S3 is the only preset that turns checksums back on. Do not "fix" this default to match the SDK.
 
+There is a **second, independent** compatibility hazard: `aws-chunked` upload bodies.
+`UseChunkEncoding` exists on `PutObjectRequest` and `UploadPartRequest` but **not** on
+`TransferUtilityUploadRequest`, and there is no config-level switch — so as long as uploads go
+through `TransferUtility` they always send `Content-Encoding: aws-chunked` and
+`x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, which the same gateways reject.
+That is why `DisableChunkedEncoding` (default `true`) makes `UploadAsync` issue `PutObject`
+directly below 16 MiB and hand-roll multipart above it, rather than configuring TransferUtility.
+`UploadRequestEncodingTests` captures the real request against a local `HttpListener`, because
+no assertion over `AmazonS3Config` can see a per-request decision.
+
+The hand-rolled multipart path uploads parts sequentially and aborts the upload on failure —
+abandoned parts are billed. `CalculatePartSize` keeps the part count within S3's 10,000 limit.
+
 `S3ErrorGuidance` maps the bare error codes these gateways return into actionable text, and
 `S3ObjectStorageClient` wraps SDK calls so failures surface as `StorageOperationException` with
 that text. `FindS3Exception` unwraps `AggregateException` because `TransferUtility` nests

@@ -68,8 +68,13 @@ public sealed partial class ConnectionEditorViewModel : ViewModelBase
     [ObservableProperty]
     private bool _allowInsecureCertificates;
 
+    // Both default on: the SDK's checksum headers and aws-chunked bodies are what
+    // S3-compatible gateways reject. Only the Amazon S3 preset turns them off.
     [ObservableProperty]
-    private bool _disableRequestChecksums;
+    private bool _disableRequestChecksums = true;
+
+    [ObservableProperty]
+    private bool _disableChunkedEncoding = true;
 
     [ObservableProperty]
     private int _timeoutSeconds = 100;
@@ -167,6 +172,7 @@ public sealed partial class ConnectionEditorViewModel : ViewModelBase
             ForcePathStyle = profile.ForcePathStyle;
             AllowInsecureCertificates = profile.AllowInsecureCertificates;
             DisableRequestChecksums = profile.DisableRequestChecksums;
+            DisableChunkedEncoding = profile.DisableChunkedEncoding;
             TimeoutSeconds = profile.TimeoutSeconds;
             MaxConcurrentTransfers = profile.MaxConcurrentTransfers;
 
@@ -202,6 +208,7 @@ public sealed partial class ConnectionEditorViewModel : ViewModelBase
         ForcePathStyle = ForcePathStyle,
         AllowInsecureCertificates = AllowInsecureCertificates,
         DisableRequestChecksums = DisableRequestChecksums,
+        DisableChunkedEncoding = DisableChunkedEncoding,
         TimeoutSeconds = TimeoutSeconds,
         MaxConcurrentTransfers = MaxConcurrentTransfers,
         Proxy = new ProxySettings
@@ -272,6 +279,7 @@ public sealed partial class ConnectionEditorViewModel : ViewModelBase
             Region = preset.DefaultRegion;
             ForcePathStyle = preset.ForcePathStyle;
             DisableRequestChecksums = preset.DisableRequestChecksums;
+            DisableChunkedEncoding = preset.DisableChunkedEncoding;
 
             if (seedEndpoint)
             {

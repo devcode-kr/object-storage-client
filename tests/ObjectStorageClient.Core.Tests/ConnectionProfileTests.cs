@@ -100,6 +100,14 @@ public sealed class ConnectionProfileTests
     public void NewProfile_DisablesRequestChecksumsByDefault() =>
         Assert.True(new ConnectionProfile().DisableRequestChecksums);
 
+    /// <summary>
+    /// aws-chunked upload bodies are the other thing gateways answer NotImplemented to, and
+    /// TransferUtility offers no way to switch them off — so a new profile must start without them.
+    /// </summary>
+    [Fact]
+    public void NewProfile_DisablesChunkedEncodingByDefault() =>
+        Assert.True(new ConnectionProfile().DisableChunkedEncoding);
+
     [Fact]
     public void Validate_RequiresAnAccountIdForProvidersThatEmbedItAndHaveNoManualUrl()
     {
@@ -167,8 +175,20 @@ public sealed class StorageProviderCatalogTests
     }
 
     [Fact]
-    public void CustomProvider_DisablesRequestChecksums() =>
+    public void AmazonS3_IsTheOnlyProviderThatKeepsChunkedUploadEncoding()
+    {
+        StorageProviderPreset[] withChunking =
+            [.. StorageProviderCatalog.All.Where(preset => !preset.DisableChunkedEncoding)];
+
+        Assert.Equal("aws", Assert.Single(withChunking).Id);
+    }
+
+    [Fact]
+    public void CustomProvider_DisablesBothCompatibilityHazards()
+    {
         Assert.True(StorageProviderCatalog.Custom.DisableRequestChecksums);
+        Assert.True(StorageProviderCatalog.Custom.DisableChunkedEncoding);
+    }
 }
 
 public sealed class ProxySettingsTests

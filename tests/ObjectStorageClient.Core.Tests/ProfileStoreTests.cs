@@ -291,6 +291,7 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         {
             ForcePathStyle = false,
             DisableRequestChecksums = false,
+            DisableChunkedEncoding = false,
             AllowInsecureCertificates = false,
         });
 
@@ -298,6 +299,7 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
 
         Assert.False(actual.ForcePathStyle);
         Assert.False(actual.DisableRequestChecksums);
+        Assert.False(actual.DisableChunkedEncoding);
         Assert.False(actual.AllowInsecureCertificates);
     }
 
@@ -344,6 +346,7 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         ConnectionProfile actual = Assert.Single(await CreateStore().LoadAsync());
 
         Assert.True(actual.DisableRequestChecksums);
+        Assert.True(actual.DisableChunkedEncoding);
         Assert.Equal("legacy", actual.Name);
     }
 

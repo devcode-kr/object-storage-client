@@ -41,6 +41,12 @@ public sealed record StorageProviderPreset
     /// </summary>
     public bool DisableRequestChecksums { get; init; } = true;
 
+    /// <summary>
+    /// Upload without <c>aws-chunked</c> transfer encoding. Same reasoning as
+    /// <see cref="DisableRequestChecksums"/>: on by default, off only for Amazon S3.
+    /// </summary>
+    public bool DisableChunkedEncoding { get; init; } = true;
+
     /// <summary>True for the free-form entry that pre-fills nothing.</summary>
     public bool IsCustom { get; init; }
 
