@@ -55,8 +55,10 @@ For a local MinIO instance:
 | Bucket | optional — leave blank to browse all buckets |
 
 Path-style addressing is enabled automatically for MinIO and other self-hosted gateways.
-For services that reject the AWS SDK's default checksum headers (R2, B2, GCS), the preset also
-switches on **Disable request checksums**; both toggles remain available under *Advanced* in the
+
+**Disable request checksums** is on by default for every provider except Amazon S3. The AWS SDK
+otherwise sends `x-amz-checksum-*` headers that many S3-compatible gateways do not implement,
+which makes uploads fail with a bare `NotImplemented`. Both toggles are under *Advanced* in the
 Site Manager.
 
 ## Packaging

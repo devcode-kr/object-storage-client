@@ -62,6 +62,74 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
         return config;
     }
 
+    /// <summary>
+    /// Runs an SDK call, replacing an <see cref="AmazonS3Exception"/> with a
+    /// <see cref="StorageOperationException"/> carrying an actionable message. Cancellation is
+    /// deliberately left alone so the transfer queue can still tell "cancelled" from "failed".
+    /// </summary>
+    private static async Task<T> InvokeAsync<T>(Func<Task<T>> operation)
+    {
+        try
+        {
+            return await operation().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && FindS3Exception(ex) is not null)
+        {
+            throw Translate(ex);
+        }
+    }
+
+    private static async Task InvokeAsync(Func<Task> operation)
+    {
+        try
+        {
+            await operation().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && FindS3Exception(ex) is not null)
+        {
+            throw Translate(ex);
+        }
+    }
+
+    private static StorageOperationException Translate(Exception exception)
+    {
+        AmazonS3Exception s3Exception = FindS3Exception(exception)!;
+
+        return new StorageOperationException(S3ErrorGuidance.Describe(s3Exception), exception)
+        {
+            ErrorCode = s3Exception.ErrorCode ?? string.Empty,
+        };
+    }
+
+    /// <summary>TransferUtility wraps multipart failures, so the S3 exception may be nested.</summary>
+    private static AmazonS3Exception? FindS3Exception(Exception? exception)
+    {
+        while (exception is not null)
+        {
+            if (exception is AmazonS3Exception s3Exception)
+            {
+                return s3Exception;
+            }
+
+            if (exception is AggregateException aggregate)
+            {
+                foreach (Exception inner in aggregate.InnerExceptions)
+                {
+                    if (FindS3Exception(inner) is { } found)
+                    {
+                        return found;
+                    }
+                }
+
+                return null;
+            }
+
+            exception = exception.InnerException;
+        }
+
+        return null;
+    }
+
     private static AWSCredentials BuildCredentials(ConnectionProfile profile) =>
         string.IsNullOrWhiteSpace(profile.SessionToken)
             ? new BasicAWSCredentials(profile.AccessKeyId, profile.SecretAccessKey)
@@ -72,18 +140,19 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
         // Prefer the configured bucket: many keys are scoped to one bucket and cannot ListBuckets.
         if (!string.IsNullOrWhiteSpace(Profile.DefaultBucket))
         {
-            await _client.ListObjectsV2Async(
+            await InvokeAsync(() => _client.ListObjectsV2Async(
                 new ListObjectsV2Request
                 {
                     BucketName = Profile.DefaultBucket,
                     MaxKeys = 1,
                     Delimiter = "/",
                 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken)).ConfigureAwait(false);
             return;
         }
 
-        await _client.ListBucketsAsync(new ListBucketsRequest(), cancellationToken).ConfigureAwait(false);
+        await InvokeAsync(() => _client.ListBucketsAsync(new ListBucketsRequest(), cancellationToken))
+            .ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<StorageBucket>> ListBucketsAsync(CancellationToken cancellationToken = default)
@@ -112,7 +181,7 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
     {
         string normalizedPrefix = ObjectKey.NormalizePrefix(prefix);
 
-        ListObjectsV2Response response = await _client.ListObjectsV2Async(
+        ListObjectsV2Response response = await InvokeAsync(() => _client.ListObjectsV2Async(
             new ListObjectsV2Request
             {
                 BucketName = bucket,
@@ -121,7 +190,7 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
                 ContinuationToken = continuationToken,
                 MaxKeys = 1000,
             },
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken)).ConfigureAwait(false);
 
         List<RemoteEntry> entries = [];
 
@@ -167,7 +236,7 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
 
         do
         {
-            ListObjectsV2Response response = await _client.ListObjectsV2Async(
+            ListObjectsV2Response response = await InvokeAsync(() => _client.ListObjectsV2Async(
                 new ListObjectsV2Request
                 {
                     BucketName = bucket,
@@ -175,7 +244,7 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
                     ContinuationToken = token,
                     MaxKeys = 1000,
                 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken)).ConfigureAwait(false);
 
             foreach (S3Object s3Object in response.S3Objects ?? [])
             {
@@ -226,7 +295,7 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
                 progress.Report(new TransferProgress(args.TransferredBytes, args.TotalBytes));
         }
 
-        await _transferUtility.DownloadAsync(request, cancellationToken).ConfigureAwait(false);
+        await InvokeAsync(() => _transferUtility.DownloadAsync(request, cancellationToken)).ConfigureAwait(false);
     }
 
     public async Task UploadAsync(
@@ -249,13 +318,13 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
                 progress.Report(new TransferProgress(args.TransferredBytes, args.TotalBytes));
         }
 
-        await _transferUtility.UploadAsync(request, cancellationToken).ConfigureAwait(false);
+        await InvokeAsync(() => _transferUtility.UploadAsync(request, cancellationToken)).ConfigureAwait(false);
     }
 
     public async Task DeleteObjectAsync(string bucket, string key, CancellationToken cancellationToken = default) =>
-        await _client.DeleteObjectAsync(
+        await InvokeAsync(() => _client.DeleteObjectAsync(
             new DeleteObjectRequest { BucketName = bucket, Key = ObjectKey.Normalize(key) },
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken)).ConfigureAwait(false);
 
     public async Task CreateFolderAsync(string bucket, string prefix, CancellationToken cancellationToken = default)
     {
@@ -265,14 +334,14 @@ public sealed class S3ObjectStorageClient : IObjectStorageClient
             throw new ArgumentException("Folder prefix must not be empty.", nameof(prefix));
         }
 
-        await _client.PutObjectAsync(
+        await InvokeAsync(() => _client.PutObjectAsync(
             new PutObjectRequest
             {
                 BucketName = bucket,
                 Key = folderKey,
                 ContentBody = string.Empty,
             },
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken)).ConfigureAwait(false);
     }
 
     public ValueTask DisposeAsync()

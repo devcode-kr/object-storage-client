@@ -52,21 +52,40 @@ public sealed class S3ConfigurationTests
         Assert.Equal(TimeSpan.FromSeconds(5), config.Timeout);
     }
 
+    /// <summary>
+    /// SDK v4 sends x-amz-checksum-* by default and gateways that do not implement them answer
+    /// NotImplemented, so suppressing them is the default for everything but Amazon S3.
+    /// </summary>
     [Fact]
-    public void BuildConfig_LeavesChecksumsAtTheSdkDefaultUnlessTheProfileOptsOut()
+    public void BuildConfig_SuppressesChecksumsByDefault()
     {
         AmazonS3Config config = S3ObjectStorageClient.BuildConfig(BaseProfile());
+
+        Assert.Equal(RequestChecksumCalculation.WHEN_REQUIRED, config.RequestChecksumCalculation);
+        Assert.Equal(ResponseChecksumValidation.WHEN_REQUIRED, config.ResponseChecksumValidation);
+    }
+
+    [Fact]
+    public void BuildConfig_KeepsTheSdkChecksumBehaviourWhenTheProfileOptsIn()
+    {
+        AmazonS3Config config = S3ObjectStorageClient.BuildConfig(
+            BaseProfile() with { DisableRequestChecksums = false });
 
         Assert.NotEqual(RequestChecksumCalculation.WHEN_REQUIRED, config.RequestChecksumCalculation);
     }
 
     [Fact]
-    public void BuildConfig_DisablesChecksumsForGatewaysThatRejectThem()
+    public void BuildConfig_KeepsChecksumsForAnAmazonS3Profile()
     {
-        AmazonS3Config config = S3ObjectStorageClient.BuildConfig(BaseProfile() with { DisableRequestChecksums = true });
+        ConnectionProfile aws = ConnectionProfile.FromPreset(StorageProviderCatalog.Resolve("aws")) with
+        {
+            AccessKeyId = "key",
+            SecretAccessKey = "secret",
+        };
 
-        Assert.Equal(RequestChecksumCalculation.WHEN_REQUIRED, config.RequestChecksumCalculation);
-        Assert.Equal(ResponseChecksumValidation.WHEN_REQUIRED, config.ResponseChecksumValidation);
+        AmazonS3Config config = S3ObjectStorageClient.BuildConfig(aws);
+
+        Assert.NotEqual(RequestChecksumCalculation.WHEN_REQUIRED, config.RequestChecksumCalculation);
     }
 
     [Fact]

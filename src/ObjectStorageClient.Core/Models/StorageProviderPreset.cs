@@ -34,10 +34,12 @@ public sealed record StorageProviderPreset
     public bool RequiresAccountId { get; init; }
 
     /// <summary>
-    /// Suppress the SDK's opportunistic request checksums. Several S3-compatible gateways
-    /// reject the <c>x-amz-checksum-*</c> headers that AWS SDK v4 sends by default.
+    /// Suppress the SDK's opportunistic request checksums. AWS SDK v4 sends
+    /// <c>x-amz-checksum-*</c> and <c>aws-chunked</c> bodies by default, and gateways that do not
+    /// implement them answer <c>NotImplemented</c> — which is why this defaults to <c>true</c>
+    /// and only Amazon S3 itself opts back in.
     /// </summary>
-    public bool DisableRequestChecksums { get; init; }
+    public bool DisableRequestChecksums { get; init; } = true;
 
     /// <summary>True for the free-form entry that pre-fills nothing.</summary>
     public bool IsCustom { get; init; }

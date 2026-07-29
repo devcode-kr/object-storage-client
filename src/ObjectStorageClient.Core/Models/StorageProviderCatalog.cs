@@ -29,6 +29,8 @@ public static class StorageProviderCatalog
             DisplayName = "Amazon S3",
             EndpointTemplate = "https://s3.{region}.amazonaws.com",
             DefaultRegion = "us-east-1",
+            // The only provider known to implement the SDK's checksum headers.
+            DisableRequestChecksums = false,
             Regions =
             [
                 "us-east-1", "us-east-2", "us-west-1", "us-west-2",
@@ -54,7 +56,6 @@ public static class StorageProviderCatalog
             DefaultRegion = "auto",
             Regions = ["auto"],
             RequiresAccountId = true,
-            DisableRequestChecksums = true,
             Hint = "Requires your Cloudflare account ID.",
         },
         new()
@@ -64,7 +65,6 @@ public static class StorageProviderCatalog
             EndpointTemplate = "https://s3.{region}.backblazeb2.com",
             DefaultRegion = "us-west-004",
             Regions = ["us-west-000", "us-west-001", "us-west-002", "us-west-004", "eu-central-003"],
-            DisableRequestChecksums = true,
         },
         new()
         {
@@ -89,7 +89,6 @@ public static class StorageProviderCatalog
             EndpointTemplate = "https://storage.googleapis.com",
             DefaultRegion = "auto",
             Regions = ["auto"],
-            DisableRequestChecksums = true,
             Hint = "Requires an HMAC key from the Cloud Storage interoperability settings.",
         },
         new()

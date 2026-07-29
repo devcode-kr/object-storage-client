@@ -277,6 +277,76 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.Equal("Second", actual.Name);
     }
 
+    /// <summary>
+    /// Regression: the serializer used to omit `false` and `0`, while these properties initialise
+    /// to `true`/non-zero — so a saved "off" reloaded as "on" and path-style addressing could not
+    /// be turned off at all.
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_PersistsFlagsWhoseValueMatchesTheClrDefault()
+    {
+        JsonConnectionProfileStore store = CreateStore();
+
+        await store.SaveAsync(SampleProfile() with
+        {
+            ForcePathStyle = false,
+            DisableRequestChecksums = false,
+            AllowInsecureCertificates = false,
+        });
+
+        ConnectionProfile actual = Assert.Single(await store.LoadAsync());
+
+        Assert.False(actual.ForcePathStyle);
+        Assert.False(actual.DisableRequestChecksums);
+        Assert.False(actual.AllowInsecureCertificates);
+    }
+
+    [Fact]
+    public async Task SaveAsync_PersistsAnEnabledFlagJustTheSame()
+    {
+        JsonConnectionProfileStore store = CreateStore();
+
+        await store.SaveAsync(SampleProfile() with { ForcePathStyle = true, DisableRequestChecksums = true });
+
+        ConnectionProfile actual = Assert.Single(await store.LoadAsync());
+
+        Assert.True(actual.ForcePathStyle);
+        Assert.True(actual.DisableRequestChecksums);
+    }
+
+    /// <summary>
+    /// Profiles written before checksums defaulted to disabled simply omit the property; they
+    /// should pick up the safer default rather than keep failing against the same gateway.
+    /// </summary>
+    [Fact]
+    public async Task LoadAsync_TreatsAnAbsentChecksumFlagAsDisabled()
+    {
+        await File.WriteAllTextAsync(_file, """
+            {
+              "version": 1,
+              "sites": [
+                {
+                  "profile": {
+                    "id": "8a1c1d1e-0000-4000-8000-000000000001",
+                    "name": "legacy",
+                    "providerId": "custom",
+                    "serviceUrl": "https://storage.example.com",
+                    "region": "us-east-1",
+                    "accessKeyId": "key",
+                    "forcePathStyle": true
+                  },
+                  "secretAccessKey": ""
+                }
+              ]
+            }
+            """);
+
+        ConnectionProfile actual = Assert.Single(await CreateStore().LoadAsync());
+
+        Assert.True(actual.DisableRequestChecksums);
+        Assert.Equal("legacy", actual.Name);
+    }
+
     [Fact]
     public async Task LoadAsync_ReturnsEmptyForACorruptedFileInsteadOfThrowing()
     {

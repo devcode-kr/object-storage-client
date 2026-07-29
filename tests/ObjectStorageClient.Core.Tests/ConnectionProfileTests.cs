@@ -92,6 +92,14 @@ public sealed class ConnectionProfileTests
         Assert.Empty(profile.SecretAccessKey);
     }
 
+    /// <summary>
+    /// The SDK's checksum headers make S3-compatible gateways answer NotImplemented, so a
+    /// hand-built profile must start with them off.
+    /// </summary>
+    [Fact]
+    public void NewProfile_DisablesRequestChecksumsByDefault() =>
+        Assert.True(new ConnectionProfile().DisableRequestChecksums);
+
     [Fact]
     public void Validate_RequiresAnAccountIdForProvidersThatEmbedItAndHaveNoManualUrl()
     {
@@ -148,6 +156,19 @@ public sealed class StorageProviderCatalogTests
     [Fact]
     public void Catalog_AlwaysOffersTheCustomEntryLast() =>
         Assert.True(StorageProviderCatalog.All[^1].IsCustom);
+
+    [Fact]
+    public void AmazonS3_IsTheOnlyProviderThatKeepsRequestChecksumsOn()
+    {
+        StorageProviderPreset[] withChecksums =
+            [.. StorageProviderCatalog.All.Where(preset => !preset.DisableRequestChecksums)];
+
+        Assert.Equal("aws", Assert.Single(withChecksums).Id);
+    }
+
+    [Fact]
+    public void CustomProvider_DisablesRequestChecksums() =>
+        Assert.True(StorageProviderCatalog.Custom.DisableRequestChecksums);
 }
 
 public sealed class ProxySettingsTests

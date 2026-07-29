@@ -14,7 +14,10 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
         WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
+        // Must not be WhenWritingDefault: that omits `false` and `0`, while several profile
+        // properties initialise to `true`/non-zero. An omitted property falls back to the
+        // initialiser on load, so writing ForcePathStyle=false would silently reload as true.
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 

@@ -41,8 +41,12 @@ public sealed record ConnectionProfile
     /// <summary>Skip TLS certificate validation. Only for self-signed development endpoints.</summary>
     public bool AllowInsecureCertificates { get; init; }
 
-    /// <summary>See <see cref="StorageProviderPreset.DisableRequestChecksums"/>.</summary>
-    public bool DisableRequestChecksums { get; init; }
+    /// <summary>
+    /// See <see cref="StorageProviderPreset.DisableRequestChecksums"/>. Defaults to <c>true</c>
+    /// because the AWS SDK's checksum headers are what most S3-compatible gateways reject;
+    /// only the Amazon S3 preset turns them back on.
+    /// </summary>
+    public bool DisableRequestChecksums { get; init; } = true;
 
     public int TimeoutSeconds { get; init; } = 100;
 

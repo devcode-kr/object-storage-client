@@ -131,7 +131,7 @@
 
           <CheckBox Content="Use path-style addressing (required by MinIO, Ceph and most self-hosted gateways)"
                     IsChecked="{Binding ForcePathStyle, Mode=TwoWay}" />
-          <CheckBox Content="Disable request checksums (needed by R2, B2 and some gateways)"
+          <CheckBox Content="Disable request checksums (turn off only for Amazon S3 — other gateways answer NotImplemented)"
                     IsChecked="{Binding DisableRequestChecksums, Mode=TwoWay}" />
           <CheckBox Content="Accept any TLS certificate (development endpoints only)"
                     IsChecked="{Binding AllowInsecureCertificates, Mode=TwoWay}" />

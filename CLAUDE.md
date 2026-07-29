@@ -75,8 +75,16 @@ glob-to-regex bypass list, and the opt-in "accept any TLS certificate" switch.
 the layer most likely to break silently against a non-AWS gateway.
 
 Provider quirks also flow through `BuildConfig`: `DisableRequestChecksums` sets
-`RequestChecksumCalculation.WHEN_REQUIRED`, because SDK v4 sends `x-amz-checksum-*` headers by
-default and R2/B2/GCS reject them.
+`RequestChecksumCalculation.WHEN_REQUIRED`. **It defaults to `true`** — AWS SDK v4 sends
+`x-amz-checksum-*` headers and `aws-chunked` bodies by default, and gateways that do not
+implement them answer `NotImplemented` with no further detail, which fails every upload. Amazon
+S3 is the only preset that turns checksums back on. Do not "fix" this default to match the SDK.
+
+`S3ErrorGuidance` maps the bare error codes these gateways return into actionable text, and
+`S3ObjectStorageClient` wraps SDK calls so failures surface as `StorageOperationException` with
+that text. `FindS3Exception` unwraps `AggregateException` because `TransferUtility` nests
+multipart failures; `OperationCanceledException` is deliberately not caught, so the transfer
+queue can still distinguish "cancelled" from "failed".
 
 ### Object keys are not file paths
 
@@ -123,6 +131,11 @@ longer decryptable. The same path handles a `config.json` whose vault definition
 
 Note `MasterPasswordViewModel.OnPasswordChanged` clears `ErrorMessage`, so any code that both
 clears the password box and reports an error must clear the box **first**.
+
+`JsonConnectionProfileStore` must not use `JsonIgnoreCondition.WhenWritingDefault`: it omits
+`false` and `0`, while `ForcePathStyle`, `DisableRequestChecksums`, `TimeoutSeconds` and
+`MaxConcurrentTransfers` all initialise to `true`/non-zero. An omitted property falls back to the
+initialiser on load, so a saved "off" silently reloaded as "on".
 
 Both stores write through a `.tmp` file and rename. Always open it with
 `AppPaths.CreateOwnerOnlyFile`, never `File.Create`: the latter applies the umask (0644 on a
