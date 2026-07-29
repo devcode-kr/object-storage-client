@@ -1,9 +1,11 @@
 using Avalonia.Controls;
 using Avalonia.Headless;
+using Avalonia.Input;
 using Avalonia.Headless.XUnit;
 using ObjectStorageClient.App.ViewModels;
 using ObjectStorageClient.App.Views;
 using ObjectStorageClient.Core.Models;
+using ObjectStorageClient.Core.Profiles;
 using Xunit;
 
 namespace ObjectStorageClient.App.Tests;
@@ -16,12 +18,27 @@ namespace ObjectStorageClient.App.Tests;
 /// </summary>
 public sealed class MasterPasswordInputTests
 {
-    private static (MasterPasswordWindow Window, MasterPasswordViewModel ViewModel, TextBox Box) Open()
+    /// <summary>
+    /// Both startup dialogs are the same window in different modes: "Set a master password" on
+    /// first run, "Unlock" on every run after. Anything input-related must hold in both, so the
+    /// core cases are run against each.
+    /// </summary>
+    public static TheoryData<bool> BothModes => new() { false, true };
+
+    private static (MasterPasswordWindow Window, MasterPasswordViewModel ViewModel, TextBox Box) Open(
+        bool unlocking = false)
     {
-        MasterPasswordViewModel viewModel = new(new AppSettings(), "/tmp/config");
+        AppSettings settings = unlocking
+            ? new AppSettings { MasterPassword = MasterPasswordVault.Create("existing-pw", 1_000).Settings }
+            : new AppSettings();
+
+        MasterPasswordViewModel viewModel = new(settings, "/tmp/config");
         MasterPasswordWindow window = new() { DataContext = viewModel };
 
         window.Show();
+
+        // Guard the fixture itself: a mode mix-up would quietly make the theory test one mode twice.
+        Assert.Equal(unlocking, viewModel.IsUnlocking);
 
         TextBox box = window.GetControl<TextBox>("PasswordBox");
         box.Focus();
@@ -29,10 +46,11 @@ public sealed class MasterPasswordInputTests
         return (window, viewModel, box);
     }
 
-    [AvaloniaFact]
-    public void HangulTextInput_NeverReachesTheBoxOrTheViewModel()
+    [AvaloniaTheory]
+    [MemberData(nameof(BothModes))]
+    public void HangulTextInput_NeverReachesTheBoxOrTheViewModel(bool unlocking)
     {
-        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open();
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open(unlocking);
 
         window.KeyTextInput("비밀번호");
 
@@ -40,10 +58,11 @@ public sealed class MasterPasswordInputTests
         Assert.Empty(viewModel.Password);
     }
 
-    [AvaloniaFact]
-    public void AsciiTextInput_IsAccepted()
+    [AvaloniaTheory]
+    [MemberData(nameof(BothModes))]
+    public void AsciiTextInput_IsAccepted(bool unlocking)
     {
-        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open();
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open(unlocking);
 
         window.KeyTextInput("Passw0rd!");
 
@@ -123,10 +142,11 @@ public sealed class MasterPasswordInputTests
     /// Asserts what the user actually sees, not just the view-model state: the red warning
     /// TextBlock has to become visible and carry the message.
     /// </summary>
-    [AvaloniaFact]
-    public void TheWarningTextBlock_BecomesVisibleWithTheMessage()
+    [AvaloniaTheory]
+    [MemberData(nameof(BothModes))]
+    public void TheWarningTextBlock_BecomesVisibleWithTheMessage(bool unlocking)
     {
-        (MasterPasswordWindow window, _, _) = Open();
+        (MasterPasswordWindow window, _, _) = Open(unlocking);
         TextBlock warning = window.GetControl<TextBlock>("ErrorText");
 
         Assert.False(warning.IsVisible);
@@ -135,6 +155,44 @@ public sealed class MasterPasswordInputTests
 
         Assert.True(warning.IsVisible);
         Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, warning.Text);
+    }
+
+    /// <summary>
+    /// The confirmation field only exists on first run, but it must be filtered too — otherwise
+    /// a vault could be created from a confirmation the user never actually matched.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheConfirmationField_IsFilteredAsWell()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, _) = Open();
+        TextBox password = window.GetControl<TextBox>("PasswordBox");
+        TextBox confirm = window.GetControl<TextBox>("ConfirmPasswordBox");
+
+        // Tab across the way a user would: calling Focus() alone does not move the headless
+        // input root's keyboard focus, so the text would still land in the password box.
+        window.KeyPressQwerty(PhysicalKey.Tab, RawInputModifiers.None);
+
+        // Typing, then an IME committing its composition: two separate input events.
+        window.KeyTextInput("pw");
+        window.KeyTextInput("비밀");
+
+        Assert.True(
+            confirm.Text == "pw",
+            $"confirm='{confirm.Text}' password='{password.Text}'");
+        Assert.Equal("pw", viewModel.ConfirmPassword);
+        Assert.Empty(viewModel.Password);
+    }
+
+    [AvaloniaFact]
+    public void TheConfirmationField_StripsPastedText()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, _) = Open();
+        TextBox confirm = window.GetControl<TextBox>("ConfirmPasswordBox");
+
+        confirm.Text = "pw비밀";
+
+        Assert.Equal("pw", confirm.Text);
+        Assert.Equal("pw", viewModel.ConfirmPassword);
     }
 
     [AvaloniaFact]
