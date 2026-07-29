@@ -30,6 +30,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
         IConnectionProfileStore profileStore,
         ITransferQueue queue,
         IDialogService dialogs,
+        IClipboardService clipboard,
         LogViewModel log)
     {
         _clientFactory = clientFactory;
@@ -38,7 +39,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
         _dialogs = dialogs;
 
         Log = log;
-        Transfers = new TransferQueueViewModel(queue);
+        Transfers = new TransferQueueViewModel(queue, clipboard);
         Local = new LocalBrowserViewModel(log, dialogs, this);
         Remote = new RemoteBrowserViewModel(log, dialogs, this);
 

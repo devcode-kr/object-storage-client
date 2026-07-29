@@ -41,7 +41,26 @@
         <TabItem Header="{Binding FailedHeader}">
           <DataGrid ItemsSource="{Binding Failed}"
                     SelectedItem="{Binding SelectedItem, Mode=TwoWay}"
-                    SelectionMode="Single">
+                    SelectionMode="Single"
+                    PointerPressed="OnRowPointerPressed">
+            <DataGrid.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="Copy error message"
+                          Command="{Binding CopyErrorMessageCommand}"
+                          InputGesture="Ctrl+C" />
+                <MenuItem Header="Copy details" Command="{Binding CopyDetailsCommand}" />
+                <Separator />
+                <MenuItem Header="Copy local path" Command="{Binding CopyLocalPathCommand}" />
+                <MenuItem Header="Copy remote path" Command="{Binding CopyRemotePathCommand}" />
+                <Separator />
+                <MenuItem Header="Copy all failed transfers" Command="{Binding CopyAllFailedCommand}" />
+              </ContextMenu>
+            </DataGrid.ContextMenu>
+
+            <DataGrid.KeyBindings>
+              <KeyBinding Gesture="Ctrl+C" Command="{Binding CopyErrorMessageCommand}" />
+            </DataGrid.KeyBindings>
+
             <DataGrid.Columns>
               <DataGridTextColumn Header="" Width="30" Binding="{Binding DirectionGlyph}" />
               <DataGridTextColumn Header="Local file" Width="*" Binding="{Binding LocalPath}" />

@@ -101,6 +101,7 @@ public partial class App : Application
 
         services.AddSingleton<LogViewModel>();
         services.AddSingleton<IDialogService, DialogService>();
+        services.AddSingleton<IClipboardService, ClipboardService>();
         services.AddSingleton<MainWindowViewModel>();
 
         // Transient: the Site Manager gets a fresh editor every time it is opened.

@@ -12,6 +12,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="ObjectStorageClient.Core.Tests" />
+    <!-- Lets view-model tests build TransferItem fixtures in a given terminal state. -->
+    <InternalsVisibleTo Include="ObjectStorageClient.App.Tests" />
   </ItemGroup>
 
 </Project>

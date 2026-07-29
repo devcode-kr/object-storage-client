@@ -9,7 +9,8 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 - **Two-pane transfers** — local file system on the left, buckets and prefixes on the right,
   with upload/download through a background queue.
 - **Transfer queue** — queued / failed / successful tabs, per-item progress, cancel and retry.
-  Each transfer succeeds or fails on its own; one failure never stalls the rest.
+  Each transfer succeeds or fails on its own; one failure never stalls the rest. Right-click a
+  failed transfer to copy its error message, paths, or the whole failure list.
 - **Message log** — colour-coded request/response/error lines, as in an FTP client.
 - **Provider presets** — Amazon S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,
   DigitalOcean Spaces, Google Cloud Storage (S3 interop), NAVER Cloud Object Storage,

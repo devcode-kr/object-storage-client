@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Text;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -43,6 +44,28 @@ public sealed partial class TransferItemViewModel : ViewModelBase
 
     public TransferStatus Status => Model.Status;
 
+    /// <summary>Multi-line description of a single transfer, for pasting into a report or ticket.</summary>
+    public string ToDetailText()
+    {
+        StringBuilder builder = new();
+        builder.Append("Direction: ").AppendLine(DirectionText);
+        builder.Append("Local:     ").AppendLine(LocalPath);
+        builder.Append("Remote:    ").AppendLine(RemotePath);
+        builder.Append("Size:      ").AppendLine(SizeText);
+        builder.Append("Status:    ").AppendLine(StatusText);
+
+        if (!string.IsNullOrEmpty(ErrorMessage))
+        {
+            builder.Append("Reason:    ").AppendLine(ErrorMessage);
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    /// <summary>Single tab-separated row, so a whole list pastes into a spreadsheet.</summary>
+    public string ToRowText() =>
+        string.Join('\t', DirectionText, LocalPath, RemotePath, StatusText, ErrorMessage);
+
     /// <summary>Re-reads the model. Must be called on the UI thread.</summary>
     public void Refresh()
     {
@@ -64,11 +87,13 @@ public sealed partial class TransferItemViewModel : ViewModelBase
 public sealed partial class TransferQueueViewModel : ViewModelBase, IDisposable
 {
     private readonly ITransferQueue _queue;
+    private readonly IClipboardService _clipboard;
     private readonly Dictionary<Guid, TransferItemViewModel> _index = [];
 
-    public TransferQueueViewModel(ITransferQueue queue)
+    public TransferQueueViewModel(ITransferQueue queue, IClipboardService clipboard)
     {
         _queue = queue;
+        _clipboard = clipboard;
         _queue.ItemAdded += OnItemAdded;
         _queue.ItemUpdated += OnItemUpdated;
     }
@@ -81,7 +106,24 @@ public sealed partial class TransferQueueViewModel : ViewModelBase, IDisposable
     public ObservableCollection<TransferItemViewModel> Successful { get; } = [];
 
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(CopyErrorMessageCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyDetailsCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyLocalPathCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyRemotePathCommand))]
     private TransferItemViewModel? _selectedItem;
+
+    /// <summary>Gates the copy commands so the context menu greys out with nothing selected.</summary>
+    public bool HasSelection => SelectedItem is not null;
+
+    /// <summary>Separate from <see cref="HasSelection"/>: only failed rows carry a reason to copy.</summary>
+    public bool HasErrorMessage => !string.IsNullOrEmpty(SelectedItem?.ErrorMessage);
+
+    partial void OnSelectedItemChanged(TransferItemViewModel? value)
+    {
+        _ = value;
+        OnPropertyChanged(nameof(HasSelection));
+        OnPropertyChanged(nameof(HasErrorMessage));
+    }
 
     public string ActiveHeader => $"Queued files ({Active.Count})";
 
@@ -185,6 +227,51 @@ public sealed partial class TransferQueueViewModel : ViewModelBase, IDisposable
         }
 
         RaiseHeaders();
+    }
+
+    /// <summary>
+    /// Copy commands behind the transfer list's context menu. A failed transfer's reason is the
+    /// one thing users need to get out of the app — into a ticket, a search box, or a colleague's
+    /// chat — and it is otherwise stuck in a truncated grid cell.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(HasErrorMessage))]
+    private Task CopyErrorMessageAsync() => CopyAsync(SelectedItem?.ErrorMessage);
+
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private Task CopyLocalPathAsync() => CopyAsync(SelectedItem?.LocalPath);
+
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private Task CopyRemotePathAsync() => CopyAsync(SelectedItem?.RemotePath);
+
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private Task CopyDetailsAsync() => CopyAsync(SelectedItem?.ToDetailText());
+
+    /// <summary>Copies every failed transfer as a tab-separated table, header included.</summary>
+    [RelayCommand]
+    private Task CopyAllFailedAsync()
+    {
+        if (Failed.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        StringBuilder builder = new();
+        builder.AppendLine(string.Join('\t', "Direction", "Local file", "Remote file", "Status", "Reason"));
+
+        foreach (TransferItemViewModel item in Failed)
+        {
+            builder.AppendLine(item.ToRowText());
+        }
+
+        return CopyAsync(builder.ToString().TrimEnd());
+    }
+
+    private async Task CopyAsync(string? text)
+    {
+        if (!string.IsNullOrEmpty(text))
+        {
+            await _clipboard.SetTextAsync(text).ConfigureAwait(true);
+        }
     }
 
     [RelayCommand]

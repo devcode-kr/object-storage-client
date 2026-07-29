@@ -124,6 +124,12 @@ longer decryptable. The same path handles a `config.json` whose vault definition
 Note `MasterPasswordViewModel.OnPasswordChanged` clears `ErrorMessage`, so any code that both
 clears the password box and reports an error must clear the box **first**.
 
+Both stores write through a `.tmp` file and rename. Always open it with
+`AppPaths.CreateOwnerOnlyFile`, never `File.Create`: the latter applies the umask (0644 on a
+typical Unix box), which would expose the credentials file until a later chmod. That helper sets
+the mode twice on purpose — `UnixCreateMode` covers a fresh file, and an explicit chmod covers a
+stale temp left by an interrupted save, whose mode `FileMode.Create` would otherwise preserve.
+
 ## Conventions specific to this codebase
 
 - Views are `.axaml`; compiled bindings are on by default
@@ -134,6 +140,8 @@ clears the password box and reports an error must clear the box **first**.
 - Code-behind is limited to view-state plumbing with no MVVM equivalent: `DataGrid.SelectedItems`
   is not a bindable property, so `LocalPaneView`/`RemotePaneView` sync selection into the view
   model, and they handle double-click activation. No business logic belongs there.
+  `TransferQueueView` additionally selects the row under a right-click, because Avalonia's
+  `DataGrid` does not — without it a context-menu command acts on the previous selection.
 - Core's bucket type is `StorageBucket`, not `BucketInfo` — the latter collides with
   `Amazon.S3.Model.BucketInfo`.
 - Log colouring is done with style classes (`Classes.command`, `Classes.response`,
