@@ -79,8 +79,9 @@ screen offers to start over, which discards the saved sites along with the old k
 
 Quitting at the password prompt closes the app: there is no usable session without the key.
 
-The password field accepts English letters, digits and symbols only, so an input method left in a
-composing mode cannot put unexpected characters into it.
+The password fields switch the input method off, and accept English letters, digits and symbols
+only — so an IME left in a composing mode cannot put unexpected characters into your master
+password, and neither can a paste.
 
 ## Where your data is stored
 

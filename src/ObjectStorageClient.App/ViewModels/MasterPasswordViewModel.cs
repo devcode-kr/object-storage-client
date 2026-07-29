@@ -69,14 +69,12 @@ public sealed partial class MasterPasswordViewModel : ViewModelBase
     [ObservableProperty]
     private bool _canReset;
 
-    /// <summary>
-    /// Only printable ASCII is accepted, so an IME left in Hangul (or any other composing) mode
-    /// cannot put characters into the master password.
-    /// </summary>
+    /// <summary>Only printable ASCII is accepted in the master password.</summary>
     /// <remarks>
-    /// There is no cross-platform way to switch the OS input method to English from Avalonia, so
-    /// the guarantee is enforced by rejecting the characters instead. Filtering here rather than
-    /// in the view also covers pasting.
+    /// The IME itself is switched off on the fields via
+    /// <c>InputMethod.IsInputMethodEnabled="False"</c>, which stops composed input at the source
+    /// on all three platforms. This filter covers what that cannot: pasting. Disabling the input
+    /// method does nothing to the clipboard, so a paste could still carry Hangul.
     /// </remarks>
     public const string NonAsciiRejectedMessage =
         "The master password accepts English letters, digits and symbols only.";

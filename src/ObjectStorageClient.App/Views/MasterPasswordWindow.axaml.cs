@@ -42,18 +42,6 @@ public partial class MasterPasswordWindow : Window
         }
     }
 
-    /// <summary>
-    /// Rejects non-ASCII before it reaches the box, so an IME-composed character never appears.
-    /// The view model sanitises as well, which is what covers pasting.
-    /// </summary>
-    private void OnPasswordTextInput(object? sender, TextInputEventArgs e)
-    {
-        if (e.Text is { Length: > 0 } text && !text.All(MasterPasswordViewModel.IsAllowed))
-        {
-            e.Handled = true;
-        }
-    }
-
     private void OnPasswordKeyDown(object? sender, KeyEventArgs e)
     {
         if (e.Key == Key.Enter && DataContext is MasterPasswordViewModel viewModel)
