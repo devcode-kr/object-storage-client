@@ -151,19 +151,22 @@ public sealed partial class SiteManagerViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Saves the form, then closes the dialog asking the main window to connect.</summary>
+    /// <summary>
+    /// Closes the dialog asking the main window to connect with the current form values.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately does not write to the store. Saving is the Save button's job, so connecting
+    /// with edited fields is a way to try them out without committing them to disk.
+    /// </remarks>
     [RelayCommand]
-    private async Task ConnectAsync()
+    private void Connect()
     {
         if (!Editor.Validate())
         {
             return;
         }
 
-        ConnectionProfile profile = Editor.ToProfile() with { LastUsedAt = DateTimeOffset.Now };
-        await _store.SaveAsync(profile).ConfigureAwait(true);
-
-        CloseRequested?.Invoke(this, profile);
+        CloseRequested?.Invoke(this, Editor.ToProfile());
     }
 
     [RelayCommand]

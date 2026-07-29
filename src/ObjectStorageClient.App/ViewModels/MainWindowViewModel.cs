@@ -19,7 +19,6 @@ namespace ObjectStorageClient.App.ViewModels;
 public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordinator, IAsyncDisposable
 {
     private readonly IObjectStorageClientFactory _clientFactory;
-    private readonly IConnectionProfileStore _profileStore;
     private readonly ITransferQueue _queue;
     private readonly IDialogService _dialogs;
 
@@ -30,18 +29,15 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
     private readonly RefreshDebouncer _localPaneRefresh;
 
     private IObjectStorageClient? _client;
-    private Guid? _lastSiteId;
 
     public MainWindowViewModel(
         IObjectStorageClientFactory clientFactory,
-        IConnectionProfileStore profileStore,
         ITransferQueue queue,
         IDialogService dialogs,
         IClipboardService clipboard,
         LogViewModel log)
     {
         _clientFactory = clientFactory;
-        _profileStore = profileStore;
         _queue = queue;
         _dialogs = dialogs;
 
@@ -195,17 +191,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
             Local.Navigate(settings.LastLocalDirectory);
         }
 
-        _lastSiteId = settings.LastSiteId;
         return Task.CompletedTask;
     }
-
-    /// <summary>Folds the current UI state back into <paramref name="settings"/> for saving on exit.</summary>
-    public AppSettings CaptureSettings(AppSettings settings) => settings with
-    {
-        LastLocalDirectory = Local.CurrentPath,
-        ShowHiddenFiles = Local.ShowHiddenFiles,
-        LastSiteId = _lastSiteId,
-    };
 
     [RelayCommand]
     private async Task QuickConnectAsync()
@@ -261,7 +248,6 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
             }
 
             _client = client;
-            _lastSiteId = profile.Id;
             _queue.Attach(client, profile.MaxConcurrentTransfers);
 
             IsConnected = true;
@@ -269,8 +255,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
             StatusText = "Connected";
             Log.Response("Connection established.");
 
+            // No implicit save. Connecting used to persist the profile, which meant every
+            // Quickconnect — built with a fresh id each time — added another saved site.
             await Remote.ConnectAsync(client).ConfigureAwait(true);
-            await _profileStore.SaveAsync(profile with { LastUsedAt = DateTimeOffset.Now }).ConfigureAwait(true);
         }
         catch (Exception ex)
         {

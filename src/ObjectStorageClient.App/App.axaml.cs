@@ -82,26 +82,23 @@ public partial class App : Application
         desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
         window.Show();
 
+        // Nothing is persisted on exit: settings are only written when the user asks for it.
+        // Shutdown just releases the connection and the transfer queue.
         desktop.ShutdownRequested += (_, _) =>
         {
-            // Snapshot on the UI thread: CaptureSettings reads view-model state.
-            AppSettings finalSettings = viewModel.CaptureSettings(settings);
-
             // Task.Run so the teardown runs without the UI thread's SynchronizationContext.
             // Awaiting it directly deadlocks: `await using` disposals do not carry
             // ConfigureAwait(false), so FileStream.DisposeAsync posts its continuation back to
             // the very thread this handler is blocking.
-            if (!Task.Run(() => ShutdownAsync(settingsStore, viewModel, provider, finalSettings))
-                    .Wait(ShutdownTimeout))
+            if (!Task.Run(() => ShutdownAsync(viewModel, provider)).Wait(ShutdownTimeout))
             {
-                // Never wedge the app closed. A save that has not finished by now is not worth
-                // trapping the user in a window that will not shut.
+                // Never wedge the app closed.
             }
         };
     }
 
     /// <summary>
-    /// Saves settings and tears down the connection and transfer queue before the process exits.
+    /// Tears down the connection and the transfer queue before the process exits.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -118,21 +115,8 @@ public partial class App : Application
     /// the whole class of problem rather than one await at a time.
     /// </para>
     /// </remarks>
-    private static async Task ShutdownAsync(
-        IAppSettingsStore settingsStore,
-        MainWindowViewModel viewModel,
-        ServiceProvider provider,
-        AppSettings settings)
+    private static async Task ShutdownAsync(MainWindowViewModel viewModel, ServiceProvider provider)
     {
-        try
-        {
-            await settingsStore.SaveAsync(viewModel.CaptureSettings(settings)).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // Losing the window's last state is not worth blocking the user from quitting.
-        }
-
         await viewModel.DisposeAsync().ConfigureAwait(false);
         await provider.DisposeAsync().ConfigureAwait(false);
     }

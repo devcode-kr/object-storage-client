@@ -150,13 +150,24 @@ clears the password box and reports an error must clear the box **first**.
 `MaxConcurrentTransfers` all initialise to `true`/non-zero. An omitted property falls back to the
 initialiser on load, so a saved "off" silently reloaded as "on".
 
+**Nothing is written to disk implicitly.** Both files are only saved when the user asks:
+`config.json` on first run (to record the new vault) and thereafter from the settings UI's Save;
+`sites.json` from the Site Manager's Save and Delete. Exiting saves nothing, and *connecting*
+saves nothing — that used to persist the profile, which meant every Quickconnect, built with a
+fresh id each time, silently added another saved site. `SiteManagerPersistenceTests` pins this
+down.
+
+Both stores verify their own writes: after the rename they read the file back and compare, and
+throw if it does not match. That is what catches a save which reports success without the file
+holding the new values — a half-written temporary file, or a serializer dropping properties.
+
 `ShutdownRequested` is a **synchronous** event: an `async` handler returns at its first `await`
-and the runtime tears the process down with the work still in flight, silently losing the
-session's settings and leaving a half-written `config.json.tmp` behind. `App.ShutdownAsync` is
-therefore blocked on — but via `Task.Run`, **not** awaited directly. `await using` disposals do not
-carry `ConfigureAwait(false)`, so `FileStream.DisposeAsync` posts its continuation back to the
-blocked UI thread and hangs the app. `Task.Run` clears the synchronization context and fixes the
-whole class of problem instead of one await at a time.
+and the runtime tears the process down with the work still in flight. `App.ShutdownAsync` (which
+now only releases the connection and the transfer queue) is therefore blocked on — but via
+`Task.Run`, **not** awaited directly. `await using` disposals do not carry `ConfigureAwait(false)`,
+so `FileStream.DisposeAsync` posts its continuation back to the blocked UI thread and hangs the
+app. `Task.Run` clears the synchronization context and fixes the whole class of problem instead of
+one await at a time.
 
 The stores are also blocked on from the UI thread, so **every** await in them — including
 `await using` disposals, which need the `stream.ConfigureAwait(false)` form — must avoid capturing

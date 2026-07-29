@@ -31,6 +31,18 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
         await _fileLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            return await ReadAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _fileLock.Release();
+        }
+    }
+
+    private async Task<AppSettings> ReadAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
             if (!File.Exists(_filePath))
             {
                 return new AppSettings();
@@ -53,10 +65,6 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
             // treated as a first-run: they are asked to create a master password again.
             return new AppSettings();
         }
-        finally
-        {
-            _fileLock.Release();
-        }
     }
 
     public async Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default)
@@ -78,6 +86,16 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
             }
 
             File.Move(temporaryPath, _filePath, overwrite: true);
+
+            // Read it back and compare: a save that reports success without the file actually
+            // holding the new values is the failure mode worth catching here — it is how a
+            // half-written temporary file, or a serializer that drops properties, goes unnoticed.
+            AppSettings written = await ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (written != settings)
+            {
+                throw new IOException(
+                    $"Settings were written to '{_filePath}' but did not read back identical.");
+            }
         }
         finally
         {

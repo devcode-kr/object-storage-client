@@ -63,6 +63,18 @@ public sealed class JsonConnectionProfileStore : IConnectionProfileStore
             }
 
             await WriteAsync(profiles, cancellationToken).ConfigureAwait(false);
+
+            // Read it back and compare, secrets included. This is what catches a save that
+            // silently drops a field — the serializer once omitted `false` values, so turning
+            // path-style addressing off appeared to work and reloaded as on.
+            IReadOnlyList<ConnectionProfile> written =
+                await LoadUnsynchronizedAsync(cancellationToken).ConfigureAwait(false);
+
+            if (written.FirstOrDefault(saved => saved.Id == profile.Id) != profile)
+            {
+                throw new IOException(
+                    $"Site '{profile.Name}' was written to '{_filePath}' but did not read back identical.");
+            }
         }
         finally
         {
