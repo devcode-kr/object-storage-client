@@ -79,12 +79,39 @@ public partial class App : Application
         desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
         window.Show();
 
-        desktop.ShutdownRequested += async (_, _) =>
+        desktop.ShutdownRequested += (_, _) => ShutdownAsync(settingsStore, viewModel, provider, settings)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    /// <summary>
+    /// Saves settings and tears down the connection and transfer queue before the process exits.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately blocking. <c>ShutdownRequested</c> is a synchronous event, so an <c>async</c>
+    /// handler returns at its first <c>await</c> and the runtime carries on tearing the process
+    /// down with the work still in flight — which left a half-written <c>config.json.tmp</c>
+    /// behind and lost the session's settings, because the file was written but never renamed.
+    /// Blocking here is safe: every path below awaits with <c>ConfigureAwait(false)</c>, so no
+    /// continuation is waiting on the UI thread this call occupies.
+    /// </remarks>
+    private static async Task ShutdownAsync(
+        IAppSettingsStore settingsStore,
+        MainWindowViewModel viewModel,
+        ServiceProvider provider,
+        AppSettings settings)
+    {
+        try
         {
             await settingsStore.SaveAsync(viewModel.CaptureSettings(settings)).ConfigureAwait(false);
-            await viewModel.DisposeAsync().ConfigureAwait(false);
-            await provider.DisposeAsync().ConfigureAwait(false);
-        };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Losing the window's last state is not worth blocking the user from quitting.
+        }
+
+        await viewModel.DisposeAsync().ConfigureAwait(false);
+        await provider.DisposeAsync().ConfigureAwait(false);
     }
 
     private static ServiceProvider BuildServices(IAppSettingsStore settingsStore, ISecretProtector protector)

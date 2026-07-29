@@ -90,6 +90,22 @@ public sealed class JsonAppSettingsStoreTests : IDisposable
         Assert.False(File.Exists(_file + ".tmp"));
     }
 
+    /// <summary>
+    /// A process killed mid-save leaves the temporary file behind. The next save has to reclaim
+    /// it rather than trip over it, so the leftover disappears on its own.
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_ClearsUpATemporaryFileLeftByAnInterruptedSave()
+    {
+        string temporary = _file + ".tmp";
+        await File.WriteAllTextAsync(temporary, "{ half-written garbage");
+
+        await CreateStore().SaveAsync(new AppSettings { ShowHiddenFiles = true });
+
+        Assert.False(File.Exists(temporary));
+        Assert.True((await CreateStore().LoadAsync()).ShowHiddenFiles);
+    }
+
     public void Dispose() => Directory.Delete(_directory, recursive: true);
 }
 

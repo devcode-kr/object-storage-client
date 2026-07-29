@@ -150,6 +150,13 @@ clears the password box and reports an error must clear the box **first**.
 `MaxConcurrentTransfers` all initialise to `true`/non-zero. An omitted property falls back to the
 initialiser on load, so a saved "off" silently reloaded as "on".
 
+`ShutdownRequested` is a **synchronous** event: an `async` handler returns at its first `await`
+and the runtime tears the process down with the work still in flight. `App.ShutdownAsync` is
+therefore blocked on deliberately — every path it awaits uses `ConfigureAwait(false)`, so nothing
+is waiting on the UI thread it occupies. Making it `async void` again silently loses the session's
+settings and leaves a half-written `config.json.tmp` behind, because the file gets written but
+never renamed.
+
 Both stores write through a `.tmp` file and rename. Always open it with
 `AppPaths.CreateOwnerOnlyFile`, never `File.Create`: the latter applies the umask (0644 on a
 typical Unix box), which would expose the credentials file until a later chmod. That helper sets
