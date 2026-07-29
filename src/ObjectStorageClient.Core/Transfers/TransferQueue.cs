@@ -29,6 +29,7 @@ public sealed class TransferQueue : ITransferQueue
     private IObjectStorageClient? _client;
     private SemaphoreSlim _slots = new(3, 3);
     private Task? _dispatcher;
+    private int _disposed;
 
     public TransferQueue(ILogger<TransferQueue>? logger = null) =>
         _logger = logger ?? NullLogger<TransferQueue>.Instance;
@@ -269,8 +270,18 @@ public sealed class TransferQueue : ITransferQueue
         ItemUpdated?.Invoke(this, item);
     }
 
+    /// <summary>
+    /// Idempotent, as <see cref="IAsyncDisposable"/> requires: a second call must not throw.
+    /// The queue is a DI singleton, so the container disposes it as well as any owner that
+    /// disposed it first — and a repeat call used to hit the already-disposed token source.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         await _shutdown.CancelAsync().ConfigureAwait(false);
         _channel.Writer.TryComplete();
 

@@ -29,6 +29,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
     private readonly RefreshDebouncer _localPaneRefresh;
 
     private IObjectStorageClient? _client;
+    private int _disposed;
 
     public MainWindowViewModel(
         IObjectStorageClientFactory clientFactory,
@@ -424,11 +425,20 @@ public sealed partial class MainWindowViewModel : ViewModelBase, ITransferCoordi
             Size = size,
         });
 
+    /// <summary>
+    /// Releases only what this view model owns. The transfer queue is a container singleton, so
+    /// the container disposes it — after this, since it is registered earlier and singletons are
+    /// disposed in reverse. Disposing it here as well is what crashed shutdown.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         _queue.ItemUpdated -= OnTransferUpdated;
         Transfers.Dispose();
-        await _queue.DisposeAsync().ConfigureAwait(false);
 
         if (_client is not null)
         {

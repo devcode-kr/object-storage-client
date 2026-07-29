@@ -90,7 +90,7 @@ public partial class App : Application
             // Awaiting it directly deadlocks: `await using` disposals do not carry
             // ConfigureAwait(false), so FileStream.DisposeAsync posts its continuation back to
             // the very thread this handler is blocking.
-            if (!Task.Run(() => ShutdownAsync(viewModel, provider)).Wait(ShutdownTimeout))
+            if (!Task.Run(() => ShutdownAsync(provider)).Wait(ShutdownTimeout))
             {
                 // Never wedge the app closed.
             }
@@ -115,11 +115,11 @@ public partial class App : Application
     /// the whole class of problem rather than one await at a time.
     /// </para>
     /// </remarks>
-    private static async Task ShutdownAsync(MainWindowViewModel viewModel, ServiceProvider provider)
-    {
-        await viewModel.DisposeAsync().ConfigureAwait(false);
+    private static async Task ShutdownAsync(ServiceProvider provider) =>
+        // Disposing the container is the whole teardown: it owns the view model, the transfer
+        // queue and the rest, and disposes singletons in reverse registration order. Disposing
+        // any of them here as well would dispose them twice.
         await provider.DisposeAsync().ConfigureAwait(false);
-    }
 
     private static ServiceProvider BuildServices(IAppSettingsStore settingsStore, ISecretProtector protector)
     {

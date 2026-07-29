@@ -161,9 +161,16 @@ Both stores verify their own writes: after the rename they read the file back an
 throw if it does not match. That is what catches a save which reports success without the file
 holding the new values — a half-written temporary file, or a serializer dropping properties.
 
+Shutdown is **just `provider.DisposeAsync()`**. The container owns the view model, the transfer
+queue and the rest, and disposes singletons in reverse registration order. Disposing any of them
+explicitly as well disposes them twice — which crashed the app on exit with
+`ObjectDisposedException` from the queue's cancellation token source. For the same reason a view
+model must only release what it created (its own `TransferQueueViewModel` and the client it built
+from the factory), never an injected dependency, and every `DisposeAsync` here is idempotent.
+
 `ShutdownRequested` is a **synchronous** event: an `async` handler returns at its first `await`
-and the runtime tears the process down with the work still in flight. `App.ShutdownAsync` (which
-now only releases the connection and the transfer queue) is therefore blocked on — but via
+and the runtime tears the process down with the work still in flight. `App.ShutdownAsync` is
+therefore blocked on — but via
 `Task.Run`, **not** awaited directly. `await using` disposals do not carry `ConfigureAwait(false)`,
 so `FileStream.DisposeAsync` posts its continuation back to the blocked UI thread and hangs the
 app. `Task.Run` clears the synchronization context and fixes the whole class of problem instead of

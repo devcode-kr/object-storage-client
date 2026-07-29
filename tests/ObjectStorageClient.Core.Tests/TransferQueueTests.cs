@@ -156,6 +156,35 @@ public sealed class TransferQueueTests
         Assert.Equal(16, queue.MaxConcurrency);
     }
 
+    /// <summary>
+    /// The queue is a DI singleton, so the container disposes it as well as anything that already
+    /// disposed it. A second call used to throw ObjectDisposedException from the cancellation
+    /// token source and crash the app on exit.
+    /// </summary>
+    [Fact]
+    public async Task DisposeAsync_IsIdempotent()
+    {
+        FakeObjectStorageClient client = new();
+        TransferQueue queue = new();
+        queue.Attach(client);
+
+        TransferItem item = queue.Enqueue(Upload("done.bin"));
+        await WaitForTerminalAsync(item);
+
+        await queue.DisposeAsync();
+        await queue.DisposeAsync();
+        await queue.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DisposeAsync_IsIdempotentEvenWithoutAClient()
+    {
+        TransferQueue queue = new();
+
+        await queue.DisposeAsync();
+        await queue.DisposeAsync();
+    }
+
     [Fact]
     public async Task ItemAdded_AndItemUpdated_ReportEveryLifecycleChange()
     {
