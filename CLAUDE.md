@@ -178,16 +178,13 @@ setting therefore needs no decision about whether it is secret**, and no new enc
 The store owns `CreatedAt` (first save) and `LastModifiedAt` (every save); `LastUsedAt` is
 reserved for ordering by recency and nothing writes it yet.
 
-The version stays **1**: nothing has shipped, so the layout change did not need a new number.
-That means the pre-release layout — profile in the clear beside three separately encrypted
-secrets — cannot be told apart by version, and `IsLegacyLayout` distinguishes them by shape
-instead (`profile` vs `connection`).
+`SiteDocument.Version` is 1 and there is only ever one layout to read — nothing has shipped, so
+earlier pre-release shapes were converted and their reader deleted rather than carried.
 
-The `Legacy*` records and the one-time conversion are **temporary**; delete them once no such
-files remain. The conversion is the single write this store performs unasked, and only once:
-re-encrypting the connection needs the master password, so it can only happen with the key to
-hand. It is skipped when a stored ciphertext decrypts to nothing — that means the key does not
-open the file, and rewriting would re-encrypt the blanks and destroy the credentials.
+`StoredSite`'s compatibility switches must keep the same defaults as `ConnectionProfile`
+(`ForcePathStyle`, `DisableRequestChecksums`, `DisableChunkedEncoding` all `true`). A `bool`
+defaults to `false`, so a stored site missing one of them would come back with checksums and
+chunked bodies enabled — which is exactly what makes S3-compatible gateways reject every upload.
 
 Shutdown is **just `provider.DisposeAsync()`**. The container owns the view model, the transfer
 queue and the rest, and disposes singletons in reverse registration order. Disposing any of them

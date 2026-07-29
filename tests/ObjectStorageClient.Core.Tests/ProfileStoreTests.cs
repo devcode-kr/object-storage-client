@@ -331,27 +331,22 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
     }
 
     /// <summary>
-    /// Profiles written before checksums defaulted to disabled simply omit the property; they
-    /// should pick up the safer default rather than keep failing against the same gateway.
+    /// A stored site that omits the compatibility switches must fall back to the settings that
+    /// work against S3-compatible gateways. Defaulting them to `false` would send checksums and
+    /// chunked bodies, which those gateways reject on every upload.
     /// </summary>
     [Fact]
-    public async Task LoadAsync_TreatsAnAbsentChecksumFlagAsDisabled()
+    public async Task LoadAsync_FallsBackToTheCompatibleSwitchesWhenTheyAreAbsent()
     {
         await File.WriteAllTextAsync(_file, """
             {
               "version": 1,
               "sites": [
                 {
-                  "profile": {
-                    "id": "8a1c1d1e-0000-4000-8000-000000000001",
-                    "name": "legacy",
-                    "providerId": "custom",
-                    "serviceUrl": "https://storage.example.com",
-                    "region": "us-east-1",
-                    "accessKeyId": "key",
-                    "forcePathStyle": true
-                  },
-                  "secretAccessKey": ""
+                  "id": "8a1c1d1e-0000-4000-8000-000000000001",
+                  "name": "sparse",
+                  "providerId": "custom",
+                  "connection": ""
                 }
               ]
             }
@@ -359,9 +354,12 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
 
         ConnectionProfile actual = Assert.Single(await CreateStore().LoadAsync());
 
+        Assert.Equal("sparse", actual.Name);
         Assert.True(actual.DisableRequestChecksums);
         Assert.True(actual.DisableChunkedEncoding);
-        Assert.Equal("legacy", actual.Name);
+        Assert.True(actual.ForcePathStyle);
+        Assert.Equal(100, actual.TimeoutSeconds);
+        Assert.Equal(3, actual.MaxConcurrentTransfers);
     }
 
     /// <summary>Pins the on-disk shape: which fields are readable, and which are inside the blob.</summary>
@@ -414,101 +412,9 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.True(second.LastModifiedAt > first.LastModifiedAt);
     }
 
-    /// <summary>
-    /// The pre-release layout kept the profile in the clear beside three separately encrypted
-    /// secrets. Such a file must open with its credentials intact and be converted on the spot,
-    /// since re-encrypting the connection needs the master password. Both layouts carry version 1,
-    /// so this also covers telling them apart by shape. TEMPORARY, with the migration itself.
-    /// </summary>
+    /// <summary>Reading never writes: the store only touches the file when asked to save.</summary>
     [Fact]
-    public async Task LoadAsync_ConvertsAPreReleaseFileOnFirstRead()
-    {
-        string secret = _protector.Protect("s3cr3t-access-key");
-        string proxyPassword = _protector.Protect("proxypass");
-
-        await File.WriteAllTextAsync(_file, $$"""
-            {
-              "version": 1,
-              "sites": [
-                {
-                  "profile": {
-                    "id": "8a1c1d1e-0000-4000-8000-000000000001",
-                    "name": "MinIO dev",
-                    "providerId": "minio",
-                    "serviceUrl": "http://localhost:9000",
-                    "region": "us-east-1",
-                    "accessKeyId": "minioadmin",
-                    "defaultBucket": "assets",
-                    "forcePathStyle": true,
-                    "timeoutSeconds": 100,
-                    "maxConcurrentTransfers": 3,
-                    "proxy": { "enabled": true, "host": "proxy", "port": 3128 }
-                  },
-                  "secretAccessKey": "{{secret}}",
-                  "proxyPassword": "{{proxyPassword}}"
-                }
-              ]
-            }
-            """);
-
-        JsonConnectionProfileStore store = CreateStore();
-        ConnectionProfile migrated = Assert.Single(await store.LoadAsync());
-
-        Assert.Equal("MinIO dev", migrated.Name);
-        Assert.Equal("http://localhost:9000", migrated.ServiceUrl);
-        Assert.Equal("minioadmin", migrated.AccessKeyId);
-        Assert.Equal("s3cr3t-access-key", migrated.SecretAccessKey);
-        Assert.Equal("proxypass", migrated.Proxy.Password);
-        Assert.Equal(3128, migrated.Proxy.Port);
-
-        // Reading is enough: the file has already been rewritten, with nothing left in the clear.
-        string json = await File.ReadAllTextAsync(_file);
-
-        Assert.DoesNotContain("\"profile\"", json, StringComparison.Ordinal);
-        Assert.DoesNotContain("http://localhost:9000", json, StringComparison.Ordinal);
-        Assert.DoesNotContain("minioadmin", json, StringComparison.Ordinal);
-        Assert.Contains("\"connection\"", json, StringComparison.Ordinal);
-
-        // ...and it still opens, now through the current path.
-        ConnectionProfile reopened = Assert.Single(await CreateStore().LoadAsync());
-        Assert.Equal("s3cr3t-access-key", reopened.SecretAccessKey);
-        Assert.Equal("proxypass", reopened.Proxy.Password);
-        Assert.Equal("http://localhost:9000", reopened.ServiceUrl);
-    }
-
-    /// <summary>
-    /// Converting is irreversible: it re-encrypts whatever was decrypted. Under a key that does
-    /// not open the file that would be blanks, so the original must be left untouched.
-    /// </summary>
-    [Fact]
-    public async Task LoadAsync_LeavesAPreReleaseFileAloneWhenTheKeyDoesNotOpenIt()
-    {
-        await File.WriteAllTextAsync(_file, $$"""
-            {
-              "version": 1,
-              "sites": [
-                {
-                  "profile": { "id": "8a1c1d1e-0000-4000-8000-000000000001", "name": "MinIO dev" },
-                  "secretAccessKey": "{{_protector.Protect("s3cr3t-access-key")}}"
-                }
-              ]
-            }
-            """);
-        string before = await File.ReadAllTextAsync(_file);
-
-        ISecretProtector wrongKey = MasterPasswordVault.Create("a-different-password", 1_000).Protector;
-        ConnectionProfile opened = Assert.Single(await new JsonConnectionProfileStore(wrongKey, _file).LoadAsync());
-
-        Assert.Empty(opened.SecretAccessKey);
-        Assert.Equal(before, await File.ReadAllTextAsync(_file));
-
-        // The right key still converts it, with the credential intact.
-        Assert.Equal("s3cr3t-access-key", Assert.Single(await CreateStore().LoadAsync()).SecretAccessKey);
-        Assert.Contains("\"connection\"", await File.ReadAllTextAsync(_file), StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task LoadAsync_DoesNotRewriteAFileThatIsAlreadyCurrent()
+    public async Task LoadAsync_NeverWritesToTheFile()
     {
         JsonConnectionProfileStore store = CreateStore();
         await store.SaveAsync(SampleProfile());
@@ -517,7 +423,6 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         await store.LoadAsync();
         await store.LoadAsync();
 
-        // Only the one-time conversion writes during a load.
         Assert.Equal(before, await File.ReadAllTextAsync(_file));
     }
 
