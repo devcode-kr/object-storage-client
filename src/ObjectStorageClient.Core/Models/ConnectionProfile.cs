@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace ObjectStorageClient.Core.Models;
 
 /// <summary>
@@ -24,10 +26,16 @@ public sealed record ConnectionProfile
 
     public string AccessKeyId { get; init; } = string.Empty;
 
-    /// <summary>Held in plaintext in memory only; persisted through <c>ISecretProtector</c>.</summary>
+    /// <summary>
+    /// Held in plaintext in memory only. Never serialised: the profile store writes it encrypted
+    /// alongside the profile, so ignoring it here makes "no plaintext secret on disk" structural
+    /// rather than something each caller has to remember.
+    /// </summary>
+    [JsonIgnore]
     public string SecretAccessKey { get; init; } = string.Empty;
 
-    /// <summary>Optional temporary-credential session token (STS).</summary>
+    /// <summary>Optional temporary-credential session token (STS). Persisted encrypted; see above.</summary>
+    [JsonIgnore]
     public string SessionToken { get; init; } = string.Empty;
 
     /// <summary>Bucket opened right after connecting. Empty means "show the bucket list".</summary>
@@ -63,7 +71,13 @@ public sealed record ConnectionProfile
 
     public DateTimeOffset? LastUsedAt { get; init; }
 
-    /// <summary>The preset backing <see cref="ProviderId"/>.</summary>
+    /// <summary>
+    /// The preset backing <see cref="ProviderId"/>. Derived, so it must not be serialised —
+    /// System.Text.Json writes any public getter, and this one wrote a whole copy of the preset
+    /// into every saved site. Nothing read it back, and it went stale the moment a preset's
+    /// defaults changed in the catalog.
+    /// </summary>
+    [JsonIgnore]
     public StorageProviderPreset Preset => StorageProviderCatalog.Resolve(ProviderId);
 
     /// <summary>

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using ObjectStorageClient.Core.Abstractions;
 using ObjectStorageClient.Core.Models;
 using ObjectStorageClient.Core.Profiles;
@@ -348,6 +349,55 @@ public sealed class JsonConnectionProfileStoreTests : IDisposable
         Assert.True(actual.DisableRequestChecksums);
         Assert.True(actual.DisableChunkedEncoding);
         Assert.Equal("legacy", actual.Name);
+    }
+
+    /// <summary>
+    /// Pins the on-disk shape. System.Text.Json serialises every public getter, so a derived
+    /// property silently becomes a stored field — <c>Preset</c> wrote a whole stale copy of the
+    /// provider catalog into each site, and the proxy's computed flags leaked the same way.
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_WritesNeitherDerivedNorPlaintextSecretFields()
+    {
+        await CreateStore().SaveAsync(SampleProfile() with { SessionToken = "session-token" });
+
+        using JsonDocument document = JsonDocument.Parse(await File.ReadAllTextAsync(_file));
+        JsonElement site = document.RootElement.GetProperty("sites")[0];
+        JsonElement profile = site.GetProperty("profile");
+
+        // Derived: recomputed from providerId on load.
+        Assert.False(profile.TryGetProperty("preset", out _));
+        Assert.False(profile.GetProperty("proxy").TryGetProperty("isUsable", out _));
+        Assert.False(profile.GetProperty("proxy").TryGetProperty("hasCredentials", out _));
+
+        // Secrets only exist encrypted, on the wrapper — never inside the profile.
+        Assert.False(profile.TryGetProperty("secretAccessKey", out _));
+        Assert.False(profile.TryGetProperty("sessionToken", out _));
+        Assert.False(profile.GetProperty("proxy").TryGetProperty("password", out _));
+
+        Assert.NotEmpty(site.GetProperty("secretAccessKey").GetString()!);
+        Assert.NotEmpty(site.GetProperty("sessionToken").GetString()!);
+    }
+
+    [Fact]
+    public async Task LoadAsync_StillReadsAFileThatContainsTheOldDerivedFields()
+    {
+        // Files written before those fields were suppressed must keep working.
+        JsonConnectionProfileStore store = CreateStore();
+        await store.SaveAsync(SampleProfile());
+
+        string json = await File.ReadAllTextAsync(_file);
+        json = json.Replace(
+            "\"providerId\": \"minio\"",
+            "\"providerId\": \"minio\",\n        \"preset\": { \"id\": \"stale\", \"displayName\": \"Stale\" },\n        \"secretAccessKey\": \"\"",
+            StringComparison.Ordinal);
+        await File.WriteAllTextAsync(_file, json);
+
+        ConnectionProfile actual = Assert.Single(await CreateStore().LoadAsync());
+
+        Assert.Equal("minio", actual.ProviderId);
+        Assert.Equal("MinIO", actual.Preset.DisplayName);
+        Assert.Equal("s3cr3t-access-key", actual.SecretAccessKey);
     }
 
     [Fact]
