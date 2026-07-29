@@ -144,17 +144,35 @@ public sealed class MasterPasswordInputTests
     /// </summary>
     [AvaloniaTheory]
     [MemberData(nameof(BothModes))]
-    public void TheWarningTextBlock_BecomesVisibleWithTheMessage(bool unlocking)
+    public void TheWarningTextBlock_ShowsTheMessage(bool unlocking)
     {
         (MasterPasswordWindow window, _, _) = Open(unlocking);
         TextBlock warning = window.GetControl<TextBlock>("ErrorText");
 
-        Assert.False(warning.IsVisible);
+        Assert.True(string.IsNullOrEmpty(warning.Text));
 
         window.KeyTextInput("비밀번호");
 
-        Assert.True(warning.IsVisible);
         Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, warning.Text);
+        Assert.True(warning.IsVisible);
+    }
+
+    /// <summary>
+    /// The warning slot is reserved rather than collapsed, so showing a message must not change
+    /// the window's height: macOS does not re-apply SizeToContent once the window is shown, and a
+    /// window that cannot resize would simply clip the extra content.
+    /// </summary>
+    [AvaloniaFact]
+    public void ShowingTheWarning_DoesNotChangeTheWindowHeight()
+    {
+        (MasterPasswordWindow window, _, _) = Open();
+        window.UpdateLayout();
+        double before = window.Bounds.Height;
+
+        window.KeyTextInput("비밀번호");
+        window.UpdateLayout();
+
+        Assert.Equal(before, window.Bounds.Height);
     }
 
     /// <summary>
@@ -196,17 +214,35 @@ public sealed class MasterPasswordInputTests
     }
 
     [AvaloniaFact]
-    public void TheWarningTextBlock_HidesAgainOnValidInput()
+    public void TheWarningTextBlock_ClearsAgainOnValidInput()
     {
         (MasterPasswordWindow window, _, _) = Open();
         TextBlock warning = window.GetControl<TextBlock>("ErrorText");
 
         window.KeyTextInput("비밀");
-        Assert.True(warning.IsVisible);
+        Assert.NotEmpty(warning.Text!);
 
         window.KeyTextInput("a");
 
-        Assert.False(warning.IsVisible);
+        Assert.True(string.IsNullOrEmpty(warning.Text));
+    }
+
+    /// <summary>
+    /// A real IME does not deliver one tidy commit: it churns the box while composing, and each
+    /// of those changes flows through the binding. The warning has to survive that, otherwise it
+    /// is set and wiped again before the user can read it.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheWarning_SurvivesAFollowUpTextChange()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open();
+
+        window.KeyTextInput("비밀");
+        Assert.NotEmpty(viewModel.ErrorMessage);
+
+        box.Text = string.Empty;
+
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, viewModel.ErrorMessage);
     }
 
     [AvaloniaFact]
