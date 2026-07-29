@@ -170,8 +170,12 @@ stale temp left by an interrupted save, whose mode `FileMode.Create` would other
   but transfers anything else. Both panes must keep that split in step.
 - The master password fields accept printable ASCII only. Three things matter here, all verified
   by `MasterPasswordInputTests` (headless, driving the real input pipeline):
-  - `InputMethod.IsInputMethodEnabled="False"` is set but **does not work on macOS** — the
-    Avalonia.Native backend lets the system IME commit anyway. It is kept for Windows/Linux.
+  - **Do not set `InputMethod.IsInputMethodEnabled="False"`.** It looks like the right tool and it
+    is not: with the input context off, macOS delivers raw key events mapped through the active
+    layout, and under a Korean layout Shift stops producing uppercase. The same keystrokes then
+    produce a *different* password depending on the input mode, invisibly, in a masked field —
+    which is how a vault ends up created with a password the user cannot reproduce. Let the IME
+    run and reject its output instead.
   - The `TextInput` handler must be attached with `RoutingStrategies.Tunnel`, in code-behind.
     `TextInputEvent` routes `Tunnel, Bubble`, and `TextBox.OnTextInput` is a **bubble-stage class
     handler** — so a XAML `TextInput="..."` handler runs *after* the text is already inserted and

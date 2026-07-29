@@ -13,8 +13,8 @@ namespace ObjectStorageClient.App.Tests;
 /// <summary>
 /// Drives the real window through Avalonia's input pipeline, because the question here — does a
 /// non-ASCII character actually reach the password box — cannot be answered by testing the view
-/// model alone. <c>InputMethod.IsInputMethodEnabled</c> is ignored by the macOS backend, so the
-/// <c>TextInput</c> handler is what has to hold.
+/// model alone. The tunnel-stage <c>TextInput</c> handler is the only mechanism; see
+/// <c>MasterPasswordWindow</c> for why disabling the input method is not an option.
 /// </summary>
 public sealed class MasterPasswordInputTests
 {
@@ -242,11 +242,30 @@ public sealed class MasterPasswordInputTests
         Assert.Empty(viewModel.ErrorMessage);
     }
 
+    /// <summary>
+    /// Regression guard. Disabling the input method makes macOS deliver raw key events through the
+    /// active layout, and under a Korean layout Shift no longer produces uppercase — so the same
+    /// keystrokes create a different password depending on the input mode, invisibly, in a masked
+    /// field. The IME is deliberately left on and its output rejected instead.
+    /// </summary>
     [AvaloniaFact]
-    public void TheInputMethodIsAlsoTurnedOffForPlatformsThatHonourIt()
+    public void TheInputMethodIsLeftEnabledSoKeyMappingStaysCorrect()
     {
-        (_, _, TextBox box) = Open();
+        (MasterPasswordWindow window, _, TextBox box) = Open();
+        TextBox confirm = window.GetControl<TextBox>("ConfirmPasswordBox");
 
-        Assert.False(Avalonia.Input.InputMethod.GetIsInputMethodEnabled(box));
+        Assert.True(Avalonia.Input.InputMethod.GetIsInputMethodEnabled(box));
+        Assert.True(Avalonia.Input.InputMethod.GetIsInputMethodEnabled(confirm));
+    }
+
+    [AvaloniaFact]
+    public void UppercaseAndSymbols_SurviveTheFilter()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, TextBox box) = Open();
+
+        window.KeyTextInput("Passw0rd!@#");
+
+        Assert.Equal("Passw0rd!@#", box.Text);
+        Assert.Equal("Passw0rd!@#", viewModel.Password);
     }
 }

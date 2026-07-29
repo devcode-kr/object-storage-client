@@ -57,8 +57,13 @@ public partial class MasterPasswordWindow : Window
     /// Drops text input containing non-ASCII before the box receives it.
     /// </summary>
     /// <remarks>
-    /// This is the layer that actually holds on macOS, where the Avalonia.Native backend ignores
-    /// <c>InputMethod.IsInputMethodEnabled</c> and lets the system IME commit its composition.
+    /// This is the only mechanism used. <c>InputMethod.IsInputMethodEnabled="False"</c> looks like
+    /// the obvious alternative but is actively dangerous here: with the input context switched off,
+    /// macOS delivers raw key events mapped through the current layout, and under a Korean layout
+    /// Shift stops producing uppercase. The same keystrokes then yield a *different* password
+    /// depending on the input mode — silently, because the field is masked — which is how a vault
+    /// gets created with a password the user cannot reproduce. Letting the IME run and rejecting
+    /// its output here keeps input predictable and tells the user what happened.
     /// </remarks>
     private void OnPasswordTextInput(object? sender, TextInputEventArgs e)
     {
