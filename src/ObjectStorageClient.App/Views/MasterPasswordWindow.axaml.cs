@@ -65,6 +65,7 @@ public partial class MasterPasswordWindow : Window
         if (e.Text is { Length: > 0 } text && !text.All(MasterPasswordViewModel.IsAllowed))
         {
             e.Handled = true;
+            ReportRejectedInput();
         }
     }
 
@@ -89,7 +90,14 @@ public partial class MasterPasswordWindow : Window
         int caret = box.CaretIndex;
         box.Text = allowed;
         box.CaretIndex = Math.Clamp(caret, 0, allowed.Length);
+
+        // Assigning the text propagates through the binding and clears ErrorMessage, so the
+        // rejection has to be reported after it, not before.
+        ReportRejectedInput();
     }
+
+    private void ReportRejectedInput() =>
+        (DataContext as MasterPasswordViewModel)?.ReportNonAsciiRejected();
 
     private void OnPasswordKeyDown(object? sender, KeyEventArgs e)
     {

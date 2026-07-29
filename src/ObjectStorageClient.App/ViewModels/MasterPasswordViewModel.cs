@@ -80,6 +80,13 @@ public sealed partial class MasterPasswordViewModel : ViewModelBase
 
     internal static bool IsAllowed(char character) => character is >= ' ' and <= '~';
 
+    /// <summary>
+    /// Called by the view after it drops non-ASCII input. The view blocks the characters before
+    /// they reach the bound property, so without this the rejection would be silent — the user
+    /// would just see their typing vanish.
+    /// </summary>
+    public void ReportNonAsciiRejected() => ErrorMessage = NonAsciiRejectedMessage;
+
     internal static string RemoveDisallowed(string value) =>
         value.All(IsAllowed) ? value : new string([.. value.Where(IsAllowed)]);
 

@@ -105,6 +105,53 @@ public sealed class MasterPasswordInputTests
         Assert.Equal("abc123", viewModel.Password);
     }
 
+    /// <summary>
+    /// The view blocks the characters before they reach the bound property, so the warning has
+    /// to be raised explicitly — otherwise the user's typing just silently disappears.
+    /// </summary>
+    [AvaloniaFact]
+    public void RejectedTyping_TellsTheUserWhyNothingAppeared()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, _) = Open();
+
+        window.KeyTextInput("비밀번호");
+
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, viewModel.ErrorMessage);
+    }
+
+    [AvaloniaFact]
+    public void RejectedPaste_AlsoWarns()
+    {
+        (_, MasterPasswordViewModel viewModel, TextBox box) = Open();
+
+        box.Text = "pa비밀ss";
+
+        Assert.Equal(MasterPasswordViewModel.NonAsciiRejectedMessage, viewModel.ErrorMessage);
+    }
+
+    [AvaloniaFact]
+    public void TypingSomethingValidAfterwards_ClearsTheWarning()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, _) = Open();
+
+        window.KeyTextInput("비밀");
+        Assert.NotEmpty(viewModel.ErrorMessage);
+
+        window.KeyTextInput("a");
+
+        Assert.Empty(viewModel.ErrorMessage);
+    }
+
+    [AvaloniaFact]
+    public void ValidTyping_NeverWarns()
+    {
+        (MasterPasswordWindow window, MasterPasswordViewModel viewModel, _) = Open();
+
+        window.KeyTextInput("Passw0rd!");
+
+        Assert.Empty(viewModel.ErrorMessage);
+    }
+
     [AvaloniaFact]
     public void TheInputMethodIsAlsoTurnedOffForPlatformsThatHonourIt()
     {
