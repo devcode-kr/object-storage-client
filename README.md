@@ -98,9 +98,11 @@ Releases are built by [`.github/workflows/release.yml`](.github/workflows/releas
 Running the workflow manually builds the same artifacts without publishing a release, which is
 the way to check packaging changes before tagging.
 
-The application icon is generated rather than hand-drawn; `build/generate-icon.py` produces the
-`.png`, `.ico` and `.icns` variants. The generated files are committed because the Linux and
-Windows runners have neither Pillow nor `iconutil`.
+The application icon is drawn once in `build/icon/appicon.svg`; `build/generate-icon.py`
+rasterises it into the `.png`, `.ico` and `.icns` variants each platform wants. It looks for
+`rsvg-convert`, ImageMagick, `cairosvg` or headless Chrome and uses whichever it finds. The
+generated files are committed because the Linux and Windows release runners have none of those,
+nor `iconutil`.
 
 ## Master password
 

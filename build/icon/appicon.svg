@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Application icon — source of truth for every raster format.
+
+  The mark is one rounded square cut by a "/": the delimiter is the only structure an object key
+  has, and the two halves are the local and remote panes the app moves files between. Cream is
+  local, amber is remote. The silhouette stays a clean square — an earlier version slid the
+  halves along the cut, which read as a rendering fault rather than as motion.
+
+  Deliberately not a database cylinder — that is a different kind of storage — and deliberately
+  not a blue gradient, which every storage tool already is.
+
+  Placeholder artwork. Edit here, then run `python3 build/generate-icon.py` to rebuild the
+  .png / .ico / .icns.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E2A27"/>
+      <stop offset="1" stop-color="#141312"/>
+    </linearGradient>
+
+    <linearGradient id="remote" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F7BA61"/>
+      <stop offset="1" stop-color="#DE861F"/>
+    </linearGradient>
+
+    <linearGradient id="local" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FBF2E4"/>
+      <stop offset="1" stop-color="#EAD6B6"/>
+    </linearGradient>
+
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- The body both halves are cut from. -->
+    <clipPath id="body" clipPathUnits="userSpaceOnUse">
+      <rect x="262" y="262" width="500" height="500" rx="96"/>
+    </clipPath>
+
+    <filter id="lift" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000000" flood-opacity="0.42"/>
+    </filter>
+  </defs>
+
+  <!-- Shell -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#shell)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="3"/>
+
+  <!-- Mark: the square, cut and sheared. -->
+  <!-- Clipping is applied after filtering, so the shadow needs its own group outside the clip. -->
+  <g filter="url(#lift)">
+    <g clip-path="url(#body)">
+      <polygon fill="url(#local)"
+               points="1540.7,-1656.5 -563.5,2657.7 -2720.6,1605.6 -616.4,-2708.6"/>
+      <polygon fill="url(#remote)"
+               points="1587.5,-1633.7 -516.7,2680.5 1640.4,3732.6 3744.6,-581.6"/>
+    </g>
+  </g>
+</svg>

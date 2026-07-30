@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Generate the application icon in every format the packaging needs.
+"""Rasterise the application icon from build/icon/appicon.svg.
 
-This is a developer tool, not part of the build: the generated files are committed, because
-the Linux and Windows release runners have neither Pillow nor `iconutil`. Re-run it only when
-the artwork changes.
+The SVG is the source of truth; everything else is generated from it. Edit the SVG, run this,
+commit the results — the Linux and Windows release runners have neither a rasteriser nor
+`iconutil`, so nothing there could rebuild them.
 
     python3 build/generate-icon.py
 
-Requires Pillow. The .icns step additionally requires macOS (`iconutil`) and is skipped
-elsewhere with a warning.
+Requires Pillow, plus one SVG rasteriser. It tries rsvg-convert, ImageMagick, cairosvg and
+headless Chrome in that order, so a machine with any one of them works. The .icns step
+additionally needs macOS (`iconutil`) and is skipped elsewhere with a warning.
 
 Outputs:
-    build/icon/appicon-1024.png                     master artwork
+    build/icon/appicon-1024.png                     master raster
     build/icon/ObjectStorageClient.icns             macOS .app bundle
     src/ObjectStorageClient.App/appicon.ico         Windows executable (<ApplicationIcon>)
     src/ObjectStorageClient.App/Assets/appicon.png  Avalonia Window.Icon (all platforms)
 
-The artwork is a placeholder: stacked storage tiers on a blue-to-cyan rounded square. It is
-deliberately simple and meant to be replaced by real artwork later.
+Only the 1024 master is rasterised; every smaller size is resampled from it, so all the outputs
+stay pixel-identical to one another.
 """
 
 from __future__ import annotations
@@ -29,30 +30,16 @@ import tempfile
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image
 except ImportError:
     sys.exit("Pillow is required: python3 -m pip install pillow")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ICON_DIR = REPO_ROOT / "build" / "icon"
 APP_DIR = REPO_ROOT / "src" / "ObjectStorageClient.App"
+SOURCE = ICON_DIR / "appicon.svg"
 
-SIZE = 1024
-SUPERSAMPLE = 4
-
-# Rounded square sized like a native macOS app icon: 824/1024 content, 185/824 corner radius.
-MARGIN = 100
-CORNER_RADIUS = 185
-
-GRADIENT_TOP = (29, 78, 216)  # #1D4ED8
-GRADIENT_BOTTOM = (6, 182, 212)  # #06B6D4
-
-TIER_COUNT = 3
-TIER_RX = 250
-TIER_RY = 66
-TIER_BODY_HEIGHT = 92
-TIER_SPACING = 118
-
+MASTER = 1024
 ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
 ICNS_SIZES = [
     ("icon_16x16.png", 16),
@@ -67,62 +54,90 @@ ICNS_SIZES = [
     ("icon_512x512@2x.png", 1024),
 ]
 
-
-def build_gradient(size: int) -> Image.Image:
-    """A vertical linear gradient, drawn one scanline at a time."""
-    gradient = Image.new("RGB", (1, size))
-    pixels = gradient.load()
-    assert pixels is not None
-    for y in range(size):
-        ratio = y / max(size - 1, 1)
-        pixels[0, y] = tuple(
-            round(start + (end - start) * ratio)
-            for start, end in zip(GRADIENT_TOP, GRADIENT_BOTTOM)
-        )
-    return gradient.resize((size, size), Image.NEAREST)
+CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+]
 
 
-def draw_tier(draw: ImageDraw.ImageDraw, centre_x: int, top_y: int, scale: int) -> None:
-    """One storage tier: a cylinder drawn as body + bottom cap + a brighter lid."""
-    rx = TIER_RX * scale
-    ry = TIER_RY * scale
-    body_height = TIER_BODY_HEIGHT * scale
-    body = (255, 255, 255, 235)
-    lid = (255, 255, 255, 255)
-
-    draw.rectangle((centre_x - rx, top_y, centre_x + rx, top_y + body_height), fill=body)
-    draw.ellipse(
-        (centre_x - rx, top_y + body_height - ry, centre_x + rx, top_y + body_height + ry),
-        fill=body,
+def rasterise_rsvg(source: Path, destination: Path) -> bool:
+    tool = shutil.which("rsvg-convert")
+    if not tool:
+        return False
+    subprocess.run(
+        [tool, "-w", str(MASTER), "-h", str(MASTER), "-o", str(destination), str(source)],
+        check=True,
     )
-    draw.ellipse((centre_x - rx, top_y - ry, centre_x + rx, top_y + ry), fill=lid)
+    return True
 
 
-def render_master() -> Image.Image:
-    scale = SUPERSAMPLE
-    canvas = SIZE * scale
-
-    # The rounded square, as a mask over the gradient, so the corners stay transparent.
-    mask = Image.new("L", (canvas, canvas), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        (MARGIN * scale, MARGIN * scale, (SIZE - MARGIN) * scale, (SIZE - MARGIN) * scale),
-        radius=CORNER_RADIUS * scale,
-        fill=255,
+def rasterise_magick(source: Path, destination: Path) -> bool:
+    tool = shutil.which("magick") or shutil.which("convert")
+    if not tool:
+        return False
+    command = [tool]
+    if Path(tool).name == "magick":
+        command.append("convert")
+    subprocess.run(
+        [*command, "-background", "none", "-density", "384",
+         str(source), "-resize", f"{MASTER}x{MASTER}", str(destination)],
+        check=True,
     )
+    return True
 
-    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    image.paste(build_gradient(canvas).convert("RGBA"), (0, 0), mask)
 
-    # Tiers are drawn on their own layer, bottom first, so upper tiers overlap lower ones.
-    tiers = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(tiers)
-    stack_height = (TIER_COUNT - 1) * TIER_SPACING + TIER_BODY_HEIGHT + 2 * TIER_RY
-    first_top = (SIZE - stack_height) // 2 + TIER_RY
-    for index in reversed(range(TIER_COUNT)):
-        draw_tier(draw, (SIZE // 2) * scale, (first_top + index * TIER_SPACING) * scale, scale)
+def rasterise_cairosvg(source: Path, destination: Path) -> bool:
+    try:
+        import cairosvg
+    except ImportError:
+        return False
+    cairosvg.svg2png(
+        url=str(source), write_to=str(destination),
+        output_width=MASTER, output_height=MASTER,
+    )
+    return True
 
-    image.alpha_composite(tiers)
-    return image.resize((SIZE, SIZE), Image.LANCZOS)
+
+def rasterise_chrome(source: Path, destination: Path) -> bool:
+    tool = next(
+        (candidate for candidate in CHROME_CANDIDATES
+         if Path(candidate).exists() or shutil.which(candidate)),
+        None,
+    )
+    if not tool:
+        return False
+    # --screenshot always writes to the working directory unless given an absolute path.
+    subprocess.run(
+        [tool, "--headless", "--disable-gpu", "--hide-scrollbars",
+         "--default-background-color=00000000", "--force-device-scale-factor=1",
+         f"--screenshot={destination}", f"--window-size={MASTER},{MASTER}",
+         source.resolve().as_uri()],
+        check=True, capture_output=True,
+    )
+    return destination.exists()
+
+
+BACKENDS = [
+    ("rsvg-convert", rasterise_rsvg),
+    ("ImageMagick", rasterise_magick),
+    ("cairosvg", rasterise_cairosvg),
+    ("headless Chrome", rasterise_chrome),
+]
+
+
+def rasterise(source: Path, destination: Path) -> str:
+    for name, backend in BACKENDS:
+        try:
+            if backend(source, destination):
+                return name
+        except subprocess.CalledProcessError as error:
+            print(f"! {name} failed ({error}) — trying the next backend", file=sys.stderr)
+    sys.exit(
+        "No SVG rasteriser found. Install one of: librsvg (rsvg-convert), ImageMagick,\n"
+        "cairosvg (pip install cairosvg), or Google Chrome / Chromium."
+    )
 
 
 def write_icns(master: Image.Image, destination: Path) -> None:
@@ -142,14 +157,20 @@ def write_icns(master: Image.Image, destination: Path) -> None:
 
 
 def main() -> None:
+    if not SOURCE.exists():
+        sys.exit(f"{SOURCE.relative_to(REPO_ROOT)} is missing")
+
     ICON_DIR.mkdir(parents=True, exist_ok=True)
     (APP_DIR / "Assets").mkdir(parents=True, exist_ok=True)
 
-    master = render_master()
-    print("Generated:")
-
     master_path = ICON_DIR / "appicon-1024.png"
-    master.save(master_path)
+    backend = rasterise(SOURCE, master_path)
+    master = Image.open(master_path).convert("RGBA")
+    if master.size != (MASTER, MASTER):
+        master = master.resize((MASTER, MASTER), Image.LANCZOS)
+        master.save(master_path)
+
+    print(f"Rasterised with {backend}:")
     print(f"  {master_path.relative_to(REPO_ROOT)}")
 
     window_icon = APP_DIR / "Assets" / "appicon.png"
