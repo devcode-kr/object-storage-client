@@ -1,0 +1,152 @@
+name: Release
+
+# Pushing a v* tag builds every platform and publishes a GitHub release.
+# Running this manually builds and uploads the same artifacts as workflow artifacts, without
+# creating a release — use that to check the packaging before committing to a tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Build and test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # The tag and <Version> must agree, or the release would ship assemblies stamped with a
+      # different version than the tag advertises.
+      - name: Resolve and check version
+        id: version
+        run: |
+          set -euo pipefail
+          props="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Directory.Build.props)"
+          if [ -z "$props" ]; then
+            echo "::error::No <Version> found in Directory.Build.props"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$props" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match <Version>$props</Version>"
+              exit 1
+            fi
+          fi
+          echo "version=$props" >> "$GITHUB_OUTPUT"
+          echo "Version: $props"
+
+      - name: Test
+        run: dotnet test ObjectStorageClient.sln --configuration Release --nologo
+
+  package:
+    name: Package ${{ matrix.rid }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: windows-latest
+            rid: win-x64
+          - os: macos-latest
+            rid: osx-arm64
+          - os: macos-latest
+            rid: osx-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # macOS needs a real .app bundle, so it goes through the packaging script. The other two
+      # platforms are a plain publish plus an archive.
+      - name: Package (macOS)
+        if: startsWith(matrix.rid, 'osx-')
+        run: bash build/package-macos.sh "${{ matrix.rid }}" "${{ needs.verify.outputs.version }}" artifacts
+
+      - name: Package (Linux)
+        if: matrix.rid == 'linux-x64'
+        run: |
+          set -euo pipefail
+          name="ObjectStorageClient-${{ needs.verify.outputs.version }}-${{ matrix.rid }}"
+          dotnet publish src/ObjectStorageClient.App \
+            --configuration Release \
+            --runtime "${{ matrix.rid }}" \
+            --self-contained \
+            --output "staging/$name" \
+            -p:Version="${{ needs.verify.outputs.version }}" \
+            --nologo
+          mkdir -p artifacts
+          tar -czf "artifacts/$name.tar.gz" -C staging "$name"
+
+      - name: Package (Windows)
+        if: matrix.rid == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "ObjectStorageClient-${{ needs.verify.outputs.version }}-${{ matrix.rid }}"
+          dotnet publish src/ObjectStorageClient.App `
+            --configuration Release `
+            --runtime "${{ matrix.rid }}" `
+            --self-contained `
+            --output "staging/$name" `
+            -p:Version="${{ needs.verify.outputs.version }}" `
+            --nologo
+          if ($LASTEXITCODE -ne 0) { throw "publish failed" }
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path "staging/$name" -DestinationPath "artifacts/$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [verify, package]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Collect artifacts and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find downloaded -type f -exec mv {} artifacts/ \;
+          cd artifacts
+          sha256sum ObjectStorageClient-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed "s/@VERSION@/$VERSION/g" build/release-body.md > release-body.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "v$VERSION" \
+            --notes-file release-body.md \
+            --generate-notes \
+            artifacts/*

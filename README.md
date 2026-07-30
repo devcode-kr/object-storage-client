@@ -26,11 +26,27 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 - **Master password** — asked for at every launch; credentials are encrypted under a key derived
   from it, and the key is never written to disk.
 
-## Requirements
+## Install
 
-- [.NET SDK 9.0](https://dotnet.microsoft.com/download) or newer
+Grab a self-contained build for your platform from the
+[latest release](https://github.com/devcode-kr/object-storage-client/releases/latest) — no .NET
+runtime installation needed. Each release ships `SHA256SUMS.txt` for verification.
 
-## Getting started
+**The binaries are not code-signed yet**, so Windows and macOS both object:
+
+- **Windows** — unblock the `.zip` in its Properties dialog before extracting, then answer
+  SmartScreen with *More info → Run anyway*.
+- **macOS** — the app is reported as *"damaged"*; that is Gatekeeper's message for an unsigned
+  quarantined bundle. Clear the attribute after installing:
+  `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
+- **Linux** — nothing in the way. A minimal install may still need
+  `libice6`, `libsm6` and `libfontconfig1`.
+
+The release notes spell each of these out in full.
+
+## Building from source
+
+Requires [.NET SDK 9.0](https://dotnet.microsoft.com/download) or newer.
 
 ```bash
 git clone <this repo>
@@ -67,8 +83,24 @@ fail with a bare `NotImplemented`. All of these toggles live under *Advanced* in
 ```bash
 dotnet publish src/ObjectStorageClient.App -c Release -r win-x64   --self-contained
 dotnet publish src/ObjectStorageClient.App -c Release -r linux-x64 --self-contained
-dotnet publish src/ObjectStorageClient.App -c Release -r osx-arm64 --self-contained
 ```
+
+On macOS the publish output is a bare executable rather than something Finder treats as an
+application, so it goes through a script that wraps it in a `.app` bundle and zips it:
+
+```bash
+build/package-macos.sh osx-arm64 0.0.1 artifacts
+```
+
+Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) when a
+`v*` tag is pushed: it runs the tests, checks that the tag matches `<Version>` in
+`Directory.Build.props`, packages all four targets, and attaches them with `SHA256SUMS.txt`.
+Running the workflow manually builds the same artifacts without publishing a release, which is
+the way to check packaging changes before tagging.
+
+The application icon is generated rather than hand-drawn; `build/generate-icon.py` produces the
+`.png`, `.ico` and `.icns` variants. The generated files are committed because the Linux and
+Windows runners have neither Pillow nor `iconutil`.
 
 ## Master password
 
@@ -110,3 +142,7 @@ tests/                         unit tests for both
 
 See [CLAUDE.md](CLAUDE.md) for the architecture notes and the constraints worth knowing before
 changing things.
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 Astral.
