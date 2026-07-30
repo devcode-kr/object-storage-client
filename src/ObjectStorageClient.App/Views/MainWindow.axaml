@@ -6,6 +6,7 @@
         x:Class="ObjectStorageClient.App.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="{Binding ConnectionTitle, StringFormat='Object Storage Client — {0}'}"
+        Icon="/Assets/appicon.png"
         Width="1280" Height="820"
         MinWidth="900" MinHeight="600"
         WindowStartupLocation="CenterScreen">
