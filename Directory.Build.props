@@ -3,6 +3,14 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <LangVersion>latest</LangVersion>
+    <!--
+      Single source of truth for the release version. The tag (v0.0.1) and the assembly must
+      agree; the release workflow verifies that they do and fails the build if they drift.
+    -->
+    <Version>0.0.1</Version>
+    <Company>Astral</Company>
+    <Product>Object Storage Client</Product>
+    <Copyright>Copyright (c) 2026 Astral</Copyright>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
