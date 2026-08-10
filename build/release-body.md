@@ -41,7 +41,7 @@ No signature checks stand in the way. On a minimal install you may need the libr
 depends on:
 
 ```sh
-sudo apt install libice6 libsm6 libfontconfig1
+sudo apt install libx11-6 libice6 libsm6 libfontconfig1
 tar -xzf ObjectStorageClient-@VERSION@-linux-x64.tar.gz
 ./ObjectStorageClient-@VERSION@-linux-x64/ObjectStorageClient.App
 ```

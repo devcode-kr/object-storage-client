@@ -40,13 +40,14 @@ runtime installation needed. Each release ships `SHA256SUMS.txt` for verificatio
   quarantined bundle. Clear the attribute after installing:
   `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
 - **Linux** — nothing in the way. A minimal install may still need
-  `libice6`, `libsm6` and `libfontconfig1`.
+  `libx11-6`, `libice6`, `libsm6` and `libfontconfig1`.
 
 The release notes spell each of these out in full.
 
 ## Building from source
 
-Requires [.NET SDK 9.0](https://dotnet.microsoft.com/download) or newer.
+Requires [.NET SDK 9.0](https://dotnet.microsoft.com/download) or newer. Nothing else — no
+workloads, and no Avalonia tooling. The commands are the same on all three platforms:
 
 ```bash
 git clone <this repo>
@@ -56,6 +57,80 @@ dotnet build ObjectStorageClient.sln
 dotnet test  ObjectStorageClient.sln
 dotnet run --project src/ObjectStorageClient.App
 ```
+
+`TreatWarningsAsErrors` is on for every project, so the build fails on a warning. The tests run on
+Avalonia's headless backend and need no display, which makes them safe to run over SSH or in a
+container.
+
+### Linux (Debian / Ubuntu)
+
+Ubuntu 24.04 and later carry the SDK in the archive; on Debian use
+[Microsoft's feed](https://learn.microsoft.com/dotnet/core/install/linux-debian) or the
+`dotnet-install` script.
+
+```bash
+sudo apt install -y dotnet-sdk-9.0
+sudo apt install -y libx11-6 libice6 libsm6 libfontconfig1   # Avalonia's runtime dependencies
+sudo apt install -y fonts-noto-cjk                           # only if you need CJK text
+```
+
+Two things bite on a minimal install. Without the four libraries above the window never appears,
+even though the build is self-contained — the .NET runtime is bundled, the X11 and font libraries
+are not. And without a CJK font, Korean or Japanese site names and log lines render as boxes;
+nothing is broken, the app simply ships no font that covers those ranges.
+
+Avalonia 11 targets X11 directly, so on a Wayland desktop the app runs through XWayland — which
+Ubuntu installs by default. Both session types work; testing under each is still worthwhile,
+since window sizing and DPI go through different paths.
+
+```bash
+dotnet run --project src/ObjectStorageClient.App
+
+# or a self-contained build, which is what a release ships
+dotnet publish src/ObjectStorageClient.App -c Release -r linux-x64 --self-contained
+./src/ObjectStorageClient.App/bin/Release/net9.0/linux-x64/publish/ObjectStorageClient.App
+```
+
+Your sites and settings land in `~/.devcode/object-storage-client/`, created with `0600`
+permissions. `stat -c %a ~/.devcode/object-storage-client/sites.json` is the quickest way to
+confirm a build has not regressed that.
+
+### Windows 11
+
+```powershell
+winget install Microsoft.DotNet.SDK.9
+
+dotnet build ObjectStorageClient.sln
+dotnet test  ObjectStorageClient.sln
+dotnet run --project src\ObjectStorageClient.App
+```
+
+Avalonia talks to Win32 directly, so there is nothing to install beyond the SDK.
+
+```powershell
+dotnet publish src\ObjectStorageClient.App -c Release -r win-x64 --self-contained
+.\src\ObjectStorageClient.App\bin\Release\net9.0\win-x64\publish\ObjectStorageClient.App.exe
+```
+
+Sites and settings go to `%USERPROFILE%\.devcode\object-storage-client\` — the same layout as the
+other platforms rather than `%APPDATA%`, so the directory can be carried between machines. Windows
+has no owner-only file mode to set, so that step is skipped there.
+
+A locally built `.exe` runs without complaint; SmartScreen only stands in the way of a binary that
+arrived over the network, which is what the [Install](#install) section covers.
+
+### A gateway to test against
+
+MinIO in Docker is enough to exercise uploads, downloads and the queue:
+
+```bash
+docker run --rm -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  quay.io/minio/minio server /data --console-address :9001
+```
+
+Create a bucket at <http://localhost:9001>, then connect with the settings below. Pointing all
+three platforms at one endpoint is what makes their results comparable.
 
 ### Connecting
 
