@@ -6,10 +6,6 @@
              x:Class="ObjectStorageClient.App.Views.RemotePaneView"
              x:DataType="vm:RemoteBrowserViewModel">
 
-  <UserControl.Resources>
-    <conv:ByteSizeConverter x:Key="ByteSize" />
-  </UserControl.Resources>
-
   <Border Classes="pane">
     <Grid RowDefinitions="Auto,Auto,*,Auto">
 
@@ -69,8 +65,9 @@
               </DataGridTemplateColumn.CellTemplate>
             </DataGridTemplateColumn>
 
+            <!-- Bound to the row, not to Size: prefixes show "-" rather than "0 B". -->
             <DataGridTextColumn Header="Size" Width="90"
-                                Binding="{Binding Size, Converter={StaticResource ByteSize}}" />
+                                Binding="{Binding Converter={x:Static conv:SizeConverters.RemoteEntrySize}}" />
             <DataGridTextColumn Header="Modified" Width="150"
                                 Binding="{Binding LastModified, StringFormat='{}{0:yyyy-MM-dd HH:mm}'}" />
             <DataGridTextColumn Header="Class" Width="100" Binding="{Binding StorageClass}" />
