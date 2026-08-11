@@ -168,8 +168,11 @@ build/package-macos.sh osx-arm64 0.0.1 artifacts
 ```
 
 Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) when a
-`v*` tag is pushed: it runs the tests, checks that the tag matches `<Version>` in
-`Directory.Build.props`, packages all four targets, and attaches them with `SHA256SUMS.txt`.
+`v*` tag is pushed: it checks that the tag matches `<Version>` in `Directory.Build.props`, runs
+the tests on all three operating systems, packages all four targets, and attaches them with
+`SHA256SUMS.txt`. Each packaged build is then launched to confirm it starts — the Linux one
+inside a bare Debian image carrying only the packages listed above, so that an error in that
+list fails the release rather than reaching users.
 Running the workflow manually builds the same artifacts without publishing a release, which is
 the way to check packaging changes before tagging.
 

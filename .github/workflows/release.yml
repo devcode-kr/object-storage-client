@@ -15,16 +15,12 @@ permissions:
 
 jobs:
   verify:
-    name: Build and test
+    name: Check version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          global-json-file: global.json
 
       # The tag and <Version> must agree, or the release would ship assemblies stamped with a
       # different version than the tag advertises.
@@ -47,12 +43,29 @@ jobs:
           echo "version=$props" >> "$GITHUB_OUTPUT"
           echo "Version: $props"
 
+  # The headless tests exercise managed code only — no display, no X11 — so they run identically
+  # everywhere. What they catch per-platform is the code that branches on the OS: file modes,
+  # path handling, and the case sensitivity of the filesystem underneath.
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
       - name: Test
         run: dotnet test ObjectStorageClient.sln --configuration Release --nologo
 
   package:
     name: Package ${{ matrix.rid }}
-    needs: verify
+    needs: [verify, test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -110,6 +123,63 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "publish failed" }
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           Compress-Archive -Path "staging/$name" -DestinationPath "artifacts/$name.zip"
+
+      # Start-up guards. The headless tests never touch X11, Win32 or AppKit, so they pass
+      # happily while the shipped binary fails to open a window — which is exactly how a missing
+      # libx11-6 survived in the documented dependency list. These launch the artifact we are
+      # about to publish and fail if it does not stay up. An app that cannot start is not
+      # something to hand to manual QA.
+
+      # Deliberately a bare Debian image with only the packages the README tells users to
+      # install, rather than the runner itself, which already has half of X11 present.
+      - name: Smoke test (Linux)
+        if: matrix.rid == 'linux-x64'
+        run: |
+          set -euo pipefail
+          name="ObjectStorageClient-${{ needs.verify.outputs.version }}-${{ matrix.rid }}"
+          docker run --rm -v "$PWD/staging/$name:/app:ro" debian:trixie-slim bash -eu -c '
+            apt-get update -qq
+            apt-get install -y -qq libx11-6 libice6 libsm6 libfontconfig1 xvfb > /dev/null
+            xvfb-run -a /app/ObjectStorageClient.App &
+            pid=$!
+            sleep 15
+            if ! kill -0 "$pid" 2> /dev/null; then
+              wait "$pid" && rc=0 || rc=$?
+              echo "The application exited during start-up (exit $rc)"
+              exit 1
+            fi
+            kill "$pid"
+            echo "Still running after 15s — start-up OK"
+          '
+
+      - name: Smoke test (Windows)
+        if: matrix.rid == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "ObjectStorageClient-${{ needs.verify.outputs.version }}-${{ matrix.rid }}"
+          $app = Start-Process -FilePath "staging/$name/ObjectStorageClient.App.exe" -PassThru
+          Start-Sleep -Seconds 15
+          if ($app.HasExited) { throw "The application exited during start-up ($($app.ExitCode))" }
+          $app.Kill()
+          Write-Host 'Still running after 15s — start-up OK'
+
+      # osx-x64 is cross-architecture on an Apple Silicon runner and would need Rosetta, so only
+      # the native slice is launched here.
+      - name: Smoke test (macOS)
+        if: matrix.rid == 'osx-arm64'
+        run: |
+          set -euo pipefail
+          "artifacts/Object Storage Client.app/Contents/MacOS/ObjectStorageClient.App" &
+          pid=$!
+          sleep 15
+          if ! kill -0 "$pid" 2> /dev/null; then
+            wait "$pid" && rc=0 || rc=$?
+            echo "::error::The application exited during start-up (exit $rc)"
+            exit 1
+          fi
+          kill "$pid"
+          echo "Still running after 15s — start-up OK"
 
       - uses: actions/upload-artifact@v4
         with:
