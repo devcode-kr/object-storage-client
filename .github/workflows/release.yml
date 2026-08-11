@@ -164,13 +164,23 @@ jobs:
           $app.Kill()
           Write-Host 'Still running after 15s — start-up OK'
 
-      # osx-x64 is cross-architecture on an Apple Silicon runner and would need Rosetta, so only
-      # the native slice is launched here.
+      # The packaging script keeps its bundle in a staging directory it deletes on exit, so this
+      # unpacks the archive that actually ships — which also proves ditto preserved the
+      # executable bit. osx-x64 is cross-architecture on an Apple Silicon runner and would need
+      # Rosetta, so only the native slice is launched.
       - name: Smoke test (macOS)
         if: matrix.rid == 'osx-arm64'
         run: |
           set -euo pipefail
-          "artifacts/Object Storage Client.app/Contents/MacOS/ObjectStorageClient.App" &
+          archive="artifacts/ObjectStorageClient-${{ needs.verify.outputs.version }}-${{ matrix.rid }}.zip"
+          rm -rf smoke && mkdir smoke
+          ditto -x -k "$archive" smoke
+          app="$(/usr/bin/find smoke -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then
+            echo "::error::No .app bundle inside $archive"
+            exit 1
+          fi
+          "$app/Contents/MacOS/ObjectStorageClient.App" &
           pid=$!
           sleep 15
           if ! kill -0 "$pid" 2> /dev/null; then
