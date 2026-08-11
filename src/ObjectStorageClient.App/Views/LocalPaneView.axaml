@@ -60,7 +60,10 @@
             <DataGridTemplateColumn.CellTemplate>
               <DataTemplate x:DataType="local:LocalEntry">
                 <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" Margin="4,0">
-                  <TextBlock Text="{Binding IsDirectory, Converter={x:Static conv:GlyphConverters.DirectoryGlyph}}" />
+                  <!-- Drawn, not an emoji: Linux without an emoji font renders those as a box. -->
+                  <Path Data="{Binding IsDirectory, Converter={x:Static conv:ListingConverters.EntryIcon}}"
+                        Fill="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                        Width="16" Height="16" Stretch="None" VerticalAlignment="Center" />
                   <TextBlock Text="{Binding Name}" />
                 </StackPanel>
               </DataTemplate>
@@ -69,9 +72,9 @@
 
           <!-- Bound to the row, not to Size: directories show "-" rather than "0 B". -->
           <DataGridTextColumn Header="Size" Width="90"
-                              Binding="{Binding Converter={x:Static conv:SizeConverters.LocalEntrySize}}" />
+                              Binding="{Binding Converter={x:Static conv:ListingConverters.LocalEntrySize}}" />
           <DataGridTextColumn Header="Modified" Width="150"
-                              Binding="{Binding LastModified, StringFormat='{}{0:yyyy-MM-dd HH:mm}'}" />
+                              Binding="{Binding LastModified, Converter={x:Static conv:ListingConverters.Timestamp}}" />
         </DataGrid.Columns>
       </DataGrid>
 

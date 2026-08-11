@@ -58,7 +58,10 @@
               <DataGridTemplateColumn.CellTemplate>
                 <DataTemplate x:DataType="models:RemoteEntry">
                   <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" Margin="4,0">
-                    <TextBlock Text="{Binding IsFolder, Converter={x:Static conv:GlyphConverters.RemoteGlyph}}" />
+                    <!-- Drawn, not an emoji: Linux without an emoji font renders those as a box. -->
+                    <Path Data="{Binding IsFolder, Converter={x:Static conv:ListingConverters.EntryIcon}}"
+                          Fill="{DynamicResource SystemControlForegroundBaseHighBrush}"
+                          Width="16" Height="16" Stretch="None" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding Name}" />
                   </StackPanel>
                 </DataTemplate>
@@ -67,9 +70,9 @@
 
             <!-- Bound to the row, not to Size: prefixes show "-" rather than "0 B". -->
             <DataGridTextColumn Header="Size" Width="90"
-                                Binding="{Binding Converter={x:Static conv:SizeConverters.RemoteEntrySize}}" />
+                                Binding="{Binding Converter={x:Static conv:ListingConverters.RemoteEntrySize}}" />
             <DataGridTextColumn Header="Modified" Width="150"
-                                Binding="{Binding LastModified, StringFormat='{}{0:yyyy-MM-dd HH:mm}'}" />
+                                Binding="{Binding LastModified, Converter={x:Static conv:ListingConverters.Timestamp}}" />
             <DataGridTextColumn Header="Class" Width="100" Binding="{Binding StorageClass}" />
           </DataGrid.Columns>
         </DataGrid>
