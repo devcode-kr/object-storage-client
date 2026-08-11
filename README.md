@@ -74,6 +74,14 @@ sudo apt install -y libx11-6 libice6 libsm6 libfontconfig1   # Avalonia's runtim
 sudo apt install -y fonts-noto-cjk                           # only if you need CJK text
 ```
 
+On a freshly installed machine those may fail with `Could not get lock
+/var/lib/dpkg/lock-frontend`, because `unattended-upgrades` runs on first boot and holds it for
+a few minutes. Add `-o DPkg::Lock::Timeout=600` to wait for it rather than fail. Do not kill the
+process or delete the lock file — an interrupted dpkg transaction leaves the package database
+needing repair. If you only want the SDK and have no root, the
+[dotnet-install script](https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script)
+installs into `$HOME` and avoids apt altogether.
+
 Two things bite on a minimal install. Without the four libraries above the window never appears,
 even though the build is self-contained — the .NET runtime is bundled, the X11 and font libraries
 are not. And without a CJK font, Korean or Japanese site names and log lines render as boxes;
