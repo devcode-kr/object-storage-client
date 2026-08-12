@@ -12,11 +12,15 @@
     대소문자와 공백까지 같아야 하고, 하나라도 다르면 업로드가 거부된다.
 
 .EXAMPLE
+    # 보통은 이렇게. 버전은 Directory.Build.props 에서 읽고 리비전은 0 이 된다.
     build\package-windows-msix.ps1 `
       -IdentityName 12345Astral.ObjectStorageClient `
       -Publisher "CN=A1B2C3D4-0000-0000-0000-000000000000" `
-      -PublisherDisplayName Astral `
-      -PackageVersion 1.0.0.0
+      -PublisherDisplayName Astral
+
+.EXAMPLE
+    # 코드는 그대로인데 다시 포장해서 올려야 할 때만 리비전을 준다.
+    build\package-windows-msix.ps1 ... -Revision 1
 #>
 [CmdletBinding()]
 param(
@@ -24,8 +28,12 @@ param(
     [Parameter(Mandatory)][string] $Publisher,
     [Parameter(Mandatory)][string] $PublisherDisplayName,
 
-    # Store 규칙: 네 번째 자리는 Store 몫이라 반드시 0, 첫 자리는 0이면 안 된다.
-    [Parameter(Mandatory)][string] $PackageVersion,
+    # 비우면 Directory.Build.props 의 <Version> 을 읽는다. 굳이 넘길 이유는 없다.
+    [string] $Version,
+
+    # 네 번째 자리. 릴리즈 워크플로는 언제나 0 으로 낸다. 코드 변경 없이 같은 버전을 다시
+    # 제출해야 할 때만 여기서 올린다. 기준 버전을 통째로 다시 적지 않아도 되게 분리해 두었다.
+    [int] $Revision = 0,
 
     [string] $DisplayName = 'Object Storage Client',
     [string] $OutputDir = 'artifacts',
@@ -44,20 +52,33 @@ function Fail([string] $message) {
     exit 1
 }
 
-# --- 버전 검증 --------------------------------------------------------------
+# --- 버전 결정과 검증 --------------------------------------------------------
 # 실패를 제출 단계가 아니라 빌드 단계에서 보게 한다.
-if ($PackageVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
-    Fail "PackageVersion 은 네 자리여야 한다 (예: 1.0.0.0). 받은 값: $PackageVersion"
+if (-not $Version) {
+    $propsPath = Join-Path $repoRoot 'Directory.Build.props'
+    [xml] $props = Get-Content $propsPath
+    $node = $props.SelectSingleNode('//PropertyGroup/Version')
+    if (-not $node) { Fail "$propsPath 에서 <Version> 을 찾지 못했다." }
+    $Version = $node.InnerText.Trim()
 }
-$parts = $PackageVersion.Split('.')
-if ([int]$parts[0] -eq 0) {
+
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    Fail "Version 은 세 자리여야 한다 (예: 1.0.0). 받은 값: $Version"
+}
+if ([int]$Version.Split('.')[0] -eq 0) {
     Fail @"
-Store 는 첫 자리가 0 인 버전을 받지 않는다 (받은 값: $PackageVersion).
-저장소의 <Version> 이 0.x 라면 Store 제출용으로는 1.0.0.0 이상을 따로 정해야 한다.
+Store 는 첫 자리가 0 인 버전을 받지 않는다 (받은 값: $Version).
+Directory.Build.props 의 <Version> 을 1.0.0 이상으로 올려야 한다.
 "@
 }
-if ([int]$parts[3] -ne 0) {
-    Fail "네 번째 자리는 Store 가 쓰는 자리라 0 이어야 한다. 받은 값: $PackageVersion"
+if ($Revision -lt 0 -or $Revision -gt 65535) {
+    Fail "Revision 은 0~65535 여야 한다. 받은 값: $Revision"
+}
+
+$PackageVersion = "$Version.$Revision"
+Write-Host "패키지 버전: $PackageVersion"
+if ($Revision -ne 0) {
+    Write-Host "  리비전 $Revision — 코드 변경 없는 재제출로 간주한다. 릴리즈 워크플로는 언제나 0 이다."
 }
 
 # --- Windows SDK 도구 찾기 ---------------------------------------------------
@@ -89,7 +110,7 @@ New-Item -ItemType Directory -Force -Path $staging | Out-Null
 Write-Host "`n== publish (win-x64, self-contained) =="
 dotnet publish (Join-Path $repoRoot 'src/ObjectStorageClient.App') `
     --configuration Release --runtime win-x64 --self-contained `
-    --output $staging -p:Version=$($parts[0..2] -join '.') --nologo
+    --output $staging -p:Version=$Version --nologo
 if ($LASTEXITCODE -ne 0) { Fail 'publish 실패' }
 
 # --- 매니페스트와 자산 -------------------------------------------------------

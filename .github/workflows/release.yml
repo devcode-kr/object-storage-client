@@ -217,7 +217,7 @@ jobs:
             -IdentityName "${{ vars.MSIX_IDENTITY_NAME }}" `
             -Publisher "${{ vars.MSIX_PUBLISHER }}" `
             -PublisherDisplayName "${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}" `
-            -PackageVersion "${{ needs.verify.outputs.version }}.0" `
+            -Version "${{ needs.verify.outputs.version }}" `
             -OutputDir msix
 
       # Separate from the release assets: this goes to Partner Center by hand, not to the release.
