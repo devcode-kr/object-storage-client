@@ -1,42 +1,41 @@
-S3 호환 오브젝트 스토리지를 위한 크로스 플랫폼 데스크톱 클라이언트. FileZilla 방식의 2단 패널
-인터페이스를 쓴다.
+S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면은 FileZilla처럼 좌우 2단으로 나뉜다.
 
 ## 다운로드
 
 | 플랫폼 | 파일 |
 | --- | --- |
 | Windows 11 (x64) | `ObjectStorageClient-@VERSION@-win-x64.zip` |
-| Linux (x64, 데비안 계열) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
+| 리눅스 (x64, 데비안 계열) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
 
-모든 빌드는 self-contained라 .NET 런타임을 따로 설치할 필요가 없다.
+.NET 런타임까지 들어 있어서 따로 설치할 게 없다.
 
-## 이 빌드들은 코드 서명이 되어 있지 않습니다
+## 이 빌드에는 코드 서명이 없습니다
 
-서명 인증서에는 비용이 드는데 이 프로젝트는 아직 그 비용을 쓰지 않았다. 그래서 Windows와 macOS
-모두 경고를 띄운다. 아래가 그것을 넘기는 방법이다. 그냥 믿고 실행하기 꺼려진다면 먼저 체크섬을
-검증하면 된다.
+서명 인증서에는 돈이 드는데 아직 거기까지 쓰지 못했다. 그래서 Windows와 macOS 모두 경고를 띄운다.
+넘어가는 방법은 아래에 있다. 그냥 실행하기가 꺼려지면 체크섬부터 확인하면 된다.
 
 ### Windows
 
-1. 받은 `.zip`을 우클릭 → **속성** → **차단 해제** 체크 → **확인**, 그다음 압축을 푼다.
-   (이 단계를 건너뛰면 다운로드 표시가 압축을 푼 모든 파일에 전파된다.)
+1. 받은 `.zip`을 우클릭해 **속성**에서 **차단 해제**를 체크하고 **확인**을 누른 다음 압축을 푼다.
+   이 단계를 건너뛰면 다운로드 딱지가 압축을 푼 파일 전부에 옮겨 붙는다.
 2. `ObjectStorageClient.App.exe`를 실행한다. SmartScreen이 *"Windows의 PC 보호"*를 띄우면
-   **추가 정보** → **실행**을 선택한다.
+   **추가 정보**를 누르고 **실행**을 고른다.
 
 ### macOS
 
-macOS는 서명되지 않은 앱을 *"손상되었기 때문에 열 수 없습니다"*라고 알린다. 앱이 손상된 것이 아니라,
-서명 없이 격리된 번들에 Gatekeeper가 붙이는 메시지다. 앱을 옮겨 놓은 뒤 격리 속성을 지우면 된다.
+서명이 없는 앱을 macOS는 *"손상되었기 때문에 열 수 없습니다"*라고 알린다. 앱이 망가진 게 아니라,
+서명 없이 격리된 번들에 Gatekeeper가 붙이는 문구다. 앱을 옮겨놓고 격리 딱지를 떼면 실행된다.
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
 ```
 
-### Linux
+### 리눅스
 
-막는 서명 검사가 없다. 최소 설치 환경에서는 Avalonia가 의존하는 라이브러리가 필요할 수 있다.
+막는 서명 검사가 없다. 다만 최소 설치 환경이라면 Avalonia가 쓰는 라이브러리를 먼저 깔아야 할 수
+있다.
 
 ```sh
 sudo apt install libx11-6 libice6 libsm6 libfontconfig1
@@ -44,12 +43,12 @@ tar -xzf ObjectStorageClient-@VERSION@-linux-x64.tar.gz
 ./ObjectStorageClient-@VERSION@-linux-x64/ObjectStorageClient.App
 ```
 
-## 다운로드 검증
+## 받은 파일 확인하기
 
-`SHA256SUMS.txt`가 이 릴리즈의 모든 자산을 포함한다.
+`SHA256SUMS.txt`에 이번 릴리즈의 모든 파일이 들어 있다.
 
 ```sh
-sha256sum -c SHA256SUMS.txt --ignore-missing     # Linux
+sha256sum -c SHA256SUMS.txt --ignore-missing     # 리눅스
 shasum -a 256 -c SHA256SUMS.txt --ignore-missing # macOS
 ```
 
@@ -57,11 +56,11 @@ shasum -a 256 -c SHA256SUMS.txt --ignore-missing # macOS
 Get-FileHash .\ObjectStorageClient-@VERSION@-win-x64.zip -Algorithm SHA256  # Windows
 ```
 
-## 데이터 저장 위치
+## 데이터가 저장되는 곳
 
-`$HOME/.devcode/object-storage-client/` (Windows는 `%USERPROFILE%`)에 `sites.json`과
-`config.json`이 저장된다. 저장된 자격증명은 마스터 비밀번호에서 파생된 키로 AES-256-GCM 암호화되며,
-그 비밀번호는 디스크에 결코 기록되지 않는다 — **잊어버리면 복구할 방법이 없다.**
+`$HOME/.devcode/object-storage-client/`에 `sites.json`과 `config.json`이 생긴다. Windows에서는
+`%USERPROFILE%` 아래다. 저장한 자격증명은 마스터 비밀번호에서 뽑은 키로 AES-256-GCM 암호화하고,
+비밀번호 자체는 디스크에 남기지 않는다. **잊어버리면 되찾을 방법이 없다.**
 
 ## 라이선스
 
