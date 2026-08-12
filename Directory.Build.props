@@ -4,10 +4,17 @@
     <TargetFramework>net9.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <!--
-      Single source of truth for the release version. The tag (v0.0.1) and the assembly must
+      Single source of truth for the release version. The tag (v1.0.0) and the assembly must
       agree; the release workflow verifies that they do and fails the build if they drift.
+
+      Three parts here, four everywhere Windows looks: .NET pads this to Major.Minor.Build.0 and
+      the Store package uses the same value. That fourth part is Revision, which the Store
+      reserves and requires to be 0 — so a repackage with no code change bumps Build, not
+      Revision. Leave it 0 unless something genuinely needs to say "same code, built again".
+
+      Started at 1.0.0 rather than 0.x because the Store rejects a major version of 0.
     -->
-    <Version>0.0.1</Version>
+    <Version>1.0.0</Version>
     <Company>Astral</Company>
     <Product>Object Storage Client</Product>
     <Copyright>Copyright (c) 2026 Astral</Copyright>

@@ -170,7 +170,7 @@ macOS는 publish 결과가 맨 실행 파일이라 Finder가 응용 프로그램
 번들로 감싸고 압축하는 스크립트를 따로 둔다.
 
 ```bash
-build/package-macos.sh osx-arm64 0.0.1 artifacts
+build/package-macos.sh osx-arm64 1.0.0 artifacts
 ```
 
 릴리즈는 `v*` 태그를 밀면 [`.github/workflows/release.yml`](.github/workflows/release.yml)이

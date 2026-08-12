@@ -175,7 +175,7 @@ On macOS the publish output is a bare executable rather than something Finder tr
 application, so it goes through a script that wraps it in a `.app` bundle and zips it:
 
 ```bash
-build/package-macos.sh osx-arm64 0.0.1 artifacts
+build/package-macos.sh osx-arm64 1.0.0 artifacts
 ```
 
 Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) when a

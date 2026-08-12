@@ -3,7 +3,7 @@
 # Assemble a macOS .app bundle and zip it.
 #
 #   build/package-macos.sh <rid> <version> <output-dir>
-#   build/package-macos.sh osx-arm64 0.0.1 artifacts
+#   build/package-macos.sh osx-arm64 1.0.0 artifacts
 #
 # `dotnet publish` emits a bare executable, not a bundle, so Finder would not treat the output
 # as an application. This wraps the publish output in the Contents/MacOS + Info.plist layout
