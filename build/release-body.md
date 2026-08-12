@@ -4,24 +4,22 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 | 플랫폼 | 파일 |
 | --- | --- |
-| Windows 11 (x64) | `ObjectStorageClient-@VERSION@-win-x64.zip` |
+| Windows 11 (x64) | [Microsoft Store](@STORE_URL@) |
 | 리눅스 (x64, 데비안 계열) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
 
 .NET 런타임까지 들어 있어서 따로 설치할 게 없다.
 
-## 이 빌드에는 코드 서명이 없습니다
+## Windows는 Microsoft Store에서
 
-서명 인증서에는 돈이 드는데 아직 거기까지 쓰지 못했다. 그래서 Windows와 macOS 모두 경고를 띄운다.
-넘어가는 방법은 아래에 있다. 그냥 실행하기가 꺼려지면 체크섬부터 확인하면 된다.
+Windows용은 Store로만 배포한다. Store가 패키지에 서명하고 업데이트도 알아서 챙겨주니, 경고를
+넘길 일도 직접 받아 압축을 풀 일도 없다.
 
-### Windows
+## macOS와 리눅스는 서명이 없습니다
 
-1. 받은 `.zip`을 우클릭해 **속성**에서 **차단 해제**를 체크하고 **확인**을 누른 다음 압축을 푼다.
-   이 단계를 건너뛰면 다운로드 딱지가 압축을 푼 파일 전부에 옮겨 붙는다.
-2. `ObjectStorageClient.App.exe`를 실행한다. SmartScreen이 *"Windows의 PC 보호"*를 띄우면
-   **추가 정보**를 누르고 **실행**을 고른다.
+이 둘은 서명 없이 나간다. macOS는 그래서 경고를 띄우는데, 넘어가는 방법은 아래에 있다. 그냥
+실행하기가 꺼려지면 체크섬부터 확인하면 된다.
 
 ### macOS
 
@@ -52,10 +50,6 @@ sha256sum -c SHA256SUMS.txt --ignore-missing     # 리눅스
 shasum -a 256 -c SHA256SUMS.txt --ignore-missing # macOS
 ```
 
-```powershell
-Get-FileHash .\ObjectStorageClient-@VERSION@-win-x64.zip -Algorithm SHA256  # Windows
-```
-
 ## 데이터가 저장되는 곳
 
 `$HOME/.devcode/object-storage-client/`에 `sites.json`과 `config.json`이 생긴다. Windows에서는
@@ -78,25 +72,22 @@ two-pane interface.
 
 | Platform | File |
 | --- | --- |
-| Windows 11 (x64) | `ObjectStorageClient-@VERSION@-win-x64.zip` |
+| Windows 11 (x64) | [Microsoft Store](@STORE_URL@) |
 | Linux (x64, Debian family) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
 
 Every build is self-contained — no .NET runtime installation is required.
 
-## These builds are not code-signed
+## Windows comes from the Microsoft Store
 
-Signing certificates cost money that this project has not spent yet, so both Windows and macOS
-will warn you. The steps below are how you get past that. Verify the checksums first if you
-would rather not take that on faith.
+Windows is distributed through the Store only. The Store signs the package and handles updates,
+so there is no warning to click past and no archive to unblock.
 
-### Windows
+## The macOS and Linux builds are not code-signed
 
-1. Right-click the downloaded `.zip` → **Properties** → tick **Unblock** → **OK**, then extract.
-   (Skipping this propagates the download mark to every extracted file.)
-2. Run `ObjectStorageClient.App.exe`. SmartScreen shows *"Windows protected your PC"* —
-   choose **More info** → **Run anyway**.
+These two ship unsigned, so macOS will warn you. Getting past it is below. Verify the checksums
+first if you would rather not take that on faith.
 
 ### macOS
 
@@ -126,10 +117,6 @@ tar -xzf ObjectStorageClient-@VERSION@-linux-x64.tar.gz
 ```sh
 sha256sum -c SHA256SUMS.txt --ignore-missing     # Linux
 shasum -a 256 -c SHA256SUMS.txt --ignore-missing # macOS
-```
-
-```powershell
-Get-FileHash .\ObjectStorageClient-@VERSION@-win-x64.zip -Algorithm SHA256  # Windows
 ```
 
 ## Where your data is stored

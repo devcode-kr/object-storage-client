@@ -30,14 +30,15 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 
 ## Install
 
-Grab a self-contained build for your platform from the
-[latest release](https://github.com/devcode-kr/object-storage-client/releases/latest) — no .NET
-runtime installation needed. Each release ships `SHA256SUMS.txt` for verification.
+**Windows comes from the Microsoft Store.** The Store signs the package and handles updates, so
+there is no warning to click past. Developer registration is under review; the link goes here
+once it clears.
 
-**The binaries are not code-signed yet**, so Windows and macOS both object:
+**macOS and Linux** come from the
+[latest release](https://github.com/devcode-kr/object-storage-client/releases/latest) — builds are
+self-contained, so no .NET runtime installation is needed, and each release ships `SHA256SUMS.txt`
+for verification. These two ship unsigned, which costs macOS one extra step:
 
-- **Windows** — unblock the `.zip` in its Properties dialog before extracting, then answer
-  SmartScreen with *More info → Run anyway*.
 - **macOS** — the app is reported as *"damaged"*; that is Gatekeeper's message for an unsigned
   quarantined bundle. Clear the attribute after installing:
   `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
@@ -235,10 +236,13 @@ reinstalling does not lose them. Delete the directory yourself if you want them 
 rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode\object-storage-client
 ```
 
-## Code signing
+## Code signing and privacy
 
-Releases are not signed yet. [CODE_SIGNING_POLICY.en.md](CODE_SIGNING_POLICY.en.md) describes who may
-sign a release, what is signed, and what a signature would and would not tell you.
+Windows is signed by the Store; macOS and Linux ship unsigned.
+[CODE_SIGNING_POLICY.en.md](CODE_SIGNING_POLICY.en.md) covers what that means per platform and
+what a signature vouches for.
+
+Nothing is collected — see the [privacy policy](PRIVACY.en.md).
 
 ## Project layout
 

@@ -28,14 +28,14 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 ## 설치
 
-[최신 릴리즈](https://github.com/devcode-kr/object-storage-client/releases/latest)에서 쓰는 플랫폼에
-맞는 파일을 받으면 된다. .NET 런타임까지 들어 있어서 따로 설치할 게 없다. 검증용
-`SHA256SUMS.txt`도 릴리즈마다 함께 올라간다.
+**Windows는 Microsoft Store에서 받는다.** Store가 패키지에 서명하고 업데이트도 챙겨주니 경고를
+넘길 일이 없다. 현재 개발자 등록 심사 중이고, 통과하면 이 자리에 링크가 들어간다.
 
-**아직 코드 서명을 하지 않아서** Windows와 macOS 모두 경고를 띄운다.
+**macOS와 리눅스는**
+[최신 릴리즈](https://github.com/devcode-kr/object-storage-client/releases/latest)에서 받으면 된다.
+.NET 런타임까지 들어 있어서 따로 설치할 게 없고, 검증용 `SHA256SUMS.txt`도 함께 올라간다. 이 둘은
+서명 없이 나가기 때문에 macOS는 한 단계를 더 거쳐야 한다.
 
-- **Windows** — 압축을 풀기 전에 `.zip` 속성 창에서 차단을 먼저 해제한다. 실행하면 SmartScreen이
-  뜨는데 *추가 정보 → 실행*을 누르면 된다.
 - **macOS** — "손상되었기 때문에 열 수 없습니다"라고 나온다. 앱이 망가진 게 아니라, 서명 없이
   격리된 번들에 Gatekeeper가 붙이는 문구다. 앱을 옮겨놓고 격리 딱지를 떼면 실행된다.
   `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
@@ -226,10 +226,12 @@ build/package-macos.sh osx-arm64 0.0.1 artifacts
 rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode\object-storage-client
 ```
 
-## 코드 서명
+## 코드 서명과 개인정보
 
-릴리즈에는 아직 서명이 붙어 있지 않다. 누가 서명할 수 있는지, 무엇에 서명하는지, 그 서명이 무엇을
-보증하고 무엇은 보증하지 않는지는 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)에 적어두었다.
+Windows는 Store가 서명하고 macOS와 리눅스는 서명 없이 나간다. 플랫폼별로 어떻게 되는지,
+그 서명이 무엇을 보증하는지는 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)에 있다.
+
+수집하는 정보는 없다. 자세한 내용은 [개인정보 처리방침](PRIVACY.md)에 적어두었다.
 
 ## 프로젝트 구조
 

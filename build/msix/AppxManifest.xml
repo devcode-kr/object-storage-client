@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX 패키지 매니페스트 템플릿.
+
+  @로 감싼 자리는 build/package-windows-msix.ps1 이 채운다. Identity 세 값은 Partner Center의
+  제품 개요 > Product management > "View app identity details"에 나오는 것을 그대로 옮겨야 한다.
+  대소문자와 공백까지 정확히 같아야 하고, 다르면 업로드가 거부된다.
+
+  Store에 올리면 Microsoft가 자기 인증서로 다시 서명한다. 그래서 제출용 패키지에는 CA 인증서가
+  필요 없다. 사이드로드용으로 만들 때만 직접 서명하면 된다.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+
+  <Identity
+    Name="@IDENTITY_NAME@"
+    Publisher="@PUBLISHER@"
+    Version="@PACKAGE_VERSION@"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>@DISPLAY_NAME@</DisplayName>
+    <PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+    <Description>S3 호환 오브젝트 스토리지용 데스크톱 클라이언트</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Resources>
+    <Resource Language="ko-kr" />
+    <Resource Language="en-us" />
+  </Resources>
+
+  <!--
+    uap10:RuntimeBehavior 를 쓰므로 MinVersion 이 19041(Windows 10 2004) 이상이어야 한다.
+    그보다 낮은 빌드를 지원하려면 EntryPoint="Windows.FullTrustApplication" 으로 바꿔야 한다.
+  -->
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <!-- 패키징된 데스크톱 앱이라 runFullTrust 하나면 된다. 네트워크 접근도 여기 포함된다. -->
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application
+      Id="ObjectStorageClient"
+      Executable="ObjectStorageClient.App.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        DisplayName="@DISPLAY_NAME@"
+        Description="S3 호환 오브젝트 스토리지용 데스크톱 클라이언트"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        BackgroundColor="#1F1D1B">
+        <uap:DefaultTile
+          Square71x71Logo="Assets\Square71x71Logo.png"
+          Square310x310Logo="Assets\Square310x310Logo.png"
+          Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+</Package>

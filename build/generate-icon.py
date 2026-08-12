@@ -16,6 +16,7 @@ Outputs:
     build/icon/ObjectStorageClient.icns             macOS .app bundle
     src/ObjectStorageClient.App/appicon.ico         Windows executable (<ApplicationIcon>)
     src/ObjectStorageClient.App/Assets/appicon.png  Avalonia Window.Icon (all platforms)
+    build/msix/Assets/*.png                         Microsoft Store tiles and logos
 
 Only the 1024 master is rasterised; every smaller size is resampled from it, so all the outputs
 stay pixel-identical to one another.
@@ -53,6 +54,25 @@ ICNS_SIZES = [
     ("icon_512x512.png", 512),
     ("icon_512x512@2x.png", 1024),
 ]
+
+# Microsoft Store tiles. The square logos are the mark on its own shell; the wide tile puts that
+# square on a matching background rather than stretching it, since a stretched icon looks broken.
+# Each also gets a scale-200 variant, which is what a 200% display actually loads.
+MSIX_SQUARE = {
+    "StoreLogo.png": 50,
+    "Square44x44Logo.png": 44,
+    "Square71x71Logo.png": 71,
+    "Square150x150Logo.png": 150,
+    "Square310x310Logo.png": 310,
+}
+MSIX_WIDE = {"Wide310x150Logo.png": (310, 150)}
+MSIX_SCALES = (100, 200)
+
+# Taskbar, ALT+TAB and snap-assist use the "unplated" asset, drawn without the tile background.
+MSIX_UNPLATED = "Square44x44Logo.targetsize-44_altform-unplated.png"
+
+# Matches BackgroundColor in AppxManifest.xml.
+MSIX_TILE_BACKGROUND = (31, 29, 27, 255)
 
 CHROME_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -156,6 +176,41 @@ def write_icns(master: Image.Image, destination: Path) -> None:
     print(f"  {destination.relative_to(REPO_ROOT)}")
 
 
+def write_msix_assets(master: Image.Image, destination: Path) -> None:
+    """Store tiles, in the sizes and naming the packaging manifest refers to."""
+    destination.mkdir(parents=True, exist_ok=True)
+    written = 0
+
+    def save(image: Image.Image, name: str, scale: int) -> None:
+        nonlocal written
+        # scale-100 keeps the plain name: that is the filename the manifest points at.
+        stem, suffix = name.rsplit(".", 1)
+        actual = f"{stem}.{suffix}" if scale == 100 else f"{stem}.scale-{scale}.{suffix}"
+        image.save(destination / actual)
+        written += 1
+
+    for name, size in MSIX_SQUARE.items():
+        for scale in MSIX_SCALES:
+            edge = round(size * scale / 100)
+            save(master.resize((edge, edge), Image.LANCZOS), name, scale)
+
+    for name, (width, height) in MSIX_WIDE.items():
+        for scale in MSIX_SCALES:
+            box = (round(width * scale / 100), round(height * scale / 100))
+            tile = Image.new("RGBA", box, MSIX_TILE_BACKGROUND)
+            # The mark keeps its own proportions and sits centred, filling the short edge.
+            edge = round(box[1] * 0.66)
+            mark = master.resize((edge, edge), Image.LANCZOS)
+            tile.alpha_composite(mark, ((box[0] - edge) // 2, (box[1] - edge) // 2))
+            save(tile, name, scale)
+
+    for scale in MSIX_SCALES:
+        edge = round(44 * scale / 100)
+        save(master.resize((edge, edge), Image.LANCZOS), MSIX_UNPLATED, scale)
+
+    print(f"  {destination.relative_to(REPO_ROOT)}/ ({written} files)")
+
+
 def main() -> None:
     if not SOURCE.exists():
         sys.exit(f"{SOURCE.relative_to(REPO_ROOT)} is missing")
@@ -182,6 +237,7 @@ def main() -> None:
     print(f"  {ico_path.relative_to(REPO_ROOT)}")
 
     write_icns(master, ICON_DIR / "ObjectStorageClient.icns")
+    write_msix_assets(master, REPO_ROOT / "build" / "msix" / "Assets")
 
 
 if __name__ == "__main__":
