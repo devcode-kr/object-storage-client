@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import pathlib
 import re
@@ -8,6 +9,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -15,7 +17,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 LINUX = ROOT / "build" / "linux"
 
-from build.linux import package_deb, stage_payload
+from build.linux import package_deb, package_rpm, stage_payload
 from build.linux.package_contract import NativeVersion
 
 
@@ -37,7 +39,18 @@ class PackageImportTests(unittest.TestCase):
     def test_package_qualified_imports_work_from_repo_root(self):
         self.assertTrue(callable(stage_payload.stage_payload))
         self.assertTrue(callable(package_deb.render_control))
+        self.assertTrue(callable(package_rpm.render_spec))
         self.assertTrue(callable(NativeVersion.parse))
+
+    def test_rpm_module_supports_direct_script_import(self):
+        spec = importlib.util.spec_from_file_location(
+            "package_rpm_direct", LINUX / "package_rpm.py"
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(callable(module.render_spec))
 
 
 def make_publish(parent: pathlib.Path, executable: bool = True) -> pathlib.Path:
@@ -940,6 +953,398 @@ class DebianCliTests(unittest.TestCase):
                     publish,
                     temporary / "output",
                 )
+
+
+EXPECTED_RPM_SPEC = """Name: object-storage-client
+Version: 1.2.3
+Release: 4%{?dist}
+Summary: Desktop client for S3-compatible object storage
+License: MIT
+URL: https://github.com/devcode-kr/object-storage-client
+Source0: payload.tar.gz
+BuildArch: x86_64
+Requires: libX11
+Requires: libICE
+Requires: libSM
+Requires: fontconfig
+Requires: ca-certificates
+
+%description
+Browse local files and remote S3-compatible object storage in a two-pane interface.
+
+%prep
+%setup -q -c -T
+%{__tar} -xzf %{SOURCE0}
+
+%build
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+cp -a .%{_prefix} %{buildroot}/
+
+%files
+%license /usr/share/doc/object-storage-client/LICENSE
+%doc /usr/share/doc/object-storage-client/README.md
+%doc /usr/share/doc/object-storage-client/PRIVACY.md
+/usr/bin/object-storage-client
+/usr/lib/object-storage-client/
+/usr/share/applications/object-storage-client.desktop
+/usr/share/icons/hicolor/256x256/apps/object-storage-client.png
+"""
+
+
+def rpm_output(output_dir: pathlib.Path) -> pathlib.Path:
+    return output_dir / "ObjectStorageClient-1.2.3-4-linux-x64.rpm"
+
+
+class RpmSpecTests(unittest.TestCase):
+    def test_render_spec_is_the_exact_complete_body(self):
+        rendered = package_rpm.render_spec(
+            NativeVersion.parse("1.2.3", 4), "payload.tar.gz"
+        )
+        self.assertEqual(EXPECTED_RPM_SPEC, rendered)
+        self.assertNotIn(".devcode", rendered)
+        self.assertIsNone(re.search(r"^%(?:pre|post|preun|postun)\b", rendered, re.MULTILINE))
+        self.assertIsNone(re.search(r"@[A-Z][A-Z0-9_]*@", rendered))
+
+    def test_render_spec_rejects_unsafe_source_names(self):
+        version = NativeVersion.parse("1.2.3", 4)
+        for source in ("../payload.tar.gz", "/payload.tar.gz", "nested/payload.tar.gz", "bad\nname"):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "source"):
+                    package_rpm.render_spec(version, source)
+
+    def test_render_spec_rejects_unknown_template_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            template = pathlib.Path(directory) / "package.spec"
+            template.write_text("Version: @VERSION@\nUnexpected: @UNKNOWN_TOKEN@\n", encoding="utf-8")
+            with (
+                mock.patch.object(package_rpm, "SPEC_TEMPLATE_PATH", template),
+                self.assertRaisesRegex(ValueError, "template token"),
+            ):
+                package_rpm.render_spec(NativeVersion.parse("1.2.3", 4), "payload.tar.gz")
+
+
+class RpmPayloadTarTests(unittest.TestCase):
+    def test_tar_is_deterministic_normalized_sorted_and_preserves_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            root = temporary / "root"
+            (root / "usr/lib/object-storage-client").mkdir(parents=True)
+            executable = root / "usr/lib/object-storage-client/app"
+            executable.write_bytes(b"app")
+            executable.chmod(0o755)
+            plain = root / "usr/lib/object-storage-client/data"
+            plain.write_bytes(b"data")
+            plain.chmod(0o644)
+            outside = temporary / "outside"
+            outside.write_bytes(b"secret")
+            try:
+                (root / "usr/lib/object-storage-client/outside-link").symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            first = temporary / "first.tar.gz"
+            second = temporary / "second.tar.gz"
+
+            package_rpm.create_payload_tar(root, first, 123456789)
+            os.utime(executable, (1_700_000_000, 1_700_000_000))
+            package_rpm.create_payload_tar(root, second, 123456789)
+
+            self.assertEqual(hashlib.sha256(first.read_bytes()).digest(), hashlib.sha256(second.read_bytes()).digest())
+            with tarfile.open(first, "r:gz") as archive:
+                members = archive.getmembers()
+                self.assertEqual(sorted(member.name for member in members), [member.name for member in members])
+                self.assertTrue(all(not member.name.startswith(("/", "../")) for member in members))
+                for member in members:
+                    self.assertEqual(0, member.uid)
+                    self.assertEqual(0, member.gid)
+                    self.assertEqual("", member.uname)
+                    self.assertEqual("", member.gname)
+                    self.assertEqual(123456789, member.mtime)
+                by_name = {member.name: member for member in members}
+                self.assertEqual(0o755, by_name["usr/lib/object-storage-client/app"].mode)
+                self.assertEqual(0o644, by_name["usr/lib/object-storage-client/data"].mode)
+                link = by_name["usr/lib/object-storage-client/outside-link"]
+                self.assertTrue(link.issym())
+                self.assertEqual(str(outside), link.linkname)
+                self.assertNotIn(b"secret", first.read_bytes())
+
+
+class RpmBuildTests(unittest.TestCase):
+    def _fixture(self, temporary: pathlib.Path):
+        repo = make_fake_repo(temporary)
+        publish_parent = temporary / "payload"
+        publish_parent.mkdir()
+        publish = make_publish(publish_parent)
+        return repo, publish, temporary / "output"
+
+    @staticmethod
+    def _write_fake_rpm(command, **kwargs):
+        topdir = pathlib.Path(command[command.index("--define") + 1].split(" ", 1)[1])
+        rpm_dir = topdir / "RPMS/x86_64"
+        rpm_dir.mkdir(parents=True, exist_ok=True)
+        (rpm_dir / "object-storage-client.rpm").write_bytes(b"fake rpm")
+        return subprocess.CompletedProcess(command, 0)
+
+    def test_missing_rpmbuild_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output = self._fixture(temporary)
+            with mock.patch.object(package_rpm.shutil, "which", return_value=None):
+                with self.assertRaisesRegex(FileNotFoundError, "rpmbuild"):
+                    package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output)
+
+    def test_fake_build_uses_isolated_topdir_and_publishes_expected_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output_dir = self._fixture(temporary)
+            epoch = 123456789
+            with (
+                mock.patch.object(package_rpm.shutil, "which", return_value="/usr/bin/rpmbuild"),
+                mock.patch.object(package_rpm.os, "environ", {"SOURCE_DATE_EPOCH": str(epoch)}),
+                mock.patch.object(package_rpm.subprocess, "run", side_effect=self._write_fake_rpm) as run,
+                mock.patch.object(package_rpm.os, "replace", wraps=os.replace) as replace,
+            ):
+                output = package_rpm.build_rpm(
+                    repo, NativeVersion.parse("1.2.3", 4), publish, output_dir
+                )
+
+            topdir = repo / "obj/linux-packages/rpm"
+            self.assertEqual(rpm_output(output_dir), output)
+            self.assertEqual(b"fake rpm", output.read_bytes())
+            self.assertEqual(
+                [
+                    "/usr/bin/rpmbuild", "-bb", "--define", f"_topdir {topdir}",
+                    str(topdir / "SPECS/object-storage-client.spec"),
+                ],
+                run.call_args.args[0],
+            )
+            self.assertTrue(run.call_args.kwargs["check"])
+            self.assertNotIn("shell", run.call_args.kwargs)
+            self.assertEqual(str(epoch), run.call_args.kwargs["env"]["SOURCE_DATE_EPOCH"])
+            for name in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+                self.assertTrue((topdir / name).is_dir())
+            self.assertTrue((topdir / "SOURCES/payload.tar.gz").is_file())
+            self.assertEqual(
+                epoch * 1_000_000_000,
+                (topdir / "SOURCES/payload.tar.gz").stat().st_mtime_ns,
+            )
+            self.assertEqual(EXPECTED_RPM_SPEC, (topdir / "SPECS/object-storage-client.spec").read_text())
+            self.assertEqual(0o644, stat.S_IMODE((topdir / "SPECS/object-storage-client.spec").stat().st_mode))
+            self.assertEqual(epoch * 1_000_000_000, (topdir / "SPECS/object-storage-client.spec").stat().st_mtime_ns)
+            replace.assert_called_once()
+            self.assertEqual(output, pathlib.Path(replace.call_args.args[1]))
+
+    def test_build_rejects_zero_multiple_and_symlink_rpm_outputs(self):
+        def callback(kind):
+            def create(command, **kwargs):
+                topdir = pathlib.Path(command[-1]).parents[1]
+                rpm_dir = topdir / "RPMS/x86_64"
+                rpm_dir.mkdir(parents=True, exist_ok=True)
+                if kind == "multiple":
+                    (rpm_dir / "one.rpm").write_bytes(b"one")
+                    (rpm_dir / "two.rpm").write_bytes(b"two")
+                elif kind == "symlink":
+                    target = topdir / "outside.rpm"
+                    target.write_bytes(b"outside")
+                    (rpm_dir / "one.rpm").symlink_to(target)
+                return subprocess.CompletedProcess(command, 0)
+            return create
+
+        for kind in ("zero", "multiple", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                temporary = pathlib.Path(directory)
+                repo, publish, output = self._fixture(temporary)
+                with (
+                    mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                    mock.patch.object(package_rpm.subprocess, "run", side_effect=callback(kind)),
+                    self.assertRaisesRegex(FileNotFoundError, "exactly one.*x86_64 RPM"),
+                ):
+                    package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output)
+
+    def test_failed_build_preserves_old_output_and_cleans_temporary_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output_dir = self._fixture(temporary)
+            output_dir.mkdir()
+            final = rpm_output(output_dir)
+            final.write_bytes(b"old rpm")
+
+            def fail(command, **kwargs):
+                raise subprocess.CalledProcessError(1, command)
+
+            with (
+                mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                mock.patch.object(package_rpm.subprocess, "run", side_effect=fail),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output_dir)
+            self.assertEqual(b"old rpm", final.read_bytes())
+            self.assertEqual([final], list(output_dir.iterdir()))
+
+    def test_failed_final_copy_preserves_old_output_and_cleans_partial_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output_dir = self._fixture(temporary)
+            output_dir.mkdir()
+            final = rpm_output(output_dir)
+            final.write_bytes(b"old rpm")
+
+            def fail_copy(source, destination, **kwargs):
+                pathlib.Path(destination).write_bytes(b"partial rpm")
+                raise OSError("copy failed")
+
+            with (
+                mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                mock.patch.object(package_rpm.subprocess, "run", side_effect=self._write_fake_rpm),
+                mock.patch.object(package_rpm.shutil, "copyfile", side_effect=fail_copy),
+                self.assertRaisesRegex(OSError, "copy failed"),
+            ):
+                package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output_dir)
+            self.assertEqual(b"old rpm", final.read_bytes())
+            self.assertEqual([final], list(output_dir.iterdir()))
+
+    def test_success_atomically_replaces_stale_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output_dir = self._fixture(temporary)
+            output_dir.mkdir()
+            final = rpm_output(output_dir)
+            final.write_bytes(b"old rpm")
+
+            def build(command, **kwargs):
+                self.assertEqual(b"old rpm", final.read_bytes())
+                return self._write_fake_rpm(command, **kwargs)
+
+            with (
+                mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                mock.patch.object(package_rpm.subprocess, "run", side_effect=build),
+                mock.patch.object(package_rpm.os, "replace", wraps=os.replace) as replace,
+            ):
+                package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output_dir)
+            self.assertEqual(b"fake rpm", final.read_bytes())
+            replace.assert_called_once()
+
+    def test_rejects_output_publish_topdir_overlaps_before_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, normal_output = self._fixture(temporary)
+            topdir = repo / "obj/linux-packages/rpm"
+            cases = (topdir / "output", topdir.parent, publish / "output", publish.parent)
+            for output in cases:
+                with (
+                    self.subTest(output=output),
+                    mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                    mock.patch.object(package_rpm, "stage_payload") as stage,
+                    mock.patch.object(package_rpm.subprocess, "run") as run,
+                    self.assertRaisesRegex(ValueError, "overlap"),
+                ):
+                    package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output)
+                stage.assert_not_called()
+                run.assert_not_called()
+
+    def test_rejects_symlinked_topdir_parent_without_deleting_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output = self._fixture(temporary)
+            unrelated = temporary / "unrelated"
+            staging = unrelated / "linux-packages/rpm/staging-root"
+            staging.mkdir(parents=True)
+            sentinel = staging / "sentinel"
+            sentinel.write_bytes(b"keep")
+            try:
+                (repo / "obj").symlink_to(unrelated, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            with (
+                mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                mock.patch.object(package_rpm.subprocess, "run") as run,
+                self.assertRaisesRegex(ValueError, str(repo / "obj")),
+            ):
+                package_rpm.build_rpm(repo, NativeVersion.parse("1.2.3", 4), publish, output)
+            self.assertEqual(b"keep", sentinel.read_bytes())
+            run.assert_not_called()
+
+    def test_rejects_final_symlink_resolving_into_protected_trees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo, publish, output_dir = self._fixture(temporary)
+            output_dir.mkdir()
+            topdir = repo / "obj/linux-packages/rpm"
+            topdir.mkdir(parents=True)
+            final = rpm_output(output_dir)
+            for target in (topdir / "keep.rpm", publish / "keep.rpm"):
+                with self.subTest(target=target):
+                    target.write_bytes(b"keep")
+                    try:
+                        final.symlink_to(target)
+                    except OSError as error:
+                        self.skipTest(f"symlinks unavailable: {error}")
+                    with (
+                        mock.patch.object(package_rpm.shutil, "which", return_value="rpmbuild"),
+                        mock.patch.object(package_rpm, "stage_payload") as stage,
+                        mock.patch.object(package_rpm.subprocess, "run") as run,
+                        self.assertRaisesRegex(ValueError, "overlap"),
+                    ):
+                        package_rpm.build_rpm(
+                            repo, NativeVersion.parse("1.2.3", 4), publish, output_dir
+                        )
+                    self.assertTrue(final.is_symlink())
+                    self.assertEqual(b"keep", target.read_bytes())
+                    stage.assert_not_called()
+                    run.assert_not_called()
+                    final.unlink()
+
+
+class RpmCliTests(unittest.TestCase):
+    def run_cli(self, *arguments: str, env=None):
+        return subprocess.run(
+            [sys.executable, str(LINUX / "package_rpm.py"), *arguments],
+            cwd=ROOT, text=True, capture_output=True, check=False, env=env,
+        )
+
+    def test_cli_requires_all_arguments(self):
+        result = self.run_cli()
+        self.assertNotEqual(0, result.returncode)
+        for option in ("--version", "--release", "--publish-dir", "--output-dir"):
+            self.assertIn(option, result.stderr)
+
+    def test_serialized_direct_cli_builds_with_fake_rpmbuild_from_repo_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            publish = make_publish(temporary)
+            output_dir = temporary / "output"
+            fake_bin = temporary / "bin"
+            fake_bin.mkdir()
+            fake = fake_bin / "rpmbuild"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "top = Path(sys.argv[sys.argv.index('--define') + 1].split(' ', 1)[1])\n"
+                "out = top / 'RPMS/x86_64/fake.rpm'\n"
+                "out.parent.mkdir(parents=True, exist_ok=True)\n"
+                "out.write_bytes(b'cli fake rpm')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            rpm_work = ROOT / "obj/linux-packages/rpm"
+            try:
+                result = self.run_cli(
+                    "--version", "1.2.3", "--release", "4",
+                    "--publish-dir", str(publish), "--output-dir", str(output_dir), env=env,
+                )
+                output = rpm_output(output_dir)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(f"{output}\n", result.stdout)
+                self.assertEqual(b"cli fake rpm", output.read_bytes())
+            finally:
+                if rpm_work.exists():
+                    import shutil
+                    shutil.rmtree(rpm_work)
 
 
 if __name__ == "__main__":
