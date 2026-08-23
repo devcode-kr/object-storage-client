@@ -9,11 +9,14 @@ import sys
 from typing import Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from package_contract import DEB_ARCH, DEB_DEPENDENCIES, PACKAGE_NAME, NativeVersion
-from stage_payload import paths_overlap, resolved_path, stage_payload
+if __package__:
+    from .package_contract import DEB_ARCH, DEB_DEPENDENCIES, PACKAGE_NAME, NativeVersion
+    from .stage_payload import paths_overlap, resolved_path, stage_payload
+else:
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from package_contract import DEB_ARCH, DEB_DEPENDENCIES, PACKAGE_NAME, NativeVersion
+    from stage_payload import paths_overlap, resolved_path, stage_payload
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
 MAINTAINER = "Devcode <129266150+devcode-kr@users.noreply.github.com>"

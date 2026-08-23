@@ -12,12 +12,9 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 LINUX = ROOT / "build" / "linux"
-if str(LINUX) not in sys.path:
-    sys.path.insert(0, str(LINUX))
 
-import package_deb
-import stage_payload
-from package_contract import NativeVersion
+from build.linux import package_deb, stage_payload
+from build.linux.package_contract import NativeVersion
 
 
 EXPECTED_CONTROL = """Package: object-storage-client
@@ -32,6 +29,26 @@ Homepage: https://github.com/devcode-kr/object-storage-client
 Description: Desktop client for S3-compatible object storage
  Browse local files and remote S3-compatible object storage in a two-pane interface.
 """
+
+
+class PackageImportTests(unittest.TestCase):
+    def test_package_qualified_imports_work_from_repo_root(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from build.linux.stage_payload import stage_payload; "
+                    "from build.linux.package_deb import render_control; "
+                    "from build.linux.package_contract import NativeVersion"
+                ),
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
 
 
 def make_publish(parent: pathlib.Path, executable: bool = True) -> pathlib.Path:

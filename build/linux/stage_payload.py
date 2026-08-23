@@ -4,7 +4,10 @@ from pathlib import Path, PurePosixPath
 import shutil
 import stat
 
-from package_contract import APP_DIR, DESKTOP_PATH, DOC_DIR, ICON_PATH, LAUNCHER_PATH
+if __package__:
+    from .package_contract import APP_DIR, DESKTOP_PATH, DOC_DIR, ICON_PATH, LAUNCHER_PATH
+else:
+    from package_contract import APP_DIR, DESKTOP_PATH, DOC_DIR, ICON_PATH, LAUNCHER_PATH
 
 APPHOST_NAME = "ObjectStorageClient.App"
 _APPROVED_DESTINATIONS = frozenset(
