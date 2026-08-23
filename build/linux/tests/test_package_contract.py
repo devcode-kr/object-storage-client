@@ -94,7 +94,7 @@ class PackageContractTests(unittest.TestCase):
             "#!/bin/sh\nexec /usr/lib/object-storage-client/ObjectStorageClient.App \"$@\"\n",
             launcher,
         )
-        self.assertTrue(launcher_path.stat().st_mode & stat.S_IXUSR)
+        self.assertEqual(0o755, stat.S_IMODE(launcher_path.stat().st_mode))
 
     def test_desktop_entry_uses_installed_command_and_icon(self):
         desktop = (LINUX / "object-storage-client.desktop").read_text(encoding="utf-8")
@@ -131,16 +131,16 @@ class PackageContractTests(unittest.TestCase):
         linux_entries = {
             entry
             for entry in entries
-            if entry.startswith(("artifacts/linux-", "obj/linux-"))
+            if entry.startswith(("artifacts/linux-", "obj/linux-", "obj/gnupg-"))
         }
-        self.assertEqual(expected - {"obj/gnupg-test/"}, linux_entries)
+        self.assertEqual(expected, linux_entries)
 
     def test_packaging_sources_never_reference_user_state(self):
         forbidden = ".devcode" + "/object-storage-client"
         for path in LINUX.rglob("*"):
             if (
                 path.is_file()
-                and path.name != "package_contract.py"
+                and path != LINUX / "package_contract.py"
                 and "__pycache__" not in path.parts
                 and path.suffix != ".pyc"
             ):
