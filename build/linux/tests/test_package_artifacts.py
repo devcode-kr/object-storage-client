@@ -1328,6 +1328,224 @@ class RpmBuildTests(unittest.TestCase):
                     final.unlink()
 
 
+class SmokePackageScriptTests(unittest.TestCase):
+    SCRIPT = LINUX / "smoke-package.sh"
+
+    def read_script(self) -> str:
+        return self.SCRIPT.read_text(encoding="utf-8")
+
+    def test_smoke_script_is_executable_posix_shell_with_required_functions(self):
+        script = self.read_script()
+        self.assertEqual(0o755, stat.S_IMODE(self.SCRIPT.stat().st_mode))
+        self.assertTrue(script.startswith("#!/bin/sh\nset -eu\n"))
+        self.assertIn("umask 022", script)
+        for function in (
+            "install_dependencies",
+            "install_local_package",
+            "validate_installed_files",
+            "launch_under_xvfb",
+            "preserve_user_fixture_on_remove",
+            "install_from_repository",
+            "cleanup",
+        ):
+            self.assertIn(f"{function}()", script)
+
+    def test_smoke_script_has_dependency_file_launch_and_removal_contracts(self):
+        script = self.read_script()
+        for marker in (
+            "apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y",
+            "libx11-6 libice6 libsm6 libfontconfig1 ca-certificates",
+            "xvfb desktop-file-utils curl gnupg procps x11-utils",
+            "dnf -y install",
+            "libX11 libICE libSM fontconfig ca-certificates",
+            "xorg-x11-server-Xvfb xorg-x11-utils desktop-file-utils curl gnupg2 procps-ng",
+            'apt-get install -y "$PACKAGE"',
+            'dnf -y install "$PACKAGE"',
+            "FIXTURE=/root/.devcode/$PROGRAM/preserve-me",
+            "/usr/bin/object-storage-client",
+            "/usr/lib/object-storage-client",
+            "/usr/share/applications/object-storage-client.desktop",
+            "/usr/share/icons/hicolor/256x256/apps/object-storage-client.png",
+            "/usr/share/doc/object-storage-client/README.md",
+            "/usr/share/doc/object-storage-client/PRIVACY.md",
+            "/usr/share/doc/object-storage-client/LICENSE",
+            "desktop-file-validate",
+            "Xvfb :99",
+            "xdpyinfo -display :99",
+            "SMOKE_SECONDS=15",
+            "apt-get remove -y object-storage-client",
+            "dnf -y remove object-storage-client",
+        ):
+            self.assertIn(marker, script)
+
+    def test_smoke_script_has_signed_http_repository_contracts(self):
+        script = self.read_script()
+        for marker in (
+            'REPOSITORY_URL=${REPOSITORY_URL:-http://repository:8000}',
+            "repository-key.asc",
+            "gpg --batch --show-keys --with-colons",
+            "/etc/apt/keyrings/object-storage-client.gpg",
+            "signed-by=/etc/apt/keyrings/object-storage-client.gpg",
+            "deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] %s stable main",
+            '"$REPOSITORY_URL/apt"',
+            "apt-get install -y object-storage-client",
+            "/etc/pki/rpm-gpg/object-storage-client.asc",
+            "baseurl=%s",
+            '"$REPOSITORY_URL/rpm/stable/x86_64"',
+            "enabled=1",
+            "gpgcheck=1",
+            "repo_gpgcheck=1",
+            "gpgkey=file:///etc/pki/rpm-gpg/object-storage-client.asc",
+            "dnf -y clean metadata",
+            "dnf -y makecache",
+            "dnf -y install object-storage-client",
+            "dpkg-query -W",
+            "rpm -q --qf",
+        ):
+            self.assertIn(marker, script)
+
+    def test_smoke_script_avoids_security_and_state_bypasses(self):
+        script = self.read_script()
+        lowered = script.lower()
+        for forbidden in (
+            "--nogpgcheck",
+            "trusted=yes",
+            "setenforce 0",
+            "apt-key",
+            "curl |",
+            "curl|",
+            "printenv",
+            "env |",
+            "env >",
+            "rm -rf /root/.devcode",
+            "rm -rf \"/root/.devcode",
+            "/packages/*.deb",
+            "/packages/*.rpm",
+            "file://$repository",
+            "file://${repository",
+        ):
+            self.assertNotIn(forbidden, lowered)
+
+    def test_smoke_script_has_valid_shell_syntax(self):
+        result = subprocess.run(
+            ["sh", "-n", str(self.SCRIPT)], text=True, capture_output=True, check=False
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_shellcheck_passes_when_available(self):
+        shellcheck = __import__("shutil").which("shellcheck")
+        if shellcheck is None:
+            self.skipTest("shellcheck is unavailable")
+        result = subprocess.run(
+            [shellcheck, str(self.SCRIPT)], text=True, capture_output=True, check=False
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def run_early_failure(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        repository_url: str = "http://repository:8000",
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            fake_bin = temporary / "bin"
+            fake_bin.mkdir()
+            command_log = temporary / "package-manager.log"
+            for name in ("apt-get", "dnf"):
+                command = fake_bin / name
+                command.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$COMMAND_LOG\"\n",
+                    encoding="utf-8",
+                )
+                command.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "COMMAND_LOG": str(command_log),
+                    "REPOSITORY_URL": repository_url,
+                }
+            )
+            result = subprocess.run(
+                ["/bin/sh", str(self.SCRIPT), *arguments],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertFalse(command_log.exists(), command_log.read_text() if command_log.exists() else "")
+            return result
+
+    def make_inputs(self, temporary: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+        package = temporary / "package.deb"
+        package.write_bytes(b"package")
+        repository = temporary / "repository"
+        repository.mkdir()
+        (repository / "repository-key.asc").write_bytes(b"public key")
+        return package, repository
+
+    def test_invalid_argument_count_and_kind_fail_before_package_managers(self):
+        for arguments in ((), ("deb",), ("deb", "one", "two", "three"), ("zip", "x", "y")):
+            with self.subTest(arguments=arguments):
+                result = self.run_early_failure(arguments)
+                self.assertNotEqual(0, result.returncode)
+
+    def test_invalid_url_fails_before_package_managers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package, repository = self.make_inputs(pathlib.Path(directory))
+            arguments = ("deb", str(package), str(repository))
+            for url in (
+                "file:///repository",
+                "ftp://repository",
+                "http://repo host",
+                "http://repository;id",
+                "http://repository$(id)",
+                "http://repository`id`",
+                "http://repository\nnext",
+            ):
+                with self.subTest(url=url):
+                    result = self.run_early_failure(arguments, repository_url=url)
+                    self.assertNotEqual(0, result.returncode)
+
+    def test_nonregular_or_symlink_inputs_fail_before_package_managers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            package, repository = self.make_inputs(temporary)
+            package_link = temporary / "package-link.deb"
+            repository_link = temporary / "repository-link"
+            key_target = repository / "repository-key.asc"
+            key_link_repository = temporary / "key-link-repository"
+            key_link_repository.mkdir()
+            try:
+                package_link.symlink_to(package)
+                repository_link.symlink_to(repository, target_is_directory=True)
+                (key_link_repository / "repository-key.asc").symlink_to(key_target)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            cases = (
+                ("deb", str(temporary / "missing.deb"), str(repository)),
+                ("deb", str(package_link), str(repository)),
+                ("deb", str(package), str(repository_link)),
+                ("deb", str(package), str(key_link_repository)),
+            )
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.run_early_failure(arguments)
+                    self.assertNotEqual(0, result.returncode)
+
+    def test_nonroot_fails_before_package_managers(self):
+        if os.geteuid() == 0:
+            self.skipTest("non-root execution is not available")
+        with tempfile.TemporaryDirectory() as directory:
+            package, repository = self.make_inputs(pathlib.Path(directory))
+            result = self.run_early_failure(("deb", str(package), str(repository)))
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("root", result.stderr.lower())
+
+
 class RpmCliTests(unittest.TestCase):
     def run_cli(self, *arguments: str, env=None, repo_root=ROOT):
         return subprocess.run(
