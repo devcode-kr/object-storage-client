@@ -986,6 +986,7 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
     backup = pathlib.Path(tempfile.mkdtemp(prefix=".repodata.rollback-", dir=parent))
     backup.rmdir()
     had_existing = False
+    preserve_backup = False
     try:
         staged.rmdir()
         shutil.copytree(source, staged, symlinks=False)
@@ -1003,18 +1004,39 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
             os.replace(staged, destination)
             _fsync_directories([parent])
         except BaseException as publication_error:
-            if destination.exists():
-                shutil.rmtree(destination)
+            try:
+                destination_metadata = destination.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                try:
+                    if stat.S_ISDIR(destination_metadata.st_mode) and not stat.S_ISLNK(destination_metadata.st_mode):
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+                except OSError as cleanup_error:
+                    publication_error.add_note(
+                        f"Could not remove failed repodata destination {destination}: {cleanup_error}"
+                    )
             if had_existing:
-                os.replace(backup, destination)
+                try:
+                    os.replace(backup, destination)
+                except BaseException as restore_error:
+                    preserve_backup = True
+                    rollback_error = RuntimeError(
+                        "repodata publication failed and rollback is incomplete; "
+                        f"preserved rollback backup for recovery at {backup}"
+                    )
+                    rollback_error.add_note(f"Original publication error: {publication_error!r}")
+                    raise rollback_error from restore_error
             _fsync_directories([parent])
-            raise publication_error
+            raise
         if had_existing:
             shutil.rmtree(backup)
     finally:
         if staged.exists():
             shutil.rmtree(staged)
-        if backup.exists():
+        if backup.exists() and not preserve_backup:
             shutil.rmtree(backup)
 
 

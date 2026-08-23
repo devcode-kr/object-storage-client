@@ -7,6 +7,7 @@ import hashlib
 import html
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from build.linux.repository import (
     normalize_fingerprint,
     rpm_paths,
     verify_public_key_fingerprint,
+    _publish_repodata,
     _validate_packages,
     _validsig_primary_fingerprints,
 )
@@ -187,22 +189,52 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
     rpmsign = root / "rpmsign"
     rpmsign.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib, sys\n"
+        "import os, pathlib, re, shlex, subprocess, sys\n"
+        f"fingerprint = {fingerprint!r}\n"
+        "args = sys.argv[1:]\n"
+        "if len(args) != 8 or args[0] != '--define' or args[2] != '--define' or args[4] != '--define' or args[6] != '--addsign': sys.exit(30)\n"
+        "if args[1] != '_gpg_name ' + fingerprint: sys.exit(30)\n"
+        "home = os.environ.get('GNUPGHOME', '')\n"
+        "if args[3] != '_gpg_path ' + home or not home: sys.exit(30)\n"
+        "home_path = pathlib.Path(home)\n"
+        "if home_path.is_symlink() or not home_path.is_dir(): sys.exit(30)\n"
+        "prefix = '__gpg_sign_cmd '\n"
+        "if not args[5].startswith(prefix): sys.exit(30)\n"
+        "try: macro = shlex.split(args[5][len(prefix):])\n"
+        "except ValueError: sys.exit(30)\n"
+        "if len(macro) != 16: sys.exit(30)\n"
+        "if macro[:7] != ['%{__gpg}', '--batch', '--no-tty', '--no-armor', '--pinentry-mode', 'loopback', '--passphrase-file']: sys.exit(30)\n"
+        "passphrase = pathlib.Path(macro[7])\n"
+        "if passphrase.is_symlink() or not passphrase.is_file(): sys.exit(30)\n"
+        "if macro[8:10] != ['--local-user', fingerprint]: sys.exit(30)\n"
+        "if macro[10] != '--faked-system-time' or re.fullmatch(r'[0-9]+!', macro[11]) is None: sys.exit(30)\n"
+        "listing = subprocess.run(['gpg', '--batch', '--no-tty', '--homedir', home, '--with-colons', '--list-secret-keys'], capture_output=True, text=True)\n"
+        "if listing.returncode != 0: sys.exit(30)\n"
+        "signing_times = [int(fields[5]) for line in listing.stdout.splitlines() if len(fields := line.split(':')) > 11 and fields[0] in ('sec', 'ssb') and 's' in fields[11].lower()]\n"
+        "if not signing_times or macro[11] != str(min(signing_times)) + '!': sys.exit(30)\n"
+        "if macro[12:] != ['--detach-sign', '--output', '%{__signature_filename}', '%{__plaintext_filename}']: sys.exit(30)\n"
+        "path = pathlib.Path(args[7])\n"
+        "if path.is_symlink() or not path.is_file(): sys.exit(30)\n"
         "if os.environ.get('OSC_RPM_SIGN_FAIL'): sys.exit(31)\n"
-        "path = pathlib.Path(sys.argv[-1])\n"
         "data = path.read_bytes()\n"
         "if not data.endswith(b'\\nFAKE-RPM-SIGNATURE\\n'):\n"
         "    path.write_bytes(data + b'\\nFAKE-RPM-SIGNATURE\\n')\n"
         "log = os.environ.get('OSC_RPM_TOOL_LOG')\n"
-        "if log: pathlib.Path(log).write_text('rpmsign\\0' + '\\0'.join(sys.argv[1:]) + '\\n' + os.getcwd() + '\\n' + os.environ.get('GNUPGHOME', ''), encoding='utf-8')\n",
+        "if log: pathlib.Path(log).write_text('rpmsign\\0' + '\\0'.join(args) + '\\n' + os.getcwd() + '\\n' + home, encoding='utf-8')\n",
         encoding="utf-8",
     )
     createrepo = root / "createrepo_c"
     createrepo.write_text(
         "#!/usr/bin/env python3\n"
         "import gzip, hashlib, os, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "if len(args) != 2 or args[0] != '--update': sys.exit(30)\n"
+        "base = pathlib.Path(args[1])\n"
+        "if base.is_symlink() or not base.is_dir(): sys.exit(30)\n"
         "if os.environ.get('OSC_RPM_METADATA_FAIL'): sys.exit(32)\n"
-        "base = pathlib.Path(sys.argv[-1]); repodata = base / 'repodata'; repodata.mkdir()\n"
+        "repodata = base / 'repodata'\n"
+        "if repodata.exists(): sys.exit(30)\n"
+        "repodata.mkdir()\n"
         "files = {}\n"
         "for kind in ('primary', 'filelists', 'other'):\n"
         "    name = kind + '.xml.gz'; data = gzip.compress(('<' + kind + '/>').encode(), mtime=0); (repodata / name).write_bytes(data); files[kind] = name\n"
@@ -214,16 +246,34 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
     rpm = root / "rpm"
     rpm.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib, sys\n"
+        "import os, pathlib, subprocess, sys, tempfile\n"
         f"fingerprint = {fingerprint!r}\n"
-        "args = sys.argv[1:]; db = pathlib.Path(args[args.index('--dbpath') + 1]); db.mkdir(parents=True, exist_ok=True)\n"
-        "if '--import' in args: (db / 'imported').write_text(fingerprint); sys.exit(0)\n"
+        "args = sys.argv[1:]\n"
+        "if len(args) != 4 or args[0] != '--dbpath' or args[2] not in ('--import', '--checksig'): sys.exit(30)\n"
+        "db = pathlib.Path(args[1]); target = pathlib.Path(args[3])\n"
+        "if db.is_symlink() or (db.exists() and not db.is_dir()): sys.exit(30)\n"
+        "if target.is_symlink() or not target.is_file(): sys.exit(30)\n"
+        "if args[2] == '--import':\n"
+        "    with tempfile.TemporaryDirectory(prefix='fake-rpm-gpg-') as temporary:\n"
+        "        home = pathlib.Path(temporary); home.chmod(0o700)\n"
+        "        result = subprocess.run(['gpg', '--batch', '--no-tty', '--homedir', str(home), '--with-colons', '--import-options', 'show-only', '--dry-run', '--import', str(target)], capture_output=True, text=True)\n"
+        "    if result.returncode != 0: sys.exit(36)\n"
+        "    primary = []; waiting = False\n"
+        "    for line in result.stdout.splitlines():\n"
+        "        fields = line.split(':'); record = fields[0]\n"
+        "        if record == 'pub': waiting = True\n"
+        "        elif record == 'fpr' and waiting:\n"
+        "            if len(fields) <= 9: sys.exit(36)\n"
+        "            primary.append(fields[9]); waiting = False\n"
+        "    if primary != [fingerprint]: sys.exit(36)\n"
+        "    db.mkdir(parents=True, exist_ok=True)\n"
+        "    (db / 'imported').write_text(fingerprint, encoding='ascii')\n"
+        "    sys.exit(0)\n"
         "if os.environ.get('OSC_RPM_VERIFY_FAIL'): sys.exit(33)\n"
-        "packages = [pathlib.Path(value) for value in args if value.endswith('.rpm')]\n"
-        "if not packages or not (db / 'imported').exists(): sys.exit(34)\n"
-        "for package in packages:\n"
-        "    if not package.read_bytes().endswith(b'\\nFAKE-RPM-SIGNATURE\\n'): sys.exit(35)\n"
-        "    print(f'{package}: digests signatures OK key ID {fingerprint[-16:]}')\n",
+        "marker = db / 'imported'\n"
+        "if not marker.is_file() or marker.is_symlink() or marker.read_text(encoding='ascii') != fingerprint: sys.exit(34)\n"
+        "if not target.read_bytes().endswith(b'\\nFAKE-RPM-SIGNATURE\\n'): sys.exit(35)\n"
+        "print(f'{target}: digests signatures OK key ID {fingerprint[-16:]}')\n",
         encoding="utf-8",
     )
     for tool in (rpmsign, createrepo, rpm):
@@ -406,6 +456,180 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn("--local-user " + self.throwaway_fingerprint, tool_log)
             self.assertIn("--passphrase-file", tool_log)
             self.assertNotIn(self.passphrase_file.read_text().strip(), tool_log)
+            self.assertEqual([], list(paths.repodata.parent.glob(".repodata.rollback-*")))
+
+    def test_fake_rpm_tools_reject_malformed_contracts_without_mutation_or_trust(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            createrepo, rpmsign, rpm = _fake_rpm_tools(
+                root / "tools", self.throwaway_fingerprint
+            )
+            package = root / "package.rpm"
+            original = b"unsigned package bytes\n"
+            package.write_bytes(original)
+            home = root / "signing-home"
+            home.mkdir(mode=0o700)
+            passphrase = root / "passphrase"
+            passphrase.write_text("secret\n", encoding="utf-8")
+            macro = (
+                f"%{{__gpg}} --batch --no-tty --no-armor --pinentry-mode loopback "
+                f"--passphrase-file {passphrase} --local-user {self.throwaway_fingerprint} "
+                "--faked-system-time 1234567890! --detach-sign "
+                "--output %{__signature_filename} %{__plaintext_filename}"
+            )
+            valid_sign_arguments = [
+                "--define", f"_gpg_name {self.throwaway_fingerprint}",
+                "--define", f"_gpg_path {home}",
+                "--define", f"__gpg_sign_cmd {macro}",
+                "--addsign", os.fspath(package),
+            ]
+            malformed_sign_arguments = (
+                valid_sign_arguments[:-2],
+                [*valid_sign_arguments[:-1], "--extra", valid_sign_arguments[-1]],
+                [*valid_sign_arguments[:1], "_gpg_name NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[2:]],
+                [*valid_sign_arguments[:3], "_gpg_path /wrong/home", *valid_sign_arguments[4:]],
+                [*valid_sign_arguments[:5], "__gpg_sign_cmd %{__gpg} --detach-sign", *valid_sign_arguments[6:]],
+            )
+            for index, arguments in enumerate(malformed_sign_arguments):
+                with self.subTest(tool="rpmsign", case=index):
+                    result = subprocess.run(
+                        [rpmsign, *arguments],
+                        check=False,
+                        env={**os.environ, "GNUPGHOME": os.fspath(home)},
+                    )
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual(original, package.read_bytes())
+
+            package_directory = root / "packages"
+            package_directory.mkdir()
+            (package_directory / "sample.rpm").write_bytes(b"sample\n")
+            for index, arguments in enumerate(
+                ([package_directory], ["--update", package_directory, "--extra"])
+            ):
+                with self.subTest(tool="createrepo_c", case=index):
+                    malformed_metadata = subprocess.run(
+                        [createrepo, *arguments], check=False
+                    )
+                    self.assertNotEqual(0, malformed_metadata.returncode)
+                    self.assertFalse((package_directory / "repodata").exists())
+
+            database = root / "rpmdb"
+            arbitrary_key = root / "arbitrary-key.asc"
+            arbitrary_key.write_bytes(b"not a public GPG export\n")
+            malformed_import = subprocess.run(
+                [rpm, "--dbpath", database, "--import", arbitrary_key], check=False
+            )
+            self.assertNotEqual(0, malformed_import.returncode)
+            self.assertFalse((database / "imported").exists())
+
+            signed = root / "signed.rpm"
+            signed_bytes = original + b"\nFAKE-RPM-SIGNATURE\n"
+            signed.write_bytes(signed_bytes)
+            untrusted_check = subprocess.run(
+                [rpm, "--dbpath", database, "--checksig", signed],
+                check=False,
+            )
+            self.assertNotEqual(0, untrusted_check.returncode)
+            self.assertEqual(signed_bytes, signed.read_bytes())
+
+            valid_import = subprocess.run(
+                [rpm, "--dbpath", database, "--import", self.public_key], check=False
+            )
+            self.assertEqual(0, valid_import.returncode)
+            malformed_check = subprocess.run(
+                [rpm, "--dbpath", database, "--checksig", signed, "--extra"],
+                check=False,
+            )
+            self.assertNotEqual(0, malformed_check.returncode)
+            unsigned_check = subprocess.run(
+                [rpm, "--dbpath", database, "--checksig", package], check=False
+            )
+            self.assertNotEqual(0, unsigned_check.returncode)
+            valid_check = subprocess.run(
+                [rpm, "--dbpath", database, "--checksig", signed],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, valid_check.returncode)
+            self.assertIn(self.throwaway_fingerprint[-16:], valid_check.stdout)
+            self.assertEqual(signed_bytes, signed.read_bytes())
+
+    def test_publish_repodata_preserves_backup_when_publication_and_restore_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source"
+            destination = root / "repodata"
+            (source / "nested").mkdir(parents=True)
+            (destination / "nested").mkdir(parents=True)
+            (source / "new.xml").write_bytes(b"new metadata\n")
+            old_file = destination / "nested/old.xml"
+            old_file.write_bytes(b"original metadata\n")
+            destination.chmod(0o751)
+            (destination / "nested").chmod(0o750)
+            old_file.chmod(0o640)
+            original_modes = {
+                ".": stat.S_IMODE(destination.stat().st_mode),
+                "nested": stat.S_IMODE((destination / "nested").stat().st_mode),
+                "nested/old.xml": stat.S_IMODE(old_file.stat().st_mode),
+            }
+            real_replace = os.replace
+            publication_failed = False
+            restore_failed = False
+
+            def fail_publication_and_restore(source_path, destination_path):
+                nonlocal publication_failed, restore_failed
+                source_candidate = pathlib.Path(source_path)
+                destination_candidate = pathlib.Path(destination_path)
+                if (
+                    destination_candidate == destination
+                    and source_candidate.name.startswith(".repodata.publish-")
+                ):
+                    publication_failed = True
+                    raise OSError("simulated staged publication failure")
+                if (
+                    destination_candidate == destination
+                    and source_candidate.name.startswith(".repodata.rollback-")
+                ):
+                    restore_failed = True
+                    raise OSError("simulated rollback restore failure")
+                return real_replace(source_path, destination_path)
+
+            try:
+                with mock.patch(
+                    "build.linux.repository.os.replace",
+                    side_effect=fail_publication_and_restore,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "rollback incomplete|preserved.*rollback"
+                    ) as raised:
+                        _publish_repodata(source, destination)
+
+                self.assertTrue(publication_failed)
+                self.assertTrue(restore_failed)
+                self.assertFalse(destination.exists())
+                self.assertEqual([], list(root.glob(".repodata.publish-*")))
+                backups = list(root.glob(".repodata.rollback-*"))
+                self.assertEqual(1, len(backups))
+                backup = backups[0]
+                self.assertTrue(stat.S_ISDIR(backup.lstat().st_mode))
+                self.assertFalse(backup.is_symlink())
+                self.assertEqual(b"original metadata\n", (backup / "nested/old.xml").read_bytes())
+                self.assertEqual(
+                    original_modes,
+                    {
+                        ".": stat.S_IMODE(backup.stat().st_mode),
+                        "nested": stat.S_IMODE((backup / "nested").stat().st_mode),
+                        "nested/old.xml": stat.S_IMODE((backup / "nested/old.xml").stat().st_mode),
+                    },
+                )
+                self.assertIn(os.fspath(backup), str(raised.exception))
+                self.assertIsInstance(raised.exception.__cause__, OSError)
+                self.assertIn("restore", str(raised.exception.__cause__))
+            finally:
+                for backup in root.glob(".repodata.rollback-*"):
+                    if backup.is_dir() and not backup.is_symlink():
+                        shutil.rmtree(backup)
 
     def test_rpm_repository_retains_versions_and_is_idempotent_but_rejects_collision(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -457,6 +681,8 @@ class RepositoryTests(unittest.TestCase):
                     self._build_rpm(root, site=site, rpm_package=package, tools=tools)
             self.assertTrue(failed)
             self.assertEqual(before, {p.name: p.read_bytes() for p in repodata.iterdir()})
+            self.assertEqual([], list(repodata.parent.glob(".repodata.publish-*")))
+            self.assertEqual([], list(repodata.parent.glob(".repodata.rollback-*")))
 
     def test_rpm_inputs_existing_tree_and_missing_tools_are_rejected_safely(self):
         with tempfile.TemporaryDirectory() as temporary:
