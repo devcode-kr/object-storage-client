@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 
 _DEFAULT_BASE_URL = "https://devcode-kr.github.io/object-storage-client"
 _ASCII_WHITESPACE = " \t\n\r\v\f"
@@ -270,6 +271,7 @@ def verify_public_key_fingerprint(
 
 
 _SAFE_DEB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~-]*\.deb")
+_SAFE_RPM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~-]*\.rpm")
 _RELEASE_FIELDS = {
     "Origin": None,
     "Label": None,
@@ -885,6 +887,252 @@ def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...
             for backup in backups.values():
                 if backup is not None:
                     backup.unlink(missing_ok=True)
+
+
+def _stage_rpm_packages(existing: pathlib.Path, staged: pathlib.Path, package: pathlib.Path) -> pathlib.Path:
+    if existing.exists():
+        metadata = existing.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"existing RPM package directory is not a regular directory: {existing}")
+        for entry in existing.iterdir():
+            entry_metadata = entry.lstat()
+            if entry.name == "repodata":
+                if stat.S_ISLNK(entry_metadata.st_mode) or not stat.S_ISDIR(entry_metadata.st_mode):
+                    raise RuntimeError("existing RPM repodata is not a regular directory")
+                for metadata_file in entry.iterdir():
+                    file_metadata = metadata_file.lstat()
+                    if (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", metadata_file.name) is None
+                            or stat.S_ISLNK(file_metadata.st_mode)
+                            or not stat.S_ISREG(file_metadata.st_mode)):
+                        raise RuntimeError(
+                            f"existing RPM repodata entry is unsafe or not a regular non-symlink file: {metadata_file}"
+                        )
+                continue
+            if _SAFE_RPM_NAME.fullmatch(entry.name) is None:
+                raise RuntimeError(f"existing RPM package directory contains an unsafe unexpected entry: {entry}")
+            if stat.S_ISLNK(entry_metadata.st_mode) or not stat.S_ISREG(entry_metadata.st_mode):
+                raise RuntimeError(f"existing RPM package is not a regular non-symlink file: {entry}")
+            _snapshot_regular_file(entry, staged / entry.name, "existing RPM package", mode=0o644)
+    destination = staged / package.name
+    if destination.exists():
+        candidate_directory = staged.parent / ".new-rpm"
+        _mkdir_mode(candidate_directory)
+        candidate = candidate_directory / package.name
+        _snapshot_regular_file(package, candidate, "rpm package", mode=0o644)
+        return candidate
+    _snapshot_regular_file(package, destination, "rpm package", mode=0o644)
+    return destination
+
+
+def _validate_repodata(repodata: pathlib.Path) -> pathlib.Path:
+    try:
+        metadata = repodata.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("createrepo_c did not create repodata") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("createrepo_c repodata must be a regular directory")
+    repomd = repodata / "repomd.xml"
+    _require_regular_file(repomd, "createrepo_c repomd.xml")
+    try:
+        root = ET.parse(repomd).getroot()
+    except (ET.ParseError, OSError) as error:
+        raise RuntimeError("createrepo_c produced malformed repomd.xml") from error
+    locations: dict[str, str] = {}
+    for data in root.findall("{*}data"):
+        kind = data.get("type", "")
+        location = data.find("{*}location")
+        href = location.get("href", "") if location is not None else ""
+        if kind in locations:
+            raise RuntimeError(f"repomd.xml contains duplicate {kind} metadata")
+        locations[kind] = href
+    if not {"primary", "filelists", "other"}.issubset(locations):
+        raise RuntimeError("repomd.xml is missing expected primary, filelists, or other metadata")
+    expected = {"repomd.xml"}
+    for kind, href in locations.items():
+        pure = pathlib.PurePosixPath(href)
+        if pure.parent != pathlib.PurePosixPath("repodata") or _CONTROL_CHARACTER.search(href):
+            raise RuntimeError(f"repomd.xml contains an unsafe {kind} metadata path")
+        path = repodata / pure.name
+        _require_regular_file(path, f"createrepo_c {kind} metadata")
+        data_element = next(item for item in root.findall("{*}data") if item.get("type", "") == kind)
+        checksum = data_element.find("{*}checksum")
+        algorithm = checksum.get("type", "") if checksum is not None else ""
+        if (checksum is None or algorithm not in hashlib.algorithms_available
+                or (checksum.text or "").lower() != _file_digest(path, algorithm)):
+            raise RuntimeError(f"repomd.xml has an invalid checksum for {kind} metadata")
+        expected.add(path.name)
+    actual = {entry.name for entry in repodata.iterdir()}
+    if actual != expected:
+        raise RuntimeError("createrepo_c repodata contains unexpected or unreferenced entries")
+    return repomd
+
+
+def _verify_rpm_packages(rpm_tool: str, public_key: pathlib.Path, packages: list[pathlib.Path], expected: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="osc-rpmdb-verify-") as temporary:
+        database = pathlib.Path(temporary)
+        database.chmod(0o700)
+        base = [rpm_tool, "--dbpath", os.fspath(database)]
+        _run_command([*base, "--import", os.fspath(public_key)], description="rpm public key import")
+        for package in packages:
+            result = _run_command([*base, "--checksig", os.fspath(package)], description="rpm package verification")
+            output = (result.stdout + result.stderr).lower()
+            if "ok" not in output or expected[-16:].lower() not in output or "not ok" in output:
+                raise RuntimeError(f"rpm package verification did not trust expected key: {package.name}")
+
+
+def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
+    parent = destination.parent
+    staged = pathlib.Path(tempfile.mkdtemp(prefix=".repodata.publish-", dir=parent))
+    backup = pathlib.Path(tempfile.mkdtemp(prefix=".repodata.rollback-", dir=parent))
+    backup.rmdir()
+    had_existing = False
+    try:
+        staged.rmdir()
+        shutil.copytree(source, staged, symlinks=False)
+        for directory, _, files in os.walk(staged):
+            pathlib.Path(directory).chmod(0o755)
+            for name in files:
+                (pathlib.Path(directory) / name).chmod(0o644)
+        if destination.exists():
+            metadata = destination.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError("repodata destination collision is not a regular directory")
+            os.replace(destination, backup)
+            had_existing = True
+        try:
+            os.replace(staged, destination)
+            _fsync_directories([parent])
+        except BaseException as publication_error:
+            if destination.exists():
+                shutil.rmtree(destination)
+            if had_existing:
+                os.replace(backup, destination)
+            _fsync_directories([parent])
+            raise publication_error
+        if had_existing:
+            shutil.rmtree(backup)
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
+        if backup.exists():
+            shutil.rmtree(backup)
+
+
+def build_rpm_repository(
+    *,
+    site_dir: os.PathLike[str] | str,
+    rpm_package: os.PathLike[str] | str,
+    public_key: os.PathLike[str] | str,
+    expected_fingerprint: str,
+    private_key: os.PathLike[str] | str,
+    passphrase_file: os.PathLike[str] | str,
+    createrepo_c: str = "createrepo_c",
+    rpmsign: str = "rpmsign",
+    rpm: str = "rpm",
+    gpg: str = "gpg",
+    now: dt.datetime | None = None,
+) -> RpmPaths:
+    site = _path(site_dir)
+    _reject_symlink_components(site, "site repository")
+    with _exclusive_site_lock(site):
+        package = pathlib.Path(rpm_package)
+        public = pathlib.Path(public_key)
+        private = pathlib.Path(private_key)
+        passphrase = pathlib.Path(passphrase_file)
+        if _SAFE_RPM_NAME.fullmatch(package.name) is None:
+            if package.suffix != ".rpm":
+                raise ValueError("package filename must end in .rpm")
+            raise ValueError("package must have a safe RPM filename")
+        for path, description in ((package, "rpm package"), (public, "public key"),
+                                  (private, "private key"), (passphrase, "passphrase file")):
+            _require_regular_file(path, description)
+            _reject_symlink_components(path, description)
+        site_absolute = site.absolute().resolve(strict=False)
+        for path in (package, public, private, passphrase):
+            absolute = path.absolute().resolve(strict=False)
+            if absolute == site_absolute or _is_relative_to(absolute, site_absolute):
+                raise ValueError(f"site repository must not overlap input file: {path}")
+        paths = rpm_paths(site)
+        for path in (site / "rpm", paths.packages, paths.repodata):
+            _reject_symlink_components(path, "site repository")
+        tools = {}
+        for name, command in (("createrepo_c", createrepo_c), ("rpmsign", rpmsign), ("rpm", rpm)):
+            resolved = shutil.which(command)
+            if resolved is None:
+                raise RuntimeError(f"{name} is not available: {command}")
+            tools[name] = resolved
+        expected = normalize_fingerprint(expected_fingerprint)
+        instant = now if now is not None else dt.datetime.now(tz=dt.timezone.utc)
+        if not isinstance(instant, dt.datetime):
+            raise TypeError("now must be a datetime")
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        instant = instant.astimezone(dt.timezone.utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory(prefix="osc-rpm-build-") as temporary:
+            root = pathlib.Path(temporary)
+            staged_public, staged_private, staged_passphrase = root / "repository-key.asc", root / "private.asc", root / "passphrase"
+            _snapshot_regular_file(public, staged_public, "public key", mode=0o644)
+            _snapshot_regular_file(private, staged_private, "private key", mode=0o600)
+            _snapshot_regular_file(passphrase, staged_passphrase, "passphrase file", mode=0o600)
+            info = verify_public_key_fingerprint(staged_public, expected, now=instant, gpg=gpg)
+            packages = root / "rpm/stable/x86_64"
+            _mkdir_mode(packages)
+            staged_package = _stage_rpm_packages(paths.packages, packages, package)
+            with tempfile.TemporaryDirectory(prefix="osc-rpm-sign-") as signing_temporary:
+                home = pathlib.Path(signing_temporary); home.chmod(0o700)
+                environment = _gpg_environment(home)
+                base = [gpg, "--batch", "--no-tty", "--homedir", os.fspath(home)]
+                _run_command([*base, "--pinentry-mode", "loopback", "--passphrase-file", os.fspath(staged_passphrase),
+                              "--import", os.fspath(staged_private)], description="gpg private key import", env=environment)
+                listing = _run_command([*base, "--with-colons", "--fingerprint", "--list-secret-keys"],
+                                       description="gpg private key inspection", env=environment)
+                _parse_secret_key_listing(listing.stdout, expected, instant)
+                signing_created = min(key.created for key in info.signing_keys if "s" in key.capabilities.lower()
+                                      and key.created <= instant and (key.expires is None or instant < key.expires))
+                macro = (
+                    f"%{{__gpg}} --batch --no-tty --no-armor --pinentry-mode loopback "
+                    f"--passphrase-file {staged_passphrase} --local-user {expected} "
+                    f"--faked-system-time {int(signing_created.timestamp())}! --detach-sign "
+                    "--output %{__signature_filename} %{__plaintext_filename}"
+                )
+                _run_command([tools["rpmsign"], "--define", f"_gpg_name {expected}", "--define", f"_gpg_path {home}",
+                              "--define", f"__gpg_sign_cmd {macro}", "--addsign", os.fspath(staged_package)],
+                             description="rpmsign package signing", cwd=packages, env=environment)
+            staged_package.chmod(0o644)
+            package_in_tree = packages / package.name
+            if staged_package != package_in_tree:
+                if not _check_immutable_destination(staged_package, package_in_tree):
+                    raise RuntimeError(f"immutable destination collision has different bytes: {package_in_tree}")
+                staged_package.unlink()
+                staged_package = package_in_tree
+            staged_rpms = sorted(packages.glob("*.rpm"), key=lambda path: path.name)
+            _verify_rpm_packages(tools["rpm"], staged_public, staged_rpms, expected)
+            _run_command([tools["createrepo_c"], "--update", os.fspath(packages)],
+                         description="createrepo_c repository metadata", cwd=packages.parent)
+            repomd = _validate_repodata(packages / "repodata")
+            signature = repomd.parent / "repomd.xml.asc"
+            with tempfile.TemporaryDirectory(prefix="osc-rpm-metadata-sign-") as signing_temporary:
+                home = pathlib.Path(signing_temporary); home.chmod(0o700); environment = _gpg_environment(home)
+                base = [gpg, "--batch", "--no-tty", "--homedir", os.fspath(home)]
+                _run_command([*base, "--pinentry-mode", "loopback", "--passphrase-file", os.fspath(staged_passphrase),
+                              "--import", os.fspath(staged_private)], description="gpg private key import", env=environment)
+                _run_command([*base, "--yes", "--armor", "--pinentry-mode", "loopback", "--passphrase-file",
+                              os.fspath(staged_passphrase), "--local-user", expected, "--output", os.fspath(signature),
+                              "--detach-sign", os.fspath(repomd)], description="gpg repomd.xml signing", env=environment)
+            signature.chmod(0o644)
+            with tempfile.TemporaryDirectory(prefix="osc-rpm-metadata-verify-") as verify_temporary:
+                home = pathlib.Path(verify_temporary); home.chmod(0o700); environment = _gpg_environment(home)
+                base = [gpg, "--batch", "--no-tty", "--homedir", os.fspath(home)]
+                _run_command([*base, "--import", os.fspath(staged_public)], description="gpg public key import for signature verification", env=environment)
+                result = _run_command([*base, "--status-fd", "1", "--verify", os.fspath(signature), os.fspath(repomd)],
+                                      description="gpg repomd.xml signature verification", env=environment)
+                if expected not in _validsig_primary_fingerprints(result.stdout):
+                    raise RuntimeError("gpg repomd.xml signature verification did not produce expected VALIDSIG")
+            _mkdir_repository_tree(site, paths.packages)
+            _copy_immutable(staged_package, paths.packages / package.name)
+            _copy_immutable(staged_public, site / "repository-key.asc")
+            _publish_repodata(packages / "repodata", paths.repodata)
+        return paths
 
 
 def build_apt_repository(

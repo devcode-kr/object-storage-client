@@ -24,6 +24,7 @@ from build.linux.repository import (
     SigningKeyRecord,
     apt_paths,
     build_apt_repository,
+    build_rpm_repository,
     build_parser,
     inspect_public_key,
     normalize_fingerprint,
@@ -181,6 +182,55 @@ for section, algorithm in algorithms:
     return tool
 
 
+def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    rpmsign = root / "rpmsign"
+    rpmsign.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        "if os.environ.get('OSC_RPM_SIGN_FAIL'): sys.exit(31)\n"
+        "path = pathlib.Path(sys.argv[-1])\n"
+        "data = path.read_bytes()\n"
+        "if not data.endswith(b'\\nFAKE-RPM-SIGNATURE\\n'):\n"
+        "    path.write_bytes(data + b'\\nFAKE-RPM-SIGNATURE\\n')\n"
+        "log = os.environ.get('OSC_RPM_TOOL_LOG')\n"
+        "if log: pathlib.Path(log).write_text('rpmsign\\0' + '\\0'.join(sys.argv[1:]) + '\\n' + os.getcwd() + '\\n' + os.environ.get('GNUPGHOME', ''), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    createrepo = root / "createrepo_c"
+    createrepo.write_text(
+        "#!/usr/bin/env python3\n"
+        "import gzip, hashlib, os, pathlib, sys\n"
+        "if os.environ.get('OSC_RPM_METADATA_FAIL'): sys.exit(32)\n"
+        "base = pathlib.Path(sys.argv[-1]); repodata = base / 'repodata'; repodata.mkdir()\n"
+        "files = {}\n"
+        "for kind in ('primary', 'filelists', 'other'):\n"
+        "    name = kind + '.xml.gz'; data = gzip.compress(('<' + kind + '/>').encode(), mtime=0); (repodata / name).write_bytes(data); files[kind] = name\n"
+        "body = ['<?xml version=\"1.0\" encoding=\"UTF-8\"?>', '<repomd xmlns=\"http://linux.duke.edu/metadata/repo\">']\n"
+        "for kind, name in files.items(): body += [f'<data type=\"{kind}\"><checksum type=\"sha256\">{hashlib.sha256((repodata/name).read_bytes()).hexdigest()}</checksum><location href=\"repodata/{name}\"/></data>']\n"
+        "body += ['</repomd>']; (repodata / 'repomd.xml').write_text(''.join(body), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    rpm = root / "rpm"
+    rpm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        f"fingerprint = {fingerprint!r}\n"
+        "args = sys.argv[1:]; db = pathlib.Path(args[args.index('--dbpath') + 1]); db.mkdir(parents=True, exist_ok=True)\n"
+        "if '--import' in args: (db / 'imported').write_text(fingerprint); sys.exit(0)\n"
+        "if os.environ.get('OSC_RPM_VERIFY_FAIL'): sys.exit(33)\n"
+        "packages = [pathlib.Path(value) for value in args if value.endswith('.rpm')]\n"
+        "if not packages or not (db / 'imported').exists(): sys.exit(34)\n"
+        "for package in packages:\n"
+        "    if not package.read_bytes().endswith(b'\\nFAKE-RPM-SIGNATURE\\n'): sys.exit(35)\n"
+        "    print(f'{package}: digests signatures OK key ID {fingerprint[-16:]}')\n",
+        encoding="utf-8",
+    )
+    for tool in (rpmsign, createrepo, rpm):
+        tool.chmod(0o755)
+    return createrepo, rpmsign, rpm
+
+
 def _page_bootstrap_blocks() -> tuple[str, str]:
     page = html.unescape((LINUX / "pages-index.html").read_text(encoding="utf-8"))
     apt = page[page.index("<h2>APT"):page.index("<h2>DNF")]
@@ -317,6 +367,120 @@ class RepositoryTests(unittest.TestCase):
             now=now,
         )
         return destination
+
+    def _build_rpm(self, root, *, site=None, rpm_package=None, tools=None, **overrides):
+        package = rpm_package or (root / "object-storage-client-1.2.3-1.x86_64.rpm")
+        if rpm_package is None:
+            package.write_bytes(b"test rpm package bytes\n")
+        createrepo, rpmsign, rpm = tools or _fake_rpm_tools(root / "rpm-tools", self.throwaway_fingerprint)
+        destination = site or (root / "site")
+        build_rpm_repository(
+            site_dir=destination, rpm_package=package,
+            public_key=overrides.get("public_key", self.public_key),
+            expected_fingerprint=self.throwaway_fingerprint,
+            private_key=overrides.get("private_key", self.secret_key),
+            passphrase_file=overrides.get("passphrase_file", self.passphrase_file),
+            createrepo_c=os.fspath(createrepo), rpmsign=os.fspath(rpmsign),
+            rpm=os.fspath(rpm), gpg=overrides.get("gpg", "gpg"),
+        )
+        return destination
+
+    def test_build_rpm_repository_signs_packages_and_metadata_with_real_gpg(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            log = root / "tool-log"
+            with mock.patch.dict(os.environ, {"OSC_RPM_TOOL_LOG": os.fspath(log)}):
+                site = self._build_rpm(root)
+            paths = rpm_paths(site)
+            package = paths.packages / "object-storage-client-1.2.3-1.x86_64.rpm"
+            expected = {package, paths.repodata / "primary.xml.gz", paths.repodata / "filelists.xml.gz",
+                        paths.repodata / "other.xml.gz", paths.repodata / "repomd.xml",
+                        paths.repodata / "repomd.xml.asc", site / "repository-key.asc"}
+            self.assertEqual(expected, {path for path in site.rglob("*") if path.is_file()})
+            for path in expected:
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+            self.assertTrue(package.read_bytes().endswith(b"\nFAKE-RPM-SIGNATURE\n"))
+            self.assertIn("BEGIN PGP SIGNATURE", (paths.repodata / "repomd.xml.asc").read_text())
+            tool_log = log.read_text(encoding="utf-8")
+            self.assertIn("--local-user " + self.throwaway_fingerprint, tool_log)
+            self.assertIn("--passphrase-file", tool_log)
+            self.assertNotIn(self.passphrase_file.read_text().strip(), tool_log)
+
+    def test_rpm_repository_retains_versions_and_is_idempotent_but_rejects_collision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+            first = root / "object-storage-client-1.0.0-1.x86_64.rpm"
+            second = root / "object-storage-client-2.0.0-1.x86_64.rpm"
+            first.write_bytes(b"rpm one\n"); second.write_bytes(b"rpm two\n")
+            site = self._build_rpm(root, rpm_package=first, tools=tools)
+            self._build_rpm(root, site=site, rpm_package=second, tools=tools)
+            before = (rpm_paths(site).packages / second.name).read_bytes()
+            self._build_rpm(root, site=site, rpm_package=second, tools=tools)
+            self.assertEqual({first.name, second.name}, {p.name for p in rpm_paths(site).packages.glob("*.rpm")})
+            self.assertEqual(before, (rpm_paths(site).packages / second.name).read_bytes())
+            second.write_bytes(b"changed same name\n")
+            with self.assertRaisesRegex(RuntimeError, "collision|different"):
+                self._build_rpm(root, site=site, rpm_package=second, tools=tools)
+
+    def test_rpm_failures_preserve_existing_repodata(self):
+        for variable, message in (("OSC_RPM_SIGN_FAIL", "rpmsign|sign"),
+                                  ("OSC_RPM_VERIFY_FAIL", "rpm.*verif"),
+                                  ("OSC_RPM_METADATA_FAIL", "createrepo")):
+            with self.subTest(variable=variable), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary); tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+                site = self._build_rpm(root, tools=tools); repodata = rpm_paths(site).repodata
+                before = {p.name: p.read_bytes() for p in repodata.iterdir()}
+                package = root / "object-storage-client-2.0.0-1.x86_64.rpm"; package.write_bytes(b"new rpm\n")
+                with mock.patch.dict(os.environ, {variable: "1"}):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        self._build_rpm(root, site=site, rpm_package=package, tools=tools)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in repodata.iterdir()})
+
+    def test_rpm_repodata_directory_publication_rolls_back_on_rename_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary); tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+            site = self._build_rpm(root, tools=tools); repodata = rpm_paths(site).repodata
+            before = {p.name: p.read_bytes() for p in repodata.iterdir()}
+            package = root / "object-storage-client-2.0.0-1.x86_64.rpm"; package.write_bytes(b"new rpm\n")
+            real_replace = os.replace
+            failed = False
+            def fail_new_directory(source, destination):
+                nonlocal failed
+                if pathlib.Path(destination) == repodata and not failed:
+                    failed = True
+                    raise OSError("simulated repodata publication failure")
+                return real_replace(source, destination)
+            with mock.patch("build.linux.repository.os.replace", side_effect=fail_new_directory):
+                with self.assertRaisesRegex(OSError, "repodata publication"):
+                    self._build_rpm(root, site=site, rpm_package=package, tools=tools)
+            self.assertTrue(failed)
+            self.assertEqual(before, {p.name: p.read_bytes() for p in repodata.iterdir()})
+
+    def test_rpm_inputs_existing_tree_and_missing_tools_are_rejected_safely(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary); tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+            unsafe = root / "unsafe name.rpm"; unsafe.write_bytes(b"rpm")
+            with self.assertRaisesRegex(ValueError, "safe|filename"): self._build_rpm(root, rpm_package=unsafe, tools=tools)
+            wrong = root / "package.deb"; wrong.write_bytes(b"deb")
+            with self.assertRaisesRegex(ValueError, "\\.rpm"): self._build_rpm(root, rpm_package=wrong, tools=tools)
+            real = root / "safe.rpm"; real.write_bytes(b"rpm")
+            linked = root / "linked.rpm"; linked.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "symlink"): self._build_rpm(root, rpm_package=linked, tools=tools)
+            with self.assertRaisesRegex((ValueError, RuntimeError), "overlap"): self._build_rpm(root, site=real, rpm_package=real, tools=tools)
+            site = root / "existing-site"; packages = rpm_paths(site).packages; packages.mkdir(parents=True)
+            (packages / "README").write_text("hazard")
+            with self.assertRaisesRegex(RuntimeError, "unsafe|unexpected"): self._build_rpm(root, site=site, rpm_package=real, tools=tools)
+            hazard_site = root / "hazard-site"; hazard_packages = rpm_paths(hazard_site).packages
+            hazard_repodata = hazard_packages / "repodata"; hazard_repodata.mkdir(parents=True)
+            (hazard_repodata / "repomd.xml").symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "symlink|regular"):
+                self._build_rpm(root, site=hazard_site, rpm_package=real, tools=tools)
+            for index, field in enumerate(("createrepo_c", "rpmsign", "rpm")):
+                broken = list(tools); broken[index] = pathlib.Path("definitely-missing-" + field)
+                with self.subTest(tool=field), self.assertRaisesRegex(RuntimeError, field.replace("_c", "") + ".*not available"):
+                    self._build_rpm(root, rpm_package=real, tools=tuple(broken))
 
     def test_build_apt_repository_signs_complete_repository_with_real_gpg(self):
         with tempfile.TemporaryDirectory() as temporary:
