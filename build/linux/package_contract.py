@@ -42,6 +42,8 @@ class NativeVersion:
             raise ValueError(
                 f"application version must be Major.Minor.Patch: {application!r}"
             )
+        if isinstance(package_release, bool) or not isinstance(package_release, int):
+            raise ValueError("package release must be an integer")
         if package_release < 1 or package_release > 65535:
             raise ValueError("package release must be between 1 and 65535")
         return cls(application, package_release)

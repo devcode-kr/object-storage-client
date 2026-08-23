@@ -13,12 +13,20 @@ LINUX = ROOT / "build" / "linux"
 
 def load_contract():
     path = LINUX / "package_contract.py"
-    spec = importlib.util.spec_from_file_location("package_contract", path)
+    module_name = "_osc_linux_package_contract_test"
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
     return module
 
 
@@ -62,13 +70,21 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual("1.2.3", version.rpm_version)
                 self.assertEqual(str(release), version.rpm_release)
 
+    def test_load_contract_leaves_no_module_entry_behind(self):
+        module_name = "_osc_linux_package_contract_test"
+        sys.modules.pop(module_name, None)
+
+        load_contract()
+
+        self.assertNotIn(module_name, sys.modules)
+
     def test_invalid_versions_and_releases_are_rejected(self):
         contract = load_contract()
         for value in ("1.2", "v1.2.3", "1.2.3.4", "1.2.x", ""):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     contract.NativeVersion.parse(value, 1)
-        for release in (0, -1, 65536):
+        for release in (0, -1, 65536, True, False, 1.5, 65534.9, "1", None):
             with self.subTest(release=release):
                 with self.assertRaises(ValueError):
                     contract.NativeVersion.parse("1.2.3", release)
@@ -111,7 +127,9 @@ class PackageContractTests(unittest.TestCase):
         )
 
     def test_linux_packaging_ignore_entries_are_exact(self):
-        expected = {
+        required = {
+            "__pycache__/",
+            "*.py[cod]",
             "artifacts/linux-packages/",
             "obj/linux-packages/",
             "obj/linux-repositories/",
@@ -119,12 +137,12 @@ class PackageContractTests(unittest.TestCase):
             "obj/gnupg-test/",
         }
         entries = [
-            line.strip()
+            line
             for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+            if line and not line.lstrip().startswith("#")
         ]
 
-        for entry in expected:
+        for entry in required:
             with self.subTest(entry=entry):
                 self.assertEqual(1, entries.count(entry))
 
@@ -133,14 +151,22 @@ class PackageContractTests(unittest.TestCase):
             for entry in entries
             if entry.startswith(("artifacts/linux-", "obj/linux-", "obj/gnupg-"))
         }
-        self.assertEqual(expected, linux_entries)
+        self.assertEqual(
+            {
+                "artifacts/linux-packages/",
+                "obj/linux-packages/",
+                "obj/linux-repositories/",
+                "obj/linux-smoke/",
+                "obj/gnupg-test/",
+            },
+            linux_entries,
+        )
 
     def test_packaging_sources_never_reference_user_state(self):
         forbidden = ".devcode" + "/object-storage-client"
         for path in LINUX.rglob("*"):
             if (
                 path.is_file()
-                and path != LINUX / "package_contract.py"
                 and "__pycache__" not in path.parts
                 and path.suffix != ".pyc"
             ):
