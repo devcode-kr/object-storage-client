@@ -6,27 +6,40 @@ import pathlib
 import stat
 import sys
 import unittest
+import uuid
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 LINUX = ROOT / "build" / "linux"
+GENERATED_PYTHON_CACHE_SUFFIXES = (".pyc", ".pyo", ".pyd")
+
+
+def user_state_references():
+    forbidden = ".devcode" + "/object-storage-client"
+    references = []
+    for path in LINUX.rglob("*"):
+        if (
+            path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix not in GENERATED_PYTHON_CACHE_SUFFIXES
+            and forbidden in path.read_text(encoding="utf-8", errors="ignore")
+        ):
+            references.append(path)
+    return references
 
 
 def load_contract():
     path = LINUX / "package_contract.py"
-    module_name = "_osc_linux_package_contract_test"
+    module_name = f"_osc_linux_package_contract_test_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    previous = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
     finally:
-        if previous is None:
-            sys.modules.pop(module_name, None)
-        else:
-            sys.modules[module_name] = previous
+        sys.modules.pop(module_name, None)
     return module
 
 
@@ -70,13 +83,33 @@ class PackageContractTests(unittest.TestCase):
                 self.assertEqual("1.2.3", version.rpm_version)
                 self.assertEqual(str(release), version.rpm_release)
 
-    def test_load_contract_leaves_no_module_entry_behind(self):
-        module_name = "_osc_linux_package_contract_test"
-        sys.modules.pop(module_name, None)
+    def test_load_contract_uses_unique_temporary_module_names(self):
+        first = load_contract()
+        second = load_contract()
 
-        load_contract()
+        self.assertNotEqual(first.__name__, second.__name__)
+        self.assertNotIn(first.__name__, sys.modules)
+        self.assertNotIn(second.__name__, sys.modules)
 
+    def test_load_contract_removes_temporary_module_when_execution_raises(self):
+        module_name = "_osc_linux_package_contract_test_failure"
+        fake_uuid = mock.Mock(hex="failure")
         self.assertNotIn(module_name, sys.modules)
+
+        try:
+            with (
+                mock.patch.object(uuid, "uuid4", return_value=fake_uuid),
+                mock.patch(
+                    "_frozen_importlib_external.SourceFileLoader.exec_module",
+                    side_effect=RuntimeError("deliberate execution failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "deliberate execution failure"),
+            ):
+                load_contract()
+        finally:
+            leaked_module = sys.modules.pop(module_name, None)
+
+        self.assertIsNone(leaked_module)
 
     def test_invalid_versions_and_releases_are_rejected(self):
         contract = load_contract()
@@ -141,10 +174,12 @@ class PackageContractTests(unittest.TestCase):
             for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
             if line and not line.lstrip().startswith("#")
         ]
+        normalized_entries = [entry.strip() for entry in entries]
 
         for entry in required:
             with self.subTest(entry=entry):
                 self.assertEqual(1, entries.count(entry))
+                self.assertEqual(1, normalized_entries.count(entry))
 
         linux_entries = {
             entry
@@ -163,18 +198,21 @@ class PackageContractTests(unittest.TestCase):
         )
 
     def test_packaging_sources_never_reference_user_state(self):
+        self.assertEqual([], user_state_references())
+
+    def test_generated_python_caches_are_skipped_but_normal_files_are_scanned(self):
         forbidden = ".devcode" + "/object-storage-client"
-        for path in LINUX.rglob("*"):
-            if (
-                path.is_file()
-                and "__pycache__" not in path.parts
-                and path.suffix != ".pyc"
-            ):
-                self.assertNotIn(
-                    forbidden,
-                    path.read_text(encoding="utf-8", errors="ignore"),
-                    str(path.relative_to(ROOT)),
-                )
+        cache_fixture = LINUX / "contract-sabotage.pyo"
+        text_fixture = LINUX / "contract-sabotage.txt"
+        try:
+            cache_fixture.write_text(forbidden, encoding="utf-8")
+            self.assertNotIn(cache_fixture, user_state_references())
+
+            text_fixture.write_text(forbidden, encoding="utf-8")
+            self.assertIn(text_fixture, user_state_references())
+        finally:
+            cache_fixture.unlink(missing_ok=True)
+            text_fixture.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
