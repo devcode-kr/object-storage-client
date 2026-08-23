@@ -37,3 +37,10 @@ _ReSharper*/
 ## Local tooling state
 .omc/
 .local/
+
+## Linux packaging output
+artifacts/linux-packages/
+obj/linux-packages/
+obj/linux-repositories/
+obj/linux-smoke/
+obj/gnupg-test/
