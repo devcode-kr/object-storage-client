@@ -13,7 +13,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from package_contract import DEB_ARCH, DEB_DEPENDENCIES, PACKAGE_NAME, NativeVersion
-from stage_payload import is_same_or_descendant, paths_overlap, resolved_path, stage_payload
+from stage_payload import paths_overlap, resolved_path, stage_payload
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
 MAINTAINER = "Devcode <129266150+devcode-kr@users.noreply.github.com>"
@@ -61,7 +61,7 @@ def build_deb(
     repo_root = resolved_path(repo_root)
     publish_dir = resolved_path(publish_dir)
     output_dir = resolved_path(output_dir)
-    package_root = resolved_path(repo_root / "obj/linux-packages/deb/root")
+    package_root = repo_root / "obj/linux-packages/deb/root"
     output = output_dir / (
         f"ObjectStorageClient-{version.application}-{version.package_release}"
         "-linux-x64.deb"
@@ -73,10 +73,10 @@ def build_deb(
                 f"output directory and {tree_name} must not overlap: "
                 f"{output_dir} and {tree}"
             )
-        if is_same_or_descendant(output, tree):
+        if paths_overlap(output, tree):
             raise ValueError(
                 f"output path must not overlap the {tree_name}: "
-                f"{resolved_path(output)} is inside {tree}"
+                f"{resolved_path(output)} and {tree}"
             )
 
     stage_payload(repo_root, publish_dir, package_root)

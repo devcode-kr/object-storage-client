@@ -66,6 +66,22 @@ def deb_output(output_dir: pathlib.Path) -> pathlib.Path:
 
 
 class StagePayloadTests(unittest.TestCase):
+    def test_finds_symlink_components_in_absolute_and_relative_lexical_paths(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            temporary = pathlib.Path(directory)
+            target = temporary / "target"
+            target.mkdir()
+            alias = temporary / "alias"
+            try:
+                alias.symlink_to(target, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+
+            absolute = alias / "staging/root"
+            relative = absolute.relative_to(ROOT)
+            self.assertEqual(alias, stage_payload.existing_symlink_component(absolute))
+            self.assertEqual(alias, stage_payload.existing_symlink_component(relative))
+
     def test_stages_exact_payload_and_preserves_publish_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
@@ -215,11 +231,32 @@ class StagePayloadTests(unittest.TestCase):
             sentinel = repo / "build/sentinel"
             sentinel.write_bytes(b"keep")
 
-            with self.assertRaisesRegex(ValueError, "source"):
+            with self.assertRaisesRegex(ValueError, str(package_root)):
                 stage_payload.stage_payload(repo, publish, package_root)
 
             launcher = repo / "build/linux/object-storage-client"
             self.assertEqual(b"#!/bin/sh\n", launcher.read_bytes())
+            self.assertEqual(b"keep", sentinel.read_bytes())
+
+    def test_rejects_arbitrary_symlinked_package_root_parent_without_deleting_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            publish = make_publish(temporary)
+            unrelated = temporary / "unrelated"
+            staging = unrelated / "staging"
+            staging.mkdir(parents=True)
+            sentinel = staging / "sentinel"
+            sentinel.write_bytes(b"keep")
+            alias = temporary / "alias"
+            try:
+                alias.symlink_to(unrelated, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            package_root = alias / "staging"
+
+            with self.assertRaisesRegex(ValueError, str(package_root)):
+                stage_payload.stage_payload(ROOT, publish, package_root)
+
             self.assertEqual(b"keep", sentinel.read_bytes())
 
     def test_rejects_publish_path_that_is_not_a_directory(self):
@@ -439,6 +476,88 @@ class DebianCliTests(unittest.TestCase):
                     self.assertTrue(output.is_symlink())
                     self.assertEqual(b"keep", target.read_bytes())
                     stage.assert_not_called()
+                    output.unlink()
+
+    def test_build_rejects_symlinked_fixed_staging_parents_before_deleting_target(self):
+        for symlink_parent in ("obj", "obj/linux-packages"):
+            with (
+                self.subTest(symlink_parent=symlink_parent),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                temporary = pathlib.Path(directory)
+                repo = make_fake_repo(temporary)
+                publish_parent = temporary / "payload"
+                publish_parent.mkdir()
+                publish = make_publish(publish_parent)
+                unrelated = temporary / "unrelated"
+                target_root = unrelated / (
+                    "linux-packages/deb/root" if symlink_parent == "obj" else "deb/root"
+                )
+                target_root.mkdir(parents=True)
+                sentinel = target_root / "sentinel"
+                sentinel.write_bytes(b"keep")
+                link = repo / symlink_parent
+                link.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    link.symlink_to(unrelated, target_is_directory=True)
+                except OSError as error:
+                    self.skipTest(f"symlinks unavailable: {error}")
+
+                with (
+                    mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
+                    mock.patch.object(package_deb.subprocess, "run") as run,
+                    self.assertRaisesRegex(ValueError, str(link)),
+                ):
+                    package_deb.build_deb(
+                        repo,
+                        NativeVersion.parse("1.2.3", 4),
+                        publish,
+                        temporary / "output",
+                    )
+
+                self.assertEqual(b"keep", sentinel.read_bytes())
+                run.assert_not_called()
+
+    def test_build_rejects_output_symlink_resolving_to_ancestor_of_protected_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            package_root = repo / "obj/linux-packages/deb/root"
+            package_root.mkdir(parents=True)
+            sentinel = package_root / "sentinel"
+            sentinel.write_bytes(b"keep")
+            output_dir = temporary / "output"
+            output_dir.mkdir()
+            output = deb_output(output_dir)
+
+            for tree_name, ancestor in (
+                ("package root", repo),
+                ("publish directory", publish_parent),
+            ):
+                with self.subTest(tree_name=tree_name):
+                    try:
+                        output.symlink_to(ancestor, target_is_directory=True)
+                    except OSError as error:
+                        self.skipTest(f"symlinks unavailable: {error}")
+                    with (
+                        mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
+                        mock.patch.object(package_deb, "stage_payload") as stage,
+                        mock.patch.object(package_deb.subprocess, "run") as run,
+                        self.assertRaisesRegex(ValueError, "overlap"),
+                    ):
+                        package_deb.build_deb(
+                            repo,
+                            NativeVersion.parse("1.2.3", 4),
+                            publish,
+                            output_dir,
+                        )
+                    self.assertTrue(output.is_symlink())
+                    self.assertEqual(b"keep", sentinel.read_bytes())
+                    stage.assert_not_called()
+                    run.assert_not_called()
                     output.unlink()
 
     def test_build_removes_stale_output_before_invoking_dpkg_deb(self):

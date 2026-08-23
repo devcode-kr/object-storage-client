@@ -17,6 +17,20 @@ def resolved_path(path: Path) -> Path:
     return Path(path).resolve()
 
 
+def existing_symlink_component(path: Path) -> Path | None:
+    """Return the first existing symlink in an absolute lexical path."""
+    lexical_path = Path(path)
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
+
+    component = Path(lexical_path.anchor)
+    for part in lexical_path.parts[1:]:
+        component /= part
+        if component.is_symlink():
+            return component
+    return None
+
+
 def is_same_or_descendant(path: Path, ancestor: Path) -> bool:
     """Return whether path resolves to ancestor or anywhere below it."""
     return resolved_path(path).is_relative_to(resolved_path(ancestor))
@@ -45,6 +59,13 @@ def stage_payload(repo_root: Path, publish_dir: Path, package_root: Path) -> Non
     repo_root = Path(repo_root)
     publish_dir = Path(publish_dir)
     package_root = Path(package_root)
+
+    unsafe_component = existing_symlink_component(package_root)
+    if unsafe_component is not None:
+        raise ValueError(
+            f"unsafe package root contains symlink component: "
+            f"{package_root} ({unsafe_component})"
+        )
 
     source_files = {
         LAUNCHER_PATH: repo_root / "build/linux/object-storage-client",
