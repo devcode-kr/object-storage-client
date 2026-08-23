@@ -13,6 +13,8 @@ import tempfile
 _DEFAULT_BASE_URL = "https://devcode-kr.github.io/object-storage-client"
 _ASCII_WHITESPACE = " \t\n\r\v\f"
 _FINGERPRINT = re.compile(r"[0-9A-F]{40}")
+_KEY_CAPABILITIES = re.compile(r"[escaESCAD]+")
+_UNUSABLE_VALIDITY = frozenset({"r", "d", "i", "e"})
 
 
 @dataclass(frozen=True)
@@ -29,12 +31,22 @@ class RpmPaths:
 
 
 @dataclass(frozen=True)
+class SigningKeyRecord:
+    record_type: str
+    validity: str
+    capabilities: str
+    created: dt.datetime
+    expires: dt.datetime | None
+
+
+@dataclass(frozen=True)
 class PublicKeyInfo:
     fingerprint: str
     created: dt.datetime
     expires: dt.datetime | None
     capabilities: str
     validity: str
+    signing_keys: tuple[SigningKeyRecord, ...]
 
 
 def _path(value: os.PathLike[str] | str) -> pathlib.Path:
@@ -76,6 +88,8 @@ def normalize_fingerprint(value: str) -> str:
 
 
 def _utc_timestamp(value: str, field: str) -> dt.datetime:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise RuntimeError(f"public key has an invalid {field} timestamp")
     try:
         timestamp = int(value)
     except (TypeError, ValueError) as error:
@@ -84,6 +98,27 @@ def _utc_timestamp(value: str, field: str) -> dt.datetime:
         return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
     except (OverflowError, OSError, ValueError) as error:
         raise RuntimeError(f"public key has an invalid {field} timestamp") from error
+
+
+def _signing_key_record(fields: list[str]) -> SigningKeyRecord:
+    if len(fields) <= 11 or fields[0] not in {"pub", "sub"}:
+        raise RuntimeError("public key has a malformed signing key record")
+    capabilities = fields[11]
+    if _KEY_CAPABILITIES.fullmatch(capabilities) is None:
+        raise RuntimeError(
+            f"public key {fields[0]} record has malformed capabilities"
+        )
+    return SigningKeyRecord(
+        record_type=fields[0],
+        validity=fields[1],
+        capabilities=capabilities,
+        created=_utc_timestamp(fields[5], f"{fields[0]} creation"),
+        expires=(
+            _utc_timestamp(fields[6], f"{fields[0]} expiry")
+            if fields[6]
+            else None
+        ),
+    )
 
 
 def _regular_non_symlink(path: pathlib.Path) -> None:
@@ -169,30 +204,23 @@ def inspect_public_key(
         raise RuntimeError("public key must contain exactly one primary public key and fingerprint")
 
     record = public_records[0]
-    if len(record) <= 11:
-        raise RuntimeError("public key record is malformed")
+    signing_keys = tuple(
+        _signing_key_record(signing_record)
+        for signing_record in [record, *subkey_records]
+    )
+    primary = signing_keys[0]
     fingerprint = normalize_fingerprint(primary_fingerprints[0])
-    validity = record[1]
-    if validity.lower() in {"r", "d", "i", "e"}:
-        raise RuntimeError(f"public key has an unusable primary validity state: {validity}")
-    created = _utc_timestamp(record[5], "creation")
-    expires = _utc_timestamp(record[6], "expiry") if record[6] else None
-    capabilities = record[11]
-    signing_records = [record, *subkey_records]
-    if any(len(signing_record) <= 11 for signing_record in signing_records):
-        raise RuntimeError("public key has a malformed key record")
-    if not any(
-        "s" in signing_record[11]
-        and signing_record[1].lower() not in {"r", "d", "i", "e"}
-        for signing_record in signing_records
-    ):
-        raise RuntimeError("public key does not have signing capability")
+    if primary.validity.lower() in _UNUSABLE_VALIDITY:
+        raise RuntimeError(
+            f"public key has an unusable primary validity state: {primary.validity}"
+        )
     return PublicKeyInfo(
         fingerprint=fingerprint,
-        created=created,
-        expires=expires,
-        capabilities=capabilities,
-        validity=validity,
+        created=primary.created,
+        expires=primary.expires,
+        capabilities=primary.capabilities,
+        validity=primary.validity,
+        signing_keys=signing_keys,
     )
 
 
@@ -222,6 +250,15 @@ def verify_public_key_fingerprint(
         raise RuntimeError(
             f"public key expired at {info.expires.isoformat()}"
         )
+    if not any(
+        "s" in key.capabilities.lower()
+        and "d" not in key.capabilities.lower()
+        and key.validity.lower() not in _UNUSABLE_VALIDITY
+        and key.created <= instant
+        and (key.expires is None or instant < key.expires)
+        for key in info.signing_keys
+    ):
+        raise RuntimeError("public key does not have a usable signing key at this time")
     return info
 
 

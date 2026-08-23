@@ -23,7 +23,15 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
 gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" &gt; "$tmpdir/key-info"
-fingerprint=$(awk -F: '$1 == "pub" { primary = 1; next } primary &amp;&amp; $1 == "fpr" { print $10; exit }' "$tmpdir/key-info")
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr &amp;&amp; $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
 test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
 gpg --batch --dearmor --output "$tmpdir/object-storage-client.gpg" "$tmpdir/repository-key.asc"
 sudo install -d -m 0755 /etc/apt/keyrings
@@ -33,15 +41,32 @@ sudo apt update
 sudo apt install object-storage-client</code></pre>
 
     <h2>DNF (Fedora and compatible distributions)</h2>
-    <p>Save this as <code>/etc/yum.repos.d/object-storage-client.repo</code>:</p>
-    <pre><code>[object-storage-client]
+    <pre><code>set -eu
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" &gt; "$tmpdir/key-info"
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr &amp;&amp; $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+sudo install -d -m 0755 /etc/pki/rpm-gpg
+sudo install -m 0644 "$tmpdir/repository-key.asc" /etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client
+printf '%s\n' '[object-storage-client]
 name=Object Storage Client
 baseurl=https://devcode-kr.github.io/object-storage-client/rpm/stable/x86_64
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=https://devcode-kr.github.io/object-storage-client/repository-key.asc</code></pre>
-    <pre><code>sudo dnf install object-storage-client</code></pre>
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo &gt; /dev/null
+sudo dnf install object-storage-client</code></pre>
 
     <h2>Links</h2>
     <ul>

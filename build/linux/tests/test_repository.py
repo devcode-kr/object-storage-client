@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import html
 import os
 import pathlib
 import stat
@@ -14,6 +15,7 @@ from build.linux.repository import (
     AptPaths,
     PublicKeyInfo,
     RpmPaths,
+    SigningKeyRecord,
     apt_paths,
     build_parser,
     inspect_public_key,
@@ -67,6 +69,16 @@ def _verify_controlled_output(output: str, now: dt.datetime) -> PublicKeyInfo:
             )
 
 
+def _key_output(*records: str) -> str:
+    return "\n".join(
+        (
+            _colon_record("pub", capabilities="c"),
+            f"fpr:::::::::{'A' * 40}:",
+            *records,
+        )
+    )
+
+
 def _run_gpg(home: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["GNUPGHOME"] = os.fspath(home)
@@ -77,6 +89,37 @@ def _run_gpg(home: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess
         text=True,
         env=environment,
     )
+
+
+def _page_bootstrap_blocks() -> tuple[str, str]:
+    page = html.unescape((LINUX / "pages-index.html").read_text(encoding="utf-8"))
+    apt = page[page.index("<h2>APT"):page.index("<h2>DNF")]
+    dnf = page[page.index("<h2>DNF"):page.index("<h2>Links")]
+    return apt, dnf
+
+
+def _run_page_fingerprint_check(
+    block: str, key_info: str
+) -> subprocess.CompletedProcess[str]:
+    start = block.index("fingerprint=$(awk ")
+    pin = f'test "$fingerprint" = "{EXPECTED_FINGERPRINT}"'
+    pin_start = block.index(pin, start)
+    snippet = block[start : pin_start + len(pin)]
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        (root / "key-info").write_text(key_info, encoding="ascii")
+        return subprocess.run(
+            [
+                "sh",
+                "-c",
+                f"set -eu\ntmpdir=$1\n{snippet}",
+                "sh",
+                os.fspath(root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 class RepositoryTests(unittest.TestCase):
@@ -302,6 +345,117 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual("A" * 40, info.fingerprint)
         self.assertEqual("c", info.capabilities)
 
+    def test_pub_and_sub_records_are_preserved_as_immutable_metadata(self):
+        output = "\n".join(
+            (
+                _colon_record("pub", validity="-", capabilities="c"),
+                f"fpr:::::::::{'A' * 40}:",
+                _colon_record(
+                    "sub",
+                    validity="u",
+                    created=1_100,
+                    expires=1_900,
+                    capabilities="s",
+                ),
+            )
+        )
+        info = _inspect_controlled_output(output)
+        self.assertEqual(
+            (
+                SigningKeyRecord(
+                    record_type="pub",
+                    validity="-",
+                    capabilities="c",
+                    created=dt.datetime.fromtimestamp(1_000, tz=dt.timezone.utc),
+                    expires=dt.datetime.fromtimestamp(2_000, tz=dt.timezone.utc),
+                ),
+                SigningKeyRecord(
+                    record_type="sub",
+                    validity="u",
+                    capabilities="s",
+                    created=dt.datetime.fromtimestamp(1_100, tz=dt.timezone.utc),
+                    expires=dt.datetime.fromtimestamp(1_900, tz=dt.timezone.utc),
+                ),
+            ),
+            info.signing_keys,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            info.signing_keys[1].validity = "r"
+
+    def test_cert_only_primary_with_expired_signing_subkey_is_rejected(self):
+        output = _key_output(
+            _colon_record("sub", created=1_000, expires=1_500, capabilities="s")
+        )
+        with self.assertRaisesRegex(RuntimeError, "usable signing key"):
+            _verify_controlled_output(
+                output, dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+            )
+
+    def test_future_signing_subkey_is_rejected(self):
+        output = _key_output(
+            _colon_record("sub", created=1_501, expires=1_900, capabilities="s")
+        )
+        with self.assertRaisesRegex(RuntimeError, "usable signing key"):
+            _verify_controlled_output(
+                output, dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+            )
+
+    def test_signing_subkey_creation_is_inclusive_and_expiry_is_exclusive(self):
+        output = _key_output(
+            _colon_record("sub", created=1_500, expires=1_900, capabilities="s")
+        )
+        created = dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+        self.assertEqual("A" * 40, _verify_controlled_output(output, created).fingerprint)
+        with self.assertRaisesRegex(RuntimeError, "usable signing key"):
+            _verify_controlled_output(
+                output, dt.datetime.fromtimestamp(1_900, tz=dt.timezone.utc)
+            )
+
+    def test_one_expired_and_one_valid_signing_subkey_is_accepted(self):
+        output = _key_output(
+            _colon_record("sub", created=1_000, expires=1_400, capabilities="s"),
+            _colon_record("sub", created=1_400, expires=1_900, capabilities="s"),
+        )
+        now = dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+        self.assertEqual("A" * 40, _verify_controlled_output(output, now).fingerprint)
+
+    def test_unusable_signing_subkey_does_not_authorize_key(self):
+        output = _key_output(
+            _colon_record(
+                "sub", validity="r", created=1_000, expires=1_900, capabilities="s"
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "usable signing key"):
+            _verify_controlled_output(
+                output, dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+            )
+
+    def test_malformed_signing_record_timestamps_and_capabilities_are_clear(self):
+        malformed = (
+            (
+                _colon_record("sub", capabilities="s").replace(
+                    ":1000:", ":later:"
+                ),
+                "creation",
+            ),
+            (
+                _colon_record("sub", capabilities="s").replace(
+                    ":2000:", ":never:"
+                ),
+                "expiry",
+            ),
+            (
+                _colon_record("sub", capabilities="s").replace(":1000:", ":-1:"),
+                "creation",
+            ),
+            (_colon_record("sub", capabilities=""), "capabilities"),
+            (_colon_record("sub", capabilities="s!"), "capabilities"),
+        )
+        for record, message in malformed:
+            with self.subTest(message=message, record=record):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    _inspect_controlled_output(_key_output(record))
+
     def test_mixed_public_and_secret_subkey_export_is_rejected(self):
         output = "\n".join(
             (
@@ -425,6 +579,55 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("EXIT HUP INT TERM", apt_block)
         self.assertNotIn("wget -O repository-key.asc", apt_block)
         self.assertNotIn("/etc/apt/keyrings/object-storage-client.gpg\n", apt_block[:positions[-1]])
+
+    def test_apt_and_dnf_bootstraps_independently_pin_exactly_one_public_key(self):
+        apt_block, dnf_block = _page_bootstrap_blocks()
+        approved = "\n".join(
+            (_colon_record("pub"), f"fpr:::::::::{EXPECTED_FINGERPRINT}:")
+        )
+        two_primary = "\n".join(
+            (
+                approved,
+                _colon_record("pub"),
+                f"fpr:::::::::{'B' * 40}:",
+            )
+        )
+        secret = "\n".join(
+            (_colon_record("sec"), f"fpr:::::::::{EXPECTED_FINGERPRINT}:")
+        )
+        for name, block in (("APT", apt_block), ("DNF", dnf_block)):
+            with self.subTest(bootstrap=name, case="approved"):
+                self.assertEqual(0, _run_page_fingerprint_check(block, approved).returncode)
+            for case, key_info in (("two-primary", two_primary), ("secret", secret)):
+                with self.subTest(bootstrap=name, case=case):
+                    self.assertNotEqual(
+                        0, _run_page_fingerprint_check(block, key_info).returncode
+                    )
+
+    def test_dnf_bootstrap_verifies_private_download_before_local_key_install(self):
+        _, dnf_block = _page_bootstrap_blocks()
+        ordered = (
+            "set -eu",
+            "umask 077",
+            "mktemp -d",
+            "trap '",
+            f'wget -O "$tmpdir/repository-key.asc" {BASE_URL}/repository-key.asc',
+            "gpg --batch --show-keys --with-colons",
+            "fingerprint=",
+            f'test "$fingerprint" = "{EXPECTED_FINGERPRINT}"',
+            "sudo install -d -m 0755 /etc/pki/rpm-gpg",
+            "sudo install -m 0644",
+            "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client",
+            "sudo dnf install object-storage-client",
+        )
+        positions = []
+        for text in ordered:
+            with self.subTest(order=text):
+                self.assertIn(text, dnf_block)
+                positions.append(dnf_block.index(text))
+        self.assertEqual(sorted(positions), positions)
+        self.assertIn("EXIT HUP INT TERM", dnf_block)
+        self.assertNotIn(f"gpgkey={BASE_URL}/repository-key.asc", dnf_block)
 
     def test_repository_public_files_exclude_exact_private_key_identifiers(self):
         private_block = "BEGIN PGP " + "PRIVATE KEY BLOCK"
