@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from typing import Sequence
+from typing import Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if __package__:
@@ -41,6 +41,13 @@ SOURCE_NAME = "payload.tar.gz"
 _SPEC_TOKEN = re.compile(r"@[A-Z][A-Z0-9_]*@")
 _SAFE_SOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _RPM_TOPDIRS = ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS")
+
+
+def rpm_source_date_epoch(environment: Mapping[str, str] | None = None) -> int:
+    environment = os.environ if environment is None else environment
+    if "SOURCE_DATE_EPOCH" not in environment:
+        return 0
+    return source_date_epoch(environment)
 
 
 def render_spec(version: NativeVersion, source_name: str) -> str:
@@ -168,7 +175,7 @@ def build_rpm(
     tool = shutil.which("rpmbuild")
     if tool is None:
         raise FileNotFoundError("required packaging tool was not found: rpmbuild")
-    epoch = source_date_epoch()
+    epoch = rpm_source_date_epoch()
 
     repo_root = resolved_path(repo_root)
     publish_dir = resolved_path(publish_dir)

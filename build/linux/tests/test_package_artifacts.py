@@ -80,6 +80,21 @@ def make_fake_repo(parent: pathlib.Path) -> pathlib.Path:
     return repo
 
 
+def make_fake_rpm_repo(parent: pathlib.Path) -> pathlib.Path:
+    repo = make_fake_repo(parent)
+    for relative in (
+        "build/linux/package_rpm.py",
+        "build/linux/package_deb.py",
+        "build/linux/stage_payload.py",
+        "build/linux/package_contract.py",
+        "build/linux/object-storage-client.spec",
+    ):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / relative).read_bytes())
+    return repo
+
+
 def deb_output(output_dir: pathlib.Path) -> pathlib.Path:
     return output_dir / "ObjectStorageClient-1.2.3-4-linux-x64.deb"
 
@@ -999,6 +1014,21 @@ def rpm_output(output_dir: pathlib.Path) -> pathlib.Path:
 
 
 class RpmSpecTests(unittest.TestCase):
+    def test_source_date_epoch_defaults_to_zero_and_accepts_ascii_decimals(self):
+        self.assertEqual(0, package_rpm.rpm_source_date_epoch({}))
+        self.assertEqual(
+            0, package_rpm.rpm_source_date_epoch({"SOURCE_DATE_EPOCH": "0"})
+        )
+        self.assertEqual(
+            123, package_rpm.rpm_source_date_epoch({"SOURCE_DATE_EPOCH": "123"})
+        )
+
+    def test_source_date_epoch_rejects_invalid_values(self):
+        for invalid in ("", "-1", "+1", "1.0", "abc", "１２３"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "SOURCE_DATE_EPOCH"):
+                    package_rpm.rpm_source_date_epoch({"SOURCE_DATE_EPOCH": invalid})
+
     def test_render_spec_is_the_exact_complete_body(self):
         rendered = package_rpm.render_spec(
             NativeVersion.parse("1.2.3", 4), "payload.tar.gz"
@@ -1027,7 +1057,7 @@ class RpmSpecTests(unittest.TestCase):
 
 
 class RpmPayloadTarTests(unittest.TestCase):
-    def test_tar_is_deterministic_normalized_sorted_and_preserves_symlinks(self):
+    def test_tar_is_deterministic_normalized_sorted_and_preserves_symlinks_at_default_epoch(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
             root = temporary / "root"
@@ -1047,9 +1077,10 @@ class RpmPayloadTarTests(unittest.TestCase):
             first = temporary / "first.tar.gz"
             second = temporary / "second.tar.gz"
 
-            package_rpm.create_payload_tar(root, first, 123456789)
+            epoch = package_rpm.rpm_source_date_epoch({})
+            package_rpm.create_payload_tar(root, first, epoch)
             os.utime(executable, (1_700_000_000, 1_700_000_000))
-            package_rpm.create_payload_tar(root, second, 123456789)
+            package_rpm.create_payload_tar(root, second, epoch)
 
             self.assertEqual(hashlib.sha256(first.read_bytes()).digest(), hashlib.sha256(second.read_bytes()).digest())
             with tarfile.open(first, "r:gz") as archive:
@@ -1061,7 +1092,7 @@ class RpmPayloadTarTests(unittest.TestCase):
                     self.assertEqual(0, member.gid)
                     self.assertEqual("", member.uname)
                     self.assertEqual("", member.gname)
-                    self.assertEqual(123456789, member.mtime)
+                    self.assertEqual(0, member.mtime)
                 by_name = {member.name: member for member in members}
                 self.assertEqual(0o755, by_name["usr/lib/object-storage-client/app"].mode)
                 self.assertEqual(0o644, by_name["usr/lib/object-storage-client/data"].mode)
@@ -1298,10 +1329,10 @@ class RpmBuildTests(unittest.TestCase):
 
 
 class RpmCliTests(unittest.TestCase):
-    def run_cli(self, *arguments: str, env=None):
+    def run_cli(self, *arguments: str, env=None, repo_root=ROOT):
         return subprocess.run(
-            [sys.executable, str(LINUX / "package_rpm.py"), *arguments],
-            cwd=ROOT, text=True, capture_output=True, check=False, env=env,
+            [sys.executable, str(repo_root / "build/linux/package_rpm.py"), *arguments],
+            cwd=repo_root, text=True, capture_output=True, check=False, env=env,
         )
 
     def test_cli_requires_all_arguments(self):
@@ -1313,8 +1344,9 @@ class RpmCliTests(unittest.TestCase):
     def test_serialized_direct_cli_builds_with_fake_rpmbuild_from_repo_root(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
-            publish = make_publish(temporary)
-            output_dir = temporary / "output"
+            fake_repo = make_fake_rpm_repo(temporary)
+            publish = make_publish(fake_repo)
+            output_dir = fake_repo / "output"
             fake_bin = temporary / "bin"
             fake_bin.mkdir()
             fake = fake_bin / "rpmbuild"
@@ -1332,19 +1364,29 @@ class RpmCliTests(unittest.TestCase):
             env = os.environ.copy()
             env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
             rpm_work = ROOT / "obj/linux-packages/rpm"
+            rpm_work_existed = rpm_work.exists()
+            rpm_work.mkdir(parents=True, exist_ok=True)
+            sentinel = rpm_work / f"test-cli-sentinel-{os.getpid()}"
+            sentinel.write_bytes(b"preserve real RPM work tree")
             try:
                 result = self.run_cli(
                     "--version", "1.2.3", "--release", "4",
                     "--publish-dir", str(publish), "--output-dir", str(output_dir), env=env,
+                    repo_root=fake_repo,
                 )
                 output = rpm_output(output_dir)
                 self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual(f"{output}\n", result.stdout)
                 self.assertEqual(b"cli fake rpm", output.read_bytes())
+                self.assertEqual(b"preserve real RPM work tree", sentinel.read_bytes())
+                self.assertTrue((fake_repo / "obj/linux-packages/rpm").is_dir())
             finally:
-                if rpm_work.exists():
-                    import shutil
-                    shutil.rmtree(rpm_work)
+                sentinel.unlink(missing_ok=True)
+                if not rpm_work_existed:
+                    try:
+                        rpm_work.rmdir()
+                    except OSError:
+                        pass
 
 
 if __name__ == "__main__":
