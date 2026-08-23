@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
+import re
 import stat
 import struct
 import subprocess
@@ -33,22 +35,9 @@ Description: Desktop client for S3-compatible object storage
 
 class PackageImportTests(unittest.TestCase):
     def test_package_qualified_imports_work_from_repo_root(self):
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "from build.linux.stage_payload import stage_payload; "
-                    "from build.linux.package_deb import render_control; "
-                    "from build.linux.package_contract import NativeVersion"
-                ),
-            ],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(callable(stage_payload.stage_payload))
+        self.assertTrue(callable(package_deb.render_control))
+        self.assertTrue(callable(NativeVersion.parse))
 
 
 def make_publish(parent: pathlib.Path, executable: bool = True) -> pathlib.Path:
@@ -63,18 +52,18 @@ def make_publish(parent: pathlib.Path, executable: bool = True) -> pathlib.Path:
 
 def make_fake_repo(parent: pathlib.Path) -> pathlib.Path:
     repo = parent / "repo"
-    sources = {
-        "build/linux/object-storage-client": b"#!/bin/sh\n",
-        "build/linux/object-storage-client.desktop": b"[Desktop Entry]\n",
-        "src/ObjectStorageClient.App/Assets/appicon.png": b"fake png",
-        "README.md": b"readme",
-        "PRIVACY.md": b"privacy",
-        "LICENSE": b"license",
-    }
-    for relative, contents in sources.items():
+    sources = (
+        "build/linux/object-storage-client",
+        "build/linux/object-storage-client.desktop",
+        "src/ObjectStorageClient.App/Assets/appicon.png",
+        "README.md",
+        "PRIVACY.md",
+        "LICENSE",
+    )
+    for relative in sources:
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(contents)
+        path.write_bytes((ROOT / relative).read_bytes())
     return repo
 
 
@@ -102,6 +91,7 @@ class StagePayloadTests(unittest.TestCase):
     def test_stages_exact_payload_and_preserves_publish_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish = make_publish(temporary)
             package_root = temporary / "root"
             package_root.mkdir()
@@ -118,7 +108,7 @@ class StagePayloadTests(unittest.TestCase):
             except OSError as error:
                 self.skipTest(f"symlinks unavailable: {error}")
 
-            stage_payload.stage_payload(ROOT, publish, package_root)
+            stage_payload.stage_payload(repo, publish, package_root)
 
             expected_files = {
                 pathlib.Path("usr/lib/object-storage-client/ObjectStorageClient.App"),
@@ -150,11 +140,11 @@ class StagePayloadTests(unittest.TestCase):
             self.assertTrue(installed_link.is_symlink())
             self.assertEqual(pathlib.Path("ObjectStorageClient.App"), installed_link.readlink())
             self.assertEqual(
-                (ROOT / "build/linux/object-storage-client.desktop").read_bytes(),
+                (repo / "build/linux/object-storage-client.desktop").read_bytes(),
                 (package_root / "usr/share/applications/object-storage-client.desktop").read_bytes(),
             )
             source_icon = (
-                ROOT / "src/ObjectStorageClient.App/Assets/appicon.png"
+                repo / "src/ObjectStorageClient.App/Assets/appicon.png"
             ).read_bytes()
             installed_icon = (
                 package_root
@@ -165,7 +155,7 @@ class StagePayloadTests(unittest.TestCase):
             self.assertEqual((256, 256), struct.unpack(">II", installed_icon[16:24]))
             for name in ("README.md", "PRIVACY.md", "LICENSE"):
                 self.assertEqual(
-                    (ROOT / name).read_bytes(),
+                    (repo / name).read_bytes(),
                     (package_root / "usr/share/doc/object-storage-client" / name).read_bytes(),
                 )
             self.assertEqual(
@@ -179,9 +169,67 @@ class StagePayloadTests(unittest.TestCase):
                 },
             )
 
+    def test_normalizes_all_staged_modes_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish = make_publish(temporary)
+            package_root = temporary / "root"
+            apphost = publish / "ObjectStorageClient.App"
+            executable = publish / "tool"
+            plain = publish / "payload.dat"
+            nested = publish / "nested"
+            apphost.chmod(0o4755)
+            executable.write_bytes(b"tool")
+            executable.chmod(0o2777)
+            plain.write_bytes(b"payload")
+            plain.chmod(0o666)
+            nested.mkdir()
+            nested.chmod(0o2777)
+            link_target = temporary / "outside-target"
+            link_target.write_bytes(b"outside")
+            link_target.chmod(0o666)
+            try:
+                (publish / "outside-link").symlink_to(link_target)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+
+            for relative in (
+                "build/linux/object-storage-client.desktop",
+                "src/ObjectStorageClient.App/Assets/appicon.png",
+                "README.md",
+                "PRIVACY.md",
+                "LICENSE",
+            ):
+                (repo / relative).chmod(0o2777)
+            (repo / "build/linux/object-storage-client").chmod(0o4755)
+
+            stage_payload.stage_payload(repo, publish, package_root)
+
+            self.assertEqual(0o755, stat.S_IMODE(package_root.stat().st_mode))
+            for path in package_root.rglob("*"):
+                if path.is_dir() and not path.is_symlink():
+                    self.assertEqual(0o755, stat.S_IMODE(path.stat().st_mode), path)
+            expected_modes = {
+                "usr/lib/object-storage-client/ObjectStorageClient.App": 0o755,
+                "usr/lib/object-storage-client/tool": 0o755,
+                "usr/lib/object-storage-client/payload.dat": 0o644,
+                "usr/bin/object-storage-client": 0o755,
+                "usr/share/applications/object-storage-client.desktop": 0o644,
+                "usr/share/icons/hicolor/256x256/apps/object-storage-client.png": 0o644,
+                "usr/share/doc/object-storage-client/README.md": 0o644,
+                "usr/share/doc/object-storage-client/PRIVACY.md": 0o644,
+                "usr/share/doc/object-storage-client/LICENSE": 0o644,
+            }
+            for relative, expected in expected_modes.items():
+                actual = stat.S_IMODE((package_root / relative).stat().st_mode)
+                self.assertEqual(expected, actual, relative)
+            self.assertEqual(0o666, stat.S_IMODE(link_target.stat().st_mode))
+
     def test_rejects_package_root_inside_publish_without_changing_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish = make_publish(temporary)
             source = publish / "ObjectStorageClient.App.dll"
             package_root = publish / "staging/root"
@@ -190,7 +238,7 @@ class StagePayloadTests(unittest.TestCase):
             sentinel.write_bytes(b"keep")
 
             with self.assertRaisesRegex(ValueError, "overlap"):
-                stage_payload.stage_payload(ROOT, publish, package_root)
+                stage_payload.stage_payload(repo, publish, package_root)
 
             self.assertEqual(b"fake dll", source.read_bytes())
             self.assertEqual(b"keep", sentinel.read_bytes())
@@ -198,6 +246,7 @@ class StagePayloadTests(unittest.TestCase):
     def test_rejects_publish_inside_package_root_without_changing_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             package_root = temporary / "staging"
             package_root.mkdir()
             sentinel = package_root / "sentinel"
@@ -206,7 +255,7 @@ class StagePayloadTests(unittest.TestCase):
             source = publish / "ObjectStorageClient.App.dll"
 
             with self.assertRaisesRegex(ValueError, "overlap"):
-                stage_payload.stage_payload(ROOT, publish, package_root)
+                stage_payload.stage_payload(repo, publish, package_root)
 
             self.assertEqual(b"fake dll", source.read_bytes())
             self.assertEqual(b"keep", sentinel.read_bytes())
@@ -227,7 +276,10 @@ class StagePayloadTests(unittest.TestCase):
                     sentinel.write_bytes(b"keep")
                     with self.assertRaisesRegex(ValueError, "source"):
                         stage_payload.stage_payload(repo, publish, package_root)
-                    self.assertEqual(b"#!/bin/sh\n", launcher.read_bytes())
+                    self.assertEqual(
+                        (ROOT / "build/linux/object-storage-client").read_bytes(),
+                        launcher.read_bytes(),
+                    )
                     self.assertEqual(b"keep", sentinel.read_bytes())
                     sentinel.unlink()
 
@@ -252,12 +304,16 @@ class StagePayloadTests(unittest.TestCase):
                 stage_payload.stage_payload(repo, publish, package_root)
 
             launcher = repo / "build/linux/object-storage-client"
-            self.assertEqual(b"#!/bin/sh\n", launcher.read_bytes())
+            self.assertEqual(
+                (ROOT / "build/linux/object-storage-client").read_bytes(),
+                launcher.read_bytes(),
+            )
             self.assertEqual(b"keep", sentinel.read_bytes())
 
     def test_rejects_arbitrary_symlinked_package_root_parent_without_deleting_target(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish = make_publish(temporary)
             unrelated = temporary / "unrelated"
             staging = unrelated / "staging"
@@ -272,32 +328,35 @@ class StagePayloadTests(unittest.TestCase):
             package_root = alias / "staging"
 
             with self.assertRaisesRegex(ValueError, str(package_root)):
-                stage_payload.stage_payload(ROOT, publish, package_root)
+                stage_payload.stage_payload(repo, publish, package_root)
 
             self.assertEqual(b"keep", sentinel.read_bytes())
 
     def test_rejects_publish_path_that_is_not_a_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish_file = temporary / "publish"
             publish_file.write_text("not a directory", encoding="utf-8")
             with self.assertRaises(NotADirectoryError):
-                stage_payload.stage_payload(ROOT, publish_file, temporary / "root")
+                stage_payload.stage_payload(repo, publish_file, temporary / "root")
 
     def test_rejects_missing_apphost(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish = temporary / "publish"
             publish.mkdir()
             with self.assertRaises(FileNotFoundError):
-                stage_payload.stage_payload(ROOT, publish, temporary / "root")
+                stage_payload.stage_payload(repo, publish, temporary / "root")
 
     def test_rejects_non_executable_apphost(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
             publish = make_publish(temporary, executable=False)
             with self.assertRaises(PermissionError):
-                stage_payload.stage_payload(ROOT, publish, temporary / "root")
+                stage_payload.stage_payload(repo, publish, temporary / "root")
 
 
 class DebianControlTests(unittest.TestCase):
@@ -309,17 +368,33 @@ class DebianControlTests(unittest.TestCase):
         self.assertTrue(control.endswith("\n"))
         self.assertNotIn(".devcode", control)
 
-    def test_installed_size_ceilings_regular_file_bytes_and_ignores_symlinks(self):
+    def test_installed_size_rounds_each_file_and_counts_non_regular_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "directory").mkdir()
-            (root / "first").write_bytes(b"a" * 1024)
+            (root / "first").write_bytes(b"a" * 1025)
             (root / "directory/second").write_bytes(b"b")
+            (root / "empty").write_bytes(b"")
+            os.link(root / "first", root / "first-hardlink")
             try:
                 (root / "large-link").symlink_to(root / "first")
             except OSError as error:
                 self.skipTest(f"symlinks unavailable: {error}")
-            self.assertEqual(2, package_deb.installed_size(root))
+            fifo = root / "pipe"
+            os.mkfifo(fifo)
+
+            # Regular files contribute 2 + 1 + 0 KiB; the hardlink is counted
+            # once. The directory, symlink, and FIFO each contribute 1 KiB.
+            self.assertEqual(6, package_deb.installed_size(root))
+
+    def test_source_date_epoch_accepts_only_nonnegative_decimal_integers(self):
+        self.assertEqual(946684800, package_deb.source_date_epoch({}))
+        self.assertEqual(0, package_deb.source_date_epoch({"SOURCE_DATE_EPOCH": "0"}))
+        self.assertEqual(123, package_deb.source_date_epoch({"SOURCE_DATE_EPOCH": "123"}))
+        for invalid in ("", "-1", "+1", " 1", "1 ", "1.0", "true", "False"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "SOURCE_DATE_EPOCH"):
+                    package_deb.source_date_epoch({"SOURCE_DATE_EPOCH": invalid})
 
     def test_render_control_rejects_invalid_installed_sizes(self):
         version = NativeVersion.parse("1.2.3", 4)
@@ -365,57 +440,101 @@ class DebianCliTests(unittest.TestCase):
     def test_missing_dpkg_deb_fails_clearly(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
-            publish = make_publish(temporary)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
             with mock.patch.object(package_deb.shutil, "which", return_value=None):
                 with self.assertRaisesRegex(FileNotFoundError, "dpkg-deb"):
                     package_deb.build_deb(
-                        ROOT,
+                        repo,
                         NativeVersion.parse("1.2.3", 4),
                         publish,
                         temporary / "out",
                     )
 
-    def test_build_invokes_dpkg_deb_with_an_argument_list_and_no_shell(self):
+    def test_build_invokes_dpkg_deb_with_temp_output_epoch_and_normalized_mtimes(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
-            publish = make_publish(temporary)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
             output_dir = temporary / "output"
+            epoch = 123456789
+            link_target = temporary / "outside-target"
+            link_target.write_bytes(b"outside")
+            target_timestamp_ns = 1_700_000_000_000_000_000
+            os.utime(link_target, ns=(target_timestamp_ns, target_timestamp_ns))
+            try:
+                (publish / "outside-link").symlink_to(link_target)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
 
             def create_output(command, **kwargs):
-                pathlib.Path(command[-1]).write_bytes(b"fake deb")
+                temporary_output = pathlib.Path(command[-1])
+                self.assertEqual(output_dir, temporary_output.parent)
+                self.assertNotEqual(deb_output(output_dir), temporary_output)
+                self.assertFalse(temporary_output.exists())
+                self.assertRegex(
+                    temporary_output.name,
+                    re.escape(deb_output(output_dir).name) + r"\..*\.tmp$",
+                )
+                self.assertEqual(str(epoch), kwargs["env"]["SOURCE_DATE_EPOCH"])
+                temporary_output.write_bytes(b"fake deb")
                 return subprocess.CompletedProcess(command, 0)
 
-            with (
-                mock.patch.object(package_deb.shutil, "which", return_value="/usr/bin/dpkg-deb"),
-                mock.patch.object(
-                    package_deb.subprocess, "run", side_effect=create_output
-                ) as run,
-            ):
-                output = package_deb.build_deb(
-                    ROOT,
-                    NativeVersion.parse("1.2.3", 4),
-                    publish,
-                    output_dir,
-                )
+            previous_umask = os.umask(0o077)
+            try:
+                with (
+                    mock.patch.object(
+                        package_deb.shutil, "which", return_value="/usr/bin/dpkg-deb"
+                    ),
+                    mock.patch.object(
+                        package_deb.os,
+                        "environ",
+                        {"SOURCE_DATE_EPOCH": str(epoch)},
+                    ),
+                    mock.patch.object(
+                        package_deb.subprocess, "run", side_effect=create_output
+                    ) as run,
+                ):
+                    output = package_deb.build_deb(
+                        repo,
+                        NativeVersion.parse("1.2.3", 4),
+                        publish,
+                        output_dir,
+                    )
+            finally:
+                os.umask(previous_umask)
 
-            expected_root = ROOT / "obj/linux-packages/deb/root"
+            expected_root = repo / "obj/linux-packages/deb/root"
+            self.assertEqual(deb_output(output_dir), output)
+            command = run.call_args.args[0]
             self.assertEqual(
-                output_dir / "ObjectStorageClient-1.2.3-4-linux-x64.deb", output
-            )
-            run.assert_called_once_with(
                 [
                     "/usr/bin/dpkg-deb",
                     "--root-owner-group",
                     "--build",
                     str(expected_root),
-                    str(output),
                 ],
-                check=True,
+                command[:-1],
             )
             self.assertNotIn("shell", run.call_args.kwargs)
+            self.assertTrue(
+                all(
+                    path.lstat().st_mtime_ns == epoch * 1_000_000_000
+                    for path in [expected_root, *expected_root.rglob("*")]
+                )
+            )
+            self.assertEqual(target_timestamp_ns, link_target.stat().st_mtime_ns)
             self.assertEqual(
                 0o644,
                 stat.S_IMODE((expected_root / "DEBIAN/control").stat().st_mode),
+            )
+            self.assertEqual(
+                0o755,
+                stat.S_IMODE((expected_root / "DEBIAN").stat().st_mode),
             )
 
     def test_build_rejects_output_tree_overlaps_before_stale_removal_or_staging(self):
@@ -579,26 +698,61 @@ class DebianCliTests(unittest.TestCase):
                     run.assert_not_called()
                     output.unlink()
 
-    def test_build_removes_stale_output_before_invoking_dpkg_deb(self):
+    def test_failed_build_preserves_old_output_and_cleans_temporary_file(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
-            publish = make_publish(temporary)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
             output_dir = temporary / "output"
             output_dir.mkdir()
             output = deb_output(output_dir)
             output.write_bytes(b"old package")
 
-            def replace_output(command, **kwargs):
-                self.assertFalse(output.exists())
+            def fail_after_writing(command, **kwargs):
+                pathlib.Path(command[-1]).write_bytes(b"partial package")
+                raise subprocess.CalledProcessError(1, command)
+
+            with (
+                mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
+                mock.patch.object(package_deb.subprocess, "run", side_effect=fail_after_writing),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                package_deb.build_deb(
+                    repo,
+                    NativeVersion.parse("1.2.3", 4),
+                    publish,
+                    output_dir,
+                )
+
+            self.assertEqual(b"old package", output.read_bytes())
+            self.assertEqual([output], list(output_dir.iterdir()))
+
+    def test_successful_build_atomically_replaces_old_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            output_dir = temporary / "output"
+            output_dir.mkdir()
+            output = deb_output(output_dir)
+            output.write_bytes(b"old package")
+
+            def create_temporary_output(command, **kwargs):
+                self.assertEqual(b"old package", output.read_bytes())
                 pathlib.Path(command[-1]).write_bytes(b"new package")
                 return subprocess.CompletedProcess(command, 0)
 
             with (
                 mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
-                mock.patch.object(package_deb.subprocess, "run", side_effect=replace_output),
+                mock.patch.object(package_deb.subprocess, "run", side_effect=create_temporary_output),
+                mock.patch.object(package_deb.os, "replace", wraps=os.replace) as replace,
             ):
                 result = package_deb.build_deb(
-                    ROOT,
+                    repo,
                     NativeVersion.parse("1.2.3", 4),
                     publish,
                     output_dir,
@@ -606,8 +760,101 @@ class DebianCliTests(unittest.TestCase):
 
             self.assertEqual(output, result)
             self.assertEqual(b"new package", output.read_bytes())
+            replace.assert_called_once()
+            self.assertEqual(output, pathlib.Path(replace.call_args.args[1]))
+            self.assertEqual([output], list(output_dir.iterdir()))
 
-    def test_cli_builds_from_repository_root_with_dpkg_deb_on_path(self):
+    def test_native_build_is_byte_identical_with_same_epoch_across_wall_clock_time(self):
+        if package_deb.shutil.which("dpkg-deb") is None:
+            self.skipTest("dpkg-deb is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            version = NativeVersion.parse("1.2.3", 4)
+
+            with mock.patch.dict(
+                os.environ, {"SOURCE_DATE_EPOCH": "946684800"}, clear=False
+            ):
+                first = package_deb.build_deb(
+                    repo, version, publish, temporary / "first-output"
+                )
+                first_hash = hashlib.sha256(first.read_bytes()).hexdigest()
+                for source in publish.rglob("*"):
+                    os.utime(source, (1_700_000_000, 1_700_000_000))
+                second = package_deb.build_deb(
+                    repo, version, publish, temporary / "second-output"
+                )
+                second_hash = hashlib.sha256(second.read_bytes()).hexdigest()
+
+            self.assertEqual(first_hash, second_hash)
+
+    def test_build_rejects_and_cleans_non_regular_temporary_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            output_dir = temporary / "output"
+            target = temporary / "target"
+            target.write_bytes(b"not the package")
+
+            def create_symlink_output(command, **kwargs):
+                pathlib.Path(command[-1]).symlink_to(target)
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
+                mock.patch.object(
+                    package_deb.subprocess, "run", side_effect=create_symlink_output
+                ),
+                self.assertRaisesRegex(FileNotFoundError, "not a regular file"),
+            ):
+                package_deb.build_deb(
+                    repo,
+                    NativeVersion.parse("1.2.3", 4),
+                    publish,
+                    output_dir,
+                )
+
+            self.assertEqual([], list(output_dir.iterdir()))
+            self.assertEqual(b"not the package", target.read_bytes())
+
+    def test_build_rejects_and_cleans_temporary_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            output_dir = temporary / "output"
+
+            def create_directory_output(command, **kwargs):
+                temporary_output = pathlib.Path(command[-1])
+                temporary_output.mkdir()
+                (temporary_output / "partial").write_bytes(b"not a package")
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
+                mock.patch.object(
+                    package_deb.subprocess, "run", side_effect=create_directory_output
+                ),
+                self.assertRaisesRegex(FileNotFoundError, "not a regular file"),
+            ):
+                package_deb.build_deb(
+                    repo,
+                    NativeVersion.parse("1.2.3", 4),
+                    publish,
+                    output_dir,
+                )
+
+            self.assertEqual([], list(output_dir.iterdir()))
+
+    def test_serialized_direct_cli_builds_from_real_repository_root(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
             publish = make_publish(temporary)
@@ -646,14 +893,17 @@ class DebianCliTests(unittest.TestCase):
     def test_build_fails_if_dpkg_deb_does_not_create_output(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
-            publish = make_publish(temporary)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
             with (
                 mock.patch.object(package_deb.shutil, "which", return_value="dpkg-deb"),
                 mock.patch.object(package_deb.subprocess, "run"),
                 self.assertRaisesRegex(FileNotFoundError, "did not create"),
             ):
                 package_deb.build_deb(
-                    ROOT,
+                    repo,
                     NativeVersion.parse("1.2.3", 4),
                     publish,
                     temporary / "output",

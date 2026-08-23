@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
 import sys
-from typing import Sequence
+import tempfile
+from typing import Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if __package__:
@@ -21,15 +23,57 @@ else:
 REPO_ROOT = SCRIPT_DIR.parents[1]
 MAINTAINER = "Devcode <129266150+devcode-kr@users.noreply.github.com>"
 HOMEPAGE = "https://github.com/devcode-kr/object-storage-client"
+DEFAULT_SOURCE_DATE_EPOCH = 946684800  # 2000-01-01 UTC; accepted by dpkg-deb/tar.
 
 
 def installed_size(package_root: Path) -> int:
-    total_bytes = 0
+    total_kib = 0
+    regular_inodes: set[tuple[int, int]] = set()
     for path in Path(package_root).rglob("*"):
         metadata = path.lstat()
         if stat.S_ISREG(metadata.st_mode):
-            total_bytes += metadata.st_size
-    return (total_bytes + 1023) // 1024
+            inode = (metadata.st_dev, metadata.st_ino)
+            if inode in regular_inodes:
+                continue
+            regular_inodes.add(inode)
+            # Debian Installed-Size rounds each regular file independently;
+            # an empty regular file therefore contributes zero KiB.
+            total_kib += (metadata.st_size + 1023) // 1024
+        else:
+            # Installed directories, symlinks, and other filesystem objects
+            # use the one-KiB policy interpretation required by this package.
+            total_kib += 1
+    return total_kib
+
+
+def source_date_epoch(environment: Mapping[str, str] | None = None) -> int:
+    value = (os.environ if environment is None else environment).get("SOURCE_DATE_EPOCH")
+    if value is None:
+        return DEFAULT_SOURCE_DATE_EPOCH
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("SOURCE_DATE_EPOCH must be a non-negative decimal integer")
+    return int(value)
+
+
+def _normalize_mtimes(package_root: Path, epoch: int) -> None:
+    timestamp_ns = epoch * 1_000_000_000
+    for path in (*package_root.rglob("*"), package_root):
+        os.utime(
+            path,
+            ns=(timestamp_ns, timestamp_ns),
+            follow_symlinks=False,
+        )
+
+
+def _remove_temporary_output(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 def render_control(version: NativeVersion, installed_size_kib: int) -> str:
@@ -64,6 +108,7 @@ def build_deb(
     tool = shutil.which("dpkg-deb")
     if tool is None:
         raise FileNotFoundError("required packaging tool was not found: dpkg-deb")
+    epoch = source_date_epoch()
 
     repo_root = resolved_path(repo_root)
     publish_dir = resolved_path(publish_dir)
@@ -89,26 +134,49 @@ def build_deb(
     stage_payload(repo_root, publish_dir, package_root)
     control_dir = package_root / "DEBIAN"
     control_dir.mkdir(parents=True)
+    control_dir.chmod(0o755)
     control = control_dir / "control"
     control.write_text(
         render_control(version, installed_size(package_root)), encoding="utf-8"
     )
     control.chmod(0o644)
 
+    _normalize_mtimes(package_root, epoch)
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    output.unlink(missing_ok=True)
-    subprocess.run(
-        [
-            tool,
-            "--root-owner-group",
-            "--build",
-            str(package_root),
-            str(output),
-        ],
-        check=True,
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{output.name}.", suffix=".tmp", dir=output_dir
     )
-    if not output.is_file():
-        raise FileNotFoundError(f"dpkg-deb did not create expected output: {output}")
+    os.close(descriptor)
+    temporary_output = Path(temporary_name)
+    temporary_output.unlink()
+    environment = os.environ.copy()
+    environment["SOURCE_DATE_EPOCH"] = str(epoch)
+    try:
+        subprocess.run(
+            [
+                tool,
+                "--root-owner-group",
+                "--build",
+                str(package_root),
+                str(temporary_output),
+            ],
+            check=True,
+            env=environment,
+        )
+        try:
+            metadata = temporary_output.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"dpkg-deb did not create expected output: {temporary_output}"
+            ) from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FileNotFoundError(
+                f"dpkg-deb output is not a regular file: {temporary_output}"
+            )
+        os.replace(temporary_output, output)
+    finally:
+        _remove_temporary_output(temporary_output)
     return output
 
 

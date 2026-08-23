@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+import os
 import shutil
 import stat
 
@@ -56,6 +57,19 @@ def _destination(package_root: Path, installed_path: str) -> Path:
     if not posix_path.is_absolute() or ".." in posix_path.parts:
         raise ValueError(f"unsafe package destination: {installed_path!r}")
     return package_root.joinpath(*posix_path.parts[1:])
+
+
+def _normalize_staged_modes(package_root: Path) -> None:
+    """Apply publish-safe modes without following staged symlinks."""
+    for path in (package_root, *package_root.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            os.chmod(path, 0o755, follow_symlinks=False)
+        elif stat.S_ISREG(metadata.st_mode):
+            executable = metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            os.chmod(path, 0o755 if executable else 0o644, follow_symlinks=False)
 
 
 def stage_payload(repo_root: Path, publish_dir: Path, package_root: Path) -> None:
@@ -124,3 +138,10 @@ def stage_payload(repo_root: Path, publish_dir: Path, package_root: Path) -> Non
     doc_destination.mkdir(parents=True, exist_ok=True)
     for document in documents:
         shutil.copy2(document, doc_destination / document.name)
+
+    _normalize_staged_modes(package_root)
+    _destination(package_root, LAUNCHER_PATH).chmod(0o755)
+    for installed_path in (DESKTOP_PATH, ICON_PATH):
+        _destination(package_root, installed_path).chmod(0o644)
+    for document in documents:
+        (doc_destination / document.name).chmod(0o644)
