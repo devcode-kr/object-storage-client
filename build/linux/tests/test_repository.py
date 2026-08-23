@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
 import gzip
 import hashlib
 import html
+import io
 import os
 import pathlib
 import shutil
@@ -1989,8 +1991,8 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual([], list(site.glob(".index.html.*")))
 
             with mock.patch.object(
-                repository_module,
-                "_fsync_directories",
+                repository_module.os,
+                "fsync",
                 side_effect=OSError("injected fsync failure"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "publish.*index"):
@@ -1998,11 +2000,153 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(b"old page\n", destination.read_bytes())
             self.assertEqual([], list(site.glob(".index.html.*")))
 
+            real_fsync = os.fsync
+            failed_directory_fsync = False
+
+            def fail_first_directory_fsync(descriptor):
+                nonlocal failed_directory_fsync
+                if (
+                    not failed_directory_fsync
+                    and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                ):
+                    failed_directory_fsync = True
+                    raise OSError("injected post-replace fsync failure")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                repository_module.os, "fsync", side_effect=fail_first_directory_fsync
+            ):
+                with self.assertRaisesRegex(RuntimeError, "publish.*index"):
+                    repository_module._publish_site_index(site, source)
+            self.assertTrue(failed_directory_fsync)
+            self.assertEqual(b"old page\n", destination.read_bytes())
+            self.assertEqual([], list(site.glob(".index.html.*")))
+
+    def test_site_index_source_parent_swap_never_publishes_attacker_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source_parent = root / "source"
+            original_parent = root / "source-original"
+            attacker_parent = root / "attacker-source"
+            site = root / "site"
+            source_parent.mkdir()
+            attacker_parent.mkdir()
+            site.mkdir()
+            source = source_parent / "pages-index.html"
+            source.write_bytes(b"trusted page\n")
+            (attacker_parent / source.name).write_bytes(b"attacker page\n")
+            real_open = os.open
+            swapped = False
+
+            def swap_parent_before_source_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped and os.fspath(path) in {os.fspath(source), source.name}:
+                    source_parent.rename(original_parent)
+                    source_parent.symlink_to(attacker_parent, target_is_directory=True)
+                    swapped = True
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(repository_module.os, "open", side_effect=swap_parent_before_source_open):
+                try:
+                    repository_module._publish_site_index(site, source)
+                except (RuntimeError, OSError):
+                    pass
+
+            self.assertTrue(swapped)
+            destination = site / "index.html"
+            if destination.exists():
+                self.assertEqual(b"trusted page\n", destination.read_bytes())
+            self.assertEqual([], [path.name for path in site.iterdir() if path.name != "index.html"])
+
+    def test_site_index_destination_parent_swap_never_publishes_to_attacker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            original_site = root / "site-original"
+            attacker_site = root / "attacker-site"
+            site.mkdir()
+            attacker_site.mkdir()
+            source = root / "pages-index.html"
+            source.write_bytes(b"trusted page\n")
+            real_replace = os.replace
+            swapped = False
+
+            def swap_site_before_replace(source_name, destination_name, *, src_dir_fd=None, dst_dir_fd=None):
+                nonlocal swapped
+                if not swapped and os.fspath(destination_name).endswith("index.html"):
+                    site.rename(original_site)
+                    site.symlink_to(attacker_site, target_is_directory=True)
+                    swapped = True
+                return real_replace(
+                    source_name, destination_name,
+                    src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                )
+
+            with mock.patch.object(repository_module.os, "replace", side_effect=swap_site_before_replace):
+                try:
+                    repository_module._publish_site_index(site, source)
+                except (RuntimeError, OSError):
+                    pass
+
+            self.assertTrue(swapped)
+            self.assertFalse((attacker_site / "index.html").exists())
+            if (original_site / "index.html").exists():
+                self.assertEqual(b"trusted page\n", (original_site / "index.html").read_bytes())
+            self.assertEqual([], list(attacker_site.iterdir()))
+            self.assertEqual([], [path.name for path in original_site.iterdir() if path.name != "index.html"])
+
+    def test_main_runtime_failures_return_one_with_only_generic_diagnostic(self):
+        root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        secret = "correct horse battery staple"
+        fingerprint = "A" * 40
+        arguments = [
+            "--site-dir", os.fspath(root / "secret-site"),
+            "--deb", os.fspath(root / "secret-input.deb"),
+            "--rpm", os.fspath(root / "secret-input.rpm"),
+            "--public-key", os.fspath(root / "secret-public.asc"),
+            "--expected-fingerprint", fingerprint,
+            "--private-key", os.fspath(root / "secret-private.asc"),
+            "--passphrase-file", secret,
+        ]
+        cases = (
+            ("build_apt_repository", "APT repository build failed\n"),
+            ("build_rpm_repository", "RPM repository build failed\n"),
+            ("_publish_site_index", "site index publication failed\n"),
+        )
+        for failing_name, expected in cases:
+            for error_type in (RuntimeError, ValueError, OSError):
+                with self.subTest(failing_name=failing_name, error_type=error_type):
+                    stderr = io.StringIO()
+                    error = error_type(f"leaked {root} {secret} {fingerprint}")
+                    with contextlib.ExitStack() as stack:
+                        for name in ("build_apt_repository", "build_rpm_repository", "_publish_site_index"):
+                            stack.enter_context(mock.patch.object(
+                                repository_module, name,
+                                side_effect=error if name == failing_name else None,
+                            ))
+                        stack.enter_context(contextlib.redirect_stderr(stderr))
+                        self.assertEqual(1, repository_module.main(arguments))
+                    diagnostic = stderr.getvalue()
+                    self.assertEqual(expected, diagnostic)
+                    self.assertNotIn("usage:", diagnostic.lower())
+                    self.assertNotIn(os.fspath(root), diagnostic)
+                    self.assertNotIn(secret, diagnostic)
+                    self.assertNotIn(fingerprint, diagnostic)
+
+    def test_main_argparse_syntax_error_remains_exit_two(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            repository_module.main([])
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("usage:", stderr.getvalue().lower())
+
     def _run_repository_cli(
         self,
         root: pathlib.Path,
         *,
         fail_rpm: bool = False,
+        script: pathlib.Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path, pathlib.Path, pathlib.Path]:
         tools = root / "tools"
         _fake_apt_ftparchive(tools)
@@ -2019,7 +2163,7 @@ class RepositoryTests(unittest.TestCase):
             environment["OSC_RPM_METADATA_FAIL"] = "1"
         arguments = [
             sys.executable,
-            os.fspath(LINUX / "repository.py"),
+            os.fspath(script or (LINUX / "repository.py")),
             "--site-dir", os.fspath(site),
             "--deb", os.fspath(deb),
             "--rpm", os.fspath(rpm),
@@ -2042,7 +2186,7 @@ class RepositoryTests(unittest.TestCase):
         )
         return result, site, deb, rpm
 
-    def test_package_import_is_quiet_and_direct_script_help_works_when_copied(self):
+    def test_package_import_is_quiet_and_copied_script_runs_full_cli(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             before = set(root.iterdir())
@@ -2075,6 +2219,15 @@ class RepositoryTests(unittest.TestCase):
                     self.assertEqual(0, helped.returncode, helped.stderr)
                     self.assertIn("--site-dir", helped.stdout)
                     self.assertEqual("", helped.stderr)
+
+            copied_result, copied_site, _, _ = self._run_repository_cli(
+                root, script=root / "repository.py"
+            )
+            self.assertEqual(0, copied_result.returncode, copied_result.stderr)
+            self.assertEqual(
+                (root / "pages-index.html").read_bytes(),
+                (copied_site / "index.html").read_bytes(),
+            )
 
     def test_direct_cli_builds_complete_signed_apt_and_rpm_site_then_publishes_index(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2134,7 +2287,8 @@ class RepositoryTests(unittest.TestCase):
             old_index = b"previous committed index\n"
             (site / "index.html").write_bytes(old_index)
             result, site, deb, rpm = self._run_repository_cli(root, fail_rpm=True)
-            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual("RPM repository build failed\n", result.stderr)
             self.assertEqual(old_index, (site / "index.html").read_bytes())
             self.assertTrue((site / f"apt/pool/main/o/object-storage-client/{deb.name}").is_file())
             self.assertTrue((site / "apt/dists/stable/InRelease").is_file())
@@ -2143,6 +2297,9 @@ class RepositoryTests(unittest.TestCase):
             self.assertNotIn(self.passphrase_file.read_text().strip(), result.stdout + result.stderr)
             self.assertNotIn(self.throwaway_fingerprint, result.stdout + result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+            self.assertNotIn("usage:", result.stderr.lower())
+            for supplied_path in (site, deb, rpm, self.public_key, self.secret_key, self.passphrase_file):
+                self.assertNotIn(os.fspath(supplied_path), result.stderr)
 
     def test_pages_index_is_static_safe_and_complete(self):
         page = (LINUX / "pages-index.html").read_text(encoding="utf-8")

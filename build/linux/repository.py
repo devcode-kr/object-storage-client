@@ -15,7 +15,9 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 
 _DEFAULT_BASE_URL = "https://devcode-kr.github.io/object-storage-client"
@@ -1502,36 +1504,179 @@ def _build_apt_repository_locked(
     return paths
 
 
+def _open_path_nofollow(
+    path: pathlib.Path,
+    *,
+    final_flags: int,
+    final_kind: str,
+) -> int:
+    """Open path components without ever re-resolving an opened parent."""
+    if not os.fspath(path) or ".." in path.parts:
+        raise ValueError("path must not be empty or contain parent-directory components")
+    absolute = path.is_absolute()
+    components = path.parts[1:] if absolute else path.parts
+    if not components:
+        raise ValueError("path must name an entry below a filesystem root")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path.anchor if absolute else ".", directory_flags)
+    try:
+        for component in components[:-1]:
+            child = os.open(component, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        opened = os.open(
+            components[-1],
+            final_flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=descriptor,
+        )
+    finally:
+        os.close(descriptor)
+    try:
+        metadata = os.fstat(opened)
+    except BaseException:
+        os.close(opened)
+        raise
+    expected = stat.S_ISREG if final_kind == "regular" else stat.S_ISDIR
+    if not expected(metadata.st_mode):
+        os.close(opened)
+        raise RuntimeError(f"path must name a non-symlink {final_kind} file")
+    return opened
+
+
+def _unlink_index_name(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _copy_index_source(source_fd: int, destination_fd: int) -> None:
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    while True:
+        block = os.read(source_fd, 1024 * 1024)
+        if not block:
+            break
+        view = memoryview(block)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise OSError("short write while publishing site index")
+            view = view[written:]
+    os.fchmod(destination_fd, 0o644)
+    os.fsync(destination_fd)
+
+
+def _publish_index_at(site_fd: int, source_fd: int) -> None:
+    index_name = "index.html"
+    token = uuid.uuid4().hex
+    temporary_name = f".index.html.tmp-{token}"
+    backup_name = f".index.html.backup-{token}"
+    temporary_fd: int | None = None
+    backup_exists = False
+    old_index_exists = False
+    replaced = False
+    try:
+        try:
+            old_metadata = os.stat(index_name, dir_fd=site_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(old_metadata.st_mode):
+                raise RuntimeError("existing site index must be a regular non-symlink file")
+            old_index_exists = True
+            os.link(
+                index_name,
+                backup_name,
+                src_dir_fd=site_fd,
+                dst_dir_fd=site_fd,
+                follow_symlinks=False,
+            )
+            backup_exists = True
+
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=site_fd,
+        )
+        _copy_index_source(source_fd, temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            index_name,
+            src_dir_fd=site_fd,
+            dst_dir_fd=site_fd,
+        )
+        replaced = True
+        os.fsync(site_fd)
+        metadata = os.stat(index_name, dir_fd=site_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o644:
+            raise RuntimeError("published site index must be a regular non-symlink 0644 file")
+        if backup_exists:
+            os.unlink(backup_name, dir_fd=site_fd)
+            backup_exists = False
+    except BaseException:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+            temporary_fd = None
+        if replaced:
+            if old_index_exists and backup_exists:
+                os.replace(
+                    backup_name,
+                    index_name,
+                    src_dir_fd=site_fd,
+                    dst_dir_fd=site_fd,
+                )
+                backup_exists = False
+            elif not old_index_exists:
+                _unlink_index_name(site_fd, index_name)
+            os.fsync(site_fd)
+        raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        _unlink_index_name(site_fd, temporary_name)
+        if backup_exists:
+            _unlink_index_name(site_fd, backup_name)
+
+
 def _publish_site_index(
     site_dir: os.PathLike[str] | str,
     source_page: os.PathLike[str] | str,
 ) -> pathlib.Path:
     site = _path(site_dir)
     source = pathlib.Path(source_page)
-    _require_regular_file(source, "site index source")
-    _reject_symlink_components(source, "site index source")
-    _reject_symlink_components(site, "site repository")
     destination = site / "index.html"
-
-    with _exclusive_site_lock(site):
-        _mkdir_mode(site)
-        with tempfile.TemporaryDirectory(prefix="osc-site-index-") as temporary:
-            snapshot = pathlib.Path(temporary) / "index.html"
-            _snapshot_regular_file(
-                source, snapshot, "site index source", mode=0o644
-            )
+    try:
+        source_fd = _open_path_nofollow(
+            source, final_flags=os.O_RDONLY, final_kind="regular"
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError("could not safely open non-symlink site index source") from error
+    try:
+        with _exclusive_site_lock(site):
             try:
-                _publish_metadata(((snapshot, destination),))
-            except (RuntimeError, OSError) as error:
-                raise RuntimeError(
-                    f"could not publish site index: {destination}"
-                ) from error
-
-        metadata = destination.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError("published site index must be a regular non-symlink file")
-        if stat.S_IMODE(metadata.st_mode) != 0o644:
-            raise RuntimeError("published site index must have mode 0644")
+                site_fd = _open_path_nofollow(
+                    site,
+                    final_flags=os.O_RDONLY | os.O_DIRECTORY,
+                    final_kind="directory",
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise RuntimeError("could not safely open site repository") from error
+            try:
+                _publish_index_at(site_fd, source_fd)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise RuntimeError("could not publish site index") from error
+            finally:
+                os.close(site_fd)
+    finally:
+        os.close(source_fd)
     return destination
 
 
@@ -1571,16 +1716,19 @@ def main(argv: list[str] | None = None) -> int:
             **common,
         )
     except (RuntimeError, ValueError, OSError):
-        parser.error(f"APT repository build failed for {options.site_dir}")
+        print("APT repository build failed", file=sys.stderr)
+        return 1
     try:
         build_rpm_repository(rpm_package=options.rpm, **common)
     except (RuntimeError, ValueError, OSError):
-        parser.error(f"RPM repository build failed for {options.site_dir}")
+        print("RPM repository build failed", file=sys.stderr)
+        return 1
     source_page = pathlib.Path(__file__).with_name("pages-index.html")
     try:
         _publish_site_index(options.site_dir, source_page)
     except (RuntimeError, ValueError, OSError):
-        parser.error(f"site index publication failed for {options.site_dir}")
+        print("site index publication failed", file=sys.stderr)
+        return 1
     return 0
 
 
