@@ -34,13 +34,16 @@ class PublicKeyInfo:
     created: dt.datetime
     expires: dt.datetime | None
     capabilities: str
+    validity: str
 
 
 def _path(value: os.PathLike[str] | str) -> pathlib.Path:
     if not isinstance(value, (str, os.PathLike)):
         raise TypeError("site root must be a path")
+    if not os.fspath(value):
+        raise ValueError("site root must name a directory below a filesystem root")
     root = pathlib.Path(value)
-    if not os.fspath(root) or root == pathlib.Path(root.anchor):
+    if root.is_absolute() and root == pathlib.Path(root.anchor):
         raise ValueError("site root must name a directory below a filesystem root")
     if ".." in root.parts:
         raise ValueError("site root must not contain a parent-directory component")
@@ -139,6 +142,7 @@ def inspect_public_key(
         raise RuntimeError("malformed public key or gpg could not inspect it")
 
     public_records: list[list[str]] = []
+    subkey_records: list[list[str]] = []
     primary_fingerprints: list[str] = []
     secret_records = 0
     current_key_record: str | None = None
@@ -152,6 +156,7 @@ def inspect_public_key(
             public_records.append(fields)
             current_key_record = record
         elif record == "sub":
+            subkey_records.append(fields)
             current_key_record = record
         elif record == "fpr" and current_key_record == "pub":
             if len(fields) <= 9:
@@ -167,16 +172,27 @@ def inspect_public_key(
     if len(record) <= 11:
         raise RuntimeError("public key record is malformed")
     fingerprint = normalize_fingerprint(primary_fingerprints[0])
+    validity = record[1]
+    if validity.lower() in {"r", "d", "i", "e"}:
+        raise RuntimeError(f"public key has an unusable primary validity state: {validity}")
     created = _utc_timestamp(record[5], "creation")
     expires = _utc_timestamp(record[6], "expiry") if record[6] else None
     capabilities = record[11]
-    if "s" not in capabilities.lower():
+    signing_records = [record, *subkey_records]
+    if any(len(signing_record) <= 11 for signing_record in signing_records):
+        raise RuntimeError("public key has a malformed key record")
+    if not any(
+        "s" in signing_record[11]
+        and signing_record[1].lower() not in {"r", "d", "i", "e"}
+        for signing_record in signing_records
+    ):
         raise RuntimeError("public key does not have signing capability")
     return PublicKeyInfo(
         fingerprint=fingerprint,
         created=created,
         expires=expires,
         capabilities=capabilities,
+        validity=validity,
     )
 
 
@@ -198,6 +214,10 @@ def verify_public_key_fingerprint(
         raise TypeError("now must be a datetime")
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
+    if instant < info.created:
+        raise RuntimeError(
+            f"public key is not valid before {info.created.isoformat()}"
+        )
     if info.expires is not None and instant >= info.expires:
         raise RuntimeError(
             f"public key expired at {info.expires.isoformat()}"

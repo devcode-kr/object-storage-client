@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -17,12 +17,18 @@
     <p>Install the stable release from the signed APT or DNF repository.</p>
 
     <h2>APT (Debian and Ubuntu)</h2>
-    <pre><code>sudo install -d -m 0755 /etc/apt/keyrings
-wget -O repository-key.asc https://devcode-kr.github.io/object-storage-client/repository-key.asc
-gpg --dearmor --output object-storage-client.gpg repository-key.asc
-sudo install -m 0644 object-storage-client.gpg /etc/apt/keyrings/object-storage-client.gpg
+    <pre><code>set -eu
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" &gt; "$tmpdir/key-info"
+fingerprint=$(awk -F: '$1 == "pub" { primary = 1; next } primary &amp;&amp; $1 == "fpr" { print $10; exit }' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+gpg --batch --dearmor --output "$tmpdir/object-storage-client.gpg" "$tmpdir/repository-key.asc"
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/object-storage-client.gpg
 printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list &gt; /dev/null
-rm repository-key.asc object-storage-client.gpg
 sudo apt update
 sudo apt install object-storage-client</code></pre>
 

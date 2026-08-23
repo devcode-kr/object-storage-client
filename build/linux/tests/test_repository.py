@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from build.linux.repository import (
     AptPaths,
@@ -25,6 +26,45 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 LINUX = ROOT / "build" / "linux"
 EXPECTED_FINGERPRINT = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
 BASE_URL = "https://devcode-kr.github.io/object-storage-client"
+
+
+def _colon_record(
+    record: str,
+    *,
+    validity: str = "-",
+    created: int = 1_000,
+    expires: int | None = 2_000,
+    capabilities: str = "sc",
+) -> str:
+    expiry = "" if expires is None else str(expires)
+    return (
+        f"{record}:{validity}:2048:1:0123456789ABCDEF:{created}:{expiry}:::::"
+        f"{capabilities}:"
+    )
+
+
+def _inspect_controlled_output(output: str) -> PublicKeyInfo:
+    with tempfile.TemporaryDirectory() as temporary:
+        public_key = pathlib.Path(temporary) / "controlled-public-key.asc"
+        public_key.write_text("controlled public input\n", encoding="ascii")
+        completed = subprocess.CompletedProcess(
+            args=["gpg"], returncode=0, stdout=output, stderr=""
+        )
+        with mock.patch("build.linux.repository.subprocess.run", return_value=completed):
+            return inspect_public_key(public_key)
+
+
+def _verify_controlled_output(output: str, now: dt.datetime) -> PublicKeyInfo:
+    with tempfile.TemporaryDirectory() as temporary:
+        public_key = pathlib.Path(temporary) / "controlled-public-key.asc"
+        public_key.write_text("controlled public input\n", encoding="ascii")
+        completed = subprocess.CompletedProcess(
+            args=["gpg"], returncode=0, stdout=output, stderr=""
+        )
+        with mock.patch("build.linux.repository.subprocess.run", return_value=completed):
+            return verify_public_key_fingerprint(
+                public_key, "A" * 40, now=now
+            )
 
 
 def _run_gpg(home: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -114,6 +154,20 @@ class RepositoryTests(unittest.TestCase):
             with self.assertRaises(dataclasses.FrozenInstanceError):
                 paths.packages = root
 
+    def test_path_constructors_accept_current_directory_but_reject_unsafe_roots(self):
+        self.assertEqual(
+            pathlib.Path("apt/dists/stable"), apt_paths(pathlib.Path(".")).release
+        )
+        self.assertEqual(
+            pathlib.Path("rpm/stable/x86_64"), rpm_paths(pathlib.Path(".")).packages
+        )
+        with self.assertRaises(ValueError):
+            apt_paths(pathlib.Path("/"))
+        with self.assertRaises(ValueError):
+            apt_paths(pathlib.Path("site") / ".." / "elsewhere")
+        with self.assertRaises(TypeError):
+            apt_paths(123)
+
     def test_fingerprint_normalization_is_exact(self):
         self.assertEqual(
             "0123456789ABCDEF0123456789ABCDEF01234567",
@@ -147,6 +201,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertIsInstance(info.created, dt.datetime)
         self.assertIsInstance(info.expires, dt.datetime)
         self.assertLess(info.created, info.expires)
+        self.assertEqual("-", info.validity)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             info.fingerprint = "0" * 40
 
@@ -171,6 +226,93 @@ class RepositoryTests(unittest.TestCase):
                 self.throwaway_fingerprint,
                 now=info.expires + dt.timedelta(seconds=1),
             )
+
+    def test_creation_boundary_is_inclusive(self):
+        output = "\n".join((_colon_record("pub"), f"fpr:::::::::{'A' * 40}:"))
+        created = dt.datetime.fromtimestamp(1_000, tz=dt.timezone.utc)
+        self.assertEqual(created, _verify_controlled_output(output, created).created)
+        with self.assertRaisesRegex(RuntimeError, "not valid before"):
+            _verify_controlled_output(output, created - dt.timedelta(microseconds=1))
+
+    def test_expiry_boundary_is_exclusive(self):
+        output = "\n".join((_colon_record("pub"), f"fpr:::::::::{'A' * 40}:"))
+        expires = dt.datetime.fromtimestamp(2_000, tz=dt.timezone.utc)
+        self.assertEqual(
+            expires,
+            _verify_controlled_output(
+                output, expires - dt.timedelta(microseconds=1)
+            ).expires,
+        )
+        with self.assertRaisesRegex(RuntimeError, "expired"):
+            _verify_controlled_output(output, expires)
+
+    def test_non_utc_aware_now_uses_the_equivalent_instant(self):
+        output = "\n".join((_colon_record("pub"), f"fpr:::::::::{'A' * 40}:"))
+        equivalent_creation = dt.datetime.fromtimestamp(
+            1_000, tz=dt.timezone(dt.timedelta(hours=9))
+        )
+        self.assertEqual(
+            dt.datetime.fromtimestamp(1_000, tz=dt.timezone.utc),
+            _verify_controlled_output(output, equivalent_creation).created,
+        )
+
+    def test_naive_now_is_rejected(self):
+        output = "\n".join((_colon_record("pub"), f"fpr:::::::::{'A' * 40}:"))
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            _verify_controlled_output(output, dt.datetime(2026, 1, 1))
+
+    def test_unusable_primary_validity_states_are_rejected_but_dash_is_accepted(self):
+        for validity in ("r", "d", "i", "e"):
+            with self.subTest(validity=validity):
+                output = "\n".join(
+                    (
+                        _colon_record("pub", validity=validity),
+                        f"fpr:::::::::{'A' * 40}:",
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "unusable|validity"):
+                    _inspect_controlled_output(output)
+        accepted = "\n".join(
+            (_colon_record("pub", validity="-"), f"fpr:::::::::{'A' * 40}:")
+        )
+        self.assertEqual("-", _inspect_controlled_output(accepted).validity)
+
+    def test_two_concatenated_primary_public_keys_are_rejected(self):
+        output = "\n".join(
+            (
+                _colon_record("pub"),
+                f"fpr:::::::::{'A' * 40}:",
+                _colon_record("pub"),
+                f"fpr:::::::::{'B' * 40}:",
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly one primary"):
+            _inspect_controlled_output(output)
+
+    def test_signing_subkey_is_accepted_without_using_its_fingerprint_as_primary(self):
+        output = "\n".join(
+            (
+                _colon_record("pub", capabilities="c"),
+                f"fpr:::::::::{'A' * 40}:",
+                _colon_record("sub", capabilities="s"),
+                f"fpr:::::::::{'B' * 40}:",
+            )
+        )
+        info = _inspect_controlled_output(output)
+        self.assertEqual("A" * 40, info.fingerprint)
+        self.assertEqual("c", info.capabilities)
+
+    def test_mixed_public_and_secret_subkey_export_is_rejected(self):
+        output = "\n".join(
+            (
+                _colon_record("pub"),
+                f"fpr:::::::::{'A' * 40}:",
+                _colon_record("ssb", capabilities="s"),
+                f"fpr:::::::::{'B' * 40}:",
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "secret"):
+            _inspect_controlled_output(output)
 
     def test_malformed_missing_symlink_and_secret_keys_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -254,10 +396,37 @@ class RepositoryTests(unittest.TestCase):
         self.assertNotIn("--nogpgcheck", lowered)
         self.assertNotIn("curl |", lowered)
         self.assertNotIn("curl|", lowered)
+        self.assertNotIn("--no-check-certificate", lowered)
+        self.assertNotIn("apt-key", lowered)
+        self.assertNotIn("|| true", lowered)
+        self.assertNotIn("set +e", lowered)
         self.assertIn("&gt;", page)
         self.assertNotIn(" > ", page)
 
-    def test_committed_public_files_do_not_contain_private_material(self):
+        apt_block = page[page.index("<h2>APT"):page.index("<h2>DNF")]
+        ordered = (
+            "set -eu",
+            "umask 077",
+            "mktemp -d",
+            "trap '",
+            f"wget -O \"$tmpdir/repository-key.asc\" {BASE_URL}/repository-key.asc",
+            "gpg --batch --show-keys --with-colons",
+            "fingerprint=",
+            f'test "$fingerprint" = "{EXPECTED_FINGERPRINT}"',
+            "gpg --batch --dearmor",
+            "sudo install -m 0644",
+        )
+        positions = []
+        for text in ordered:
+            with self.subTest(order=text):
+                self.assertIn(text, apt_block)
+                positions.append(apt_block.index(text))
+        self.assertEqual(sorted(positions), positions)
+        self.assertIn("EXIT HUP INT TERM", apt_block)
+        self.assertNotIn("wget -O repository-key.asc", apt_block)
+        self.assertNotIn("/etc/apt/keyrings/object-storage-client.gpg\n", apt_block[:positions[-1]])
+
+    def test_repository_public_files_exclude_exact_private_key_identifiers(self):
         private_block = "BEGIN PGP " + "PRIVATE KEY BLOCK"
         secret_names = (
             "LINUX_REPO_GPG_" + "PRIVATE_KEY",
