@@ -96,7 +96,12 @@ select_xdpyinfo_package() {
 }
 
 snapshot_inputs() {
-    PACKAGE_SNAPSHOT=$TEMP_ROOT/package
+    case "$KIND" in
+        deb) snapshot_suffix=.deb ;;
+        rpm) snapshot_suffix=.rpm ;;
+        *) fail "package kind must be deb or rpm" ;;
+    esac
+    PACKAGE_SNAPSHOT=$TEMP_ROOT/package$snapshot_suffix
     REPOSITORY_KEY_SNAPSHOT=$TEMP_ROOT/repository-key.asc
     install -m 0444 "$PACKAGE" "$PACKAGE_SNAPSHOT"
     [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package source changed while snapshotting"

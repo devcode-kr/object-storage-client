@@ -1494,17 +1494,20 @@ class SmokePackageScriptTests(unittest.TestCase):
             temp_root = temporary / "private"
             temp_root.mkdir(mode=0o700)
             commands = (
-                f'TEMP_ROOT="{temp_root}"; PACKAGE="{package}"; REPOSITORY_KEY="{key}"; '
+                f'TEMP_ROOT="{temp_root}"; KIND=deb; PACKAGE="{package}"; REPOSITORY_KEY="{key}"; '
                 "snapshot_inputs; "
                 f'printf changed > "{package}"; printf changed > "{key}"; '
-                "printf '%s|%s|%s|%s\\n' \"$(cat \"$PACKAGE_SNAPSHOT\")\" "
+                "printf '%s|%s|%s|%s|%s\\n' \"$(cat \"$PACKAGE_SNAPSHOT\")\" "
                 "\"$(stat -c %a \"$PACKAGE_SNAPSHOT\")\" \"$(cat \"$REPOSITORY_KEY_SNAPSHOT\")\" "
-                "\"$(stat -c %a \"$REPOSITORY_KEY_SNAPSHOT\")\""
+                "\"$(stat -c %a \"$REPOSITORY_KEY_SNAPSHOT\")\" \"${PACKAGE_SNAPSHOT##*/}\""
             )
             result = self.run_library(commands)
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("original package|444|original public key|600", result.stdout.strip())
-            self.assertFalse((temp_root / "package").is_symlink())
+            self.assertEqual(
+                "original package|444|original public key|600|package.deb",
+                result.stdout.strip(),
+            )
+            self.assertFalse((temp_root / "package.deb").is_symlink())
             self.assertFalse((temp_root / "repository-key.asc").is_symlink())
 
     def test_main_signals_and_bounded_operations_contract(self):
