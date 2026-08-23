@@ -193,11 +193,16 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
         "import os, pathlib, re, shlex, subprocess, sys\n"
         f"fingerprint = {fingerprint!r}\n"
         "args = sys.argv[1:]\n"
-        "if os.environ.get('OSC_FAKE_RPM_MAJOR', '4') not in ('4', '6'): sys.exit(30)\n"
-        "if len(args) != 10 or any(args[index] != '--define' for index in (0, 2, 4, 6)) or args[8] != '--addsign': sys.exit(30)\n"
-        "defines = dict(value.split(' ', 1) for value in (args[1], args[3], args[5], args[7]))\n"
-        "if set(defines) != {'_openpgp_sign', '_openpgp_sign_id', '_gpg_path', '_gpg_sign_cmd_extra_args'}: sys.exit(30)\n"
-        "if defines['_openpgp_sign'] != 'gpg' or defines['_openpgp_sign_id'] != fingerprint: sys.exit(30)\n"
+        "major = os.environ.get('OSC_FAKE_RPM_MAJOR', '4')\n"
+        "if major not in ('4', '6') or len(args) < 8 or args[-2] != '--addsign' or any(value != '--define' for value in args[:-2:2]): sys.exit(30)\n"
+        "try: pairs = [value.split(' ', 1) for value in args[1:-2:2]]; defines = dict(pairs)\n"
+        "except (ValueError, IndexError): sys.exit(30)\n"
+        "if len(defines) != len(pairs) or not set(defines) <= {'_gpg_name', '_openpgp_sign', '_openpgp_sign_id', '_gpg_path', '_gpg_sign_cmd_extra_args'}: sys.exit(30)\n"
+        "if not {'_gpg_path', '_gpg_sign_cmd_extra_args'} <= set(defines): sys.exit(30)\n"
+        "if major == '4' and defines.get('_gpg_name') != fingerprint: sys.exit(30)\n"
+        "if major == '6' and (defines.get('_openpgp_sign') != 'gpg' or defines.get('_openpgp_sign_id') != fingerprint): sys.exit(30)\n"
+        "if '_openpgp_sign' in defines and defines['_openpgp_sign'] != 'gpg': sys.exit(30)\n"
+        "if '_openpgp_sign_id' in defines and defines['_openpgp_sign_id'] != fingerprint: sys.exit(30)\n"
         "home = os.environ.get('GNUPGHOME', '')\n"
         "if defines['_gpg_path'] != home or not home: sys.exit(30)\n"
         "home_path = pathlib.Path(home)\n"
@@ -213,7 +218,7 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
         "if listing.returncode != 0: sys.exit(30)\n"
         "signing_times = [int(fields[5]) for line in listing.stdout.splitlines() if len(fields := line.split(':')) > 11 and fields[0] in ('sec', 'ssb') and 's' in fields[11].lower()]\n"
         "if not signing_times or extra[7] != str(min(signing_times)) + '!': sys.exit(30)\n"
-        "path = pathlib.Path(args[9])\n"
+        "path = pathlib.Path(args[-1])\n"
         "if path.is_symlink() or not path.is_file(): sys.exit(30)\n"
         "if os.environ.get('OSC_RPM_SIGN_FAIL'): sys.exit(31)\n"
         "data = path.read_bytes()\n"
@@ -275,9 +280,13 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
         "if not target.read_bytes().endswith(b'\\nFAKE-RPM-SIGNATURE\\n'): sys.exit(35)\n"
         "mode = os.environ.get('OSC_RPM_CHECKSIG_OUTPUT', 'ok')\n"
         "if mode == 'ok': print(f'{target}: digests signatures OK')\n"
+        "elif mode == 'whitespace': print(f'{target}:  digests\\t signatures   OK  ')\n"
         "elif mode == 'not-ok': print(f'{target}: digests signatures NOT OK')\n"
-        "elif mode == 'malformed': print(f'{target}: digests signatures VERIFIED')\n"
+        "elif mode == 'malformed-ok': print('wholly malformed but ending OK')\n"
+        "elif mode == 'missing-signatures': print(f'{target}: digests OK')\n"
+        "elif mode == 'uppercase-failures': print(f'{target}: DIGESTS SIGNATURES OK')\n"
         "elif mode == 'trailing': print(f'{target}: digests signatures OK\\ntrailing diagnostic')\n"
+        "elif mode == 'wrong-package': print(f'{target}.other: digests signatures OK')\n"
         "else: sys.exit(30)\n",
         encoding="utf-8",
     )
@@ -458,6 +467,7 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue(package.read_bytes().endswith(b"\nFAKE-RPM-SIGNATURE\n"))
             self.assertIn("BEGIN PGP SIGNATURE", (paths.repodata / "repomd.xml.asc").read_text())
             tool_log = log.read_text(encoding="utf-8")
+            self.assertIn("_gpg_name " + self.throwaway_fingerprint, tool_log)
             self.assertIn("_openpgp_sign gpg", tool_log)
             self.assertIn("_openpgp_sign_id " + self.throwaway_fingerprint, tool_log)
             self.assertIn("_gpg_sign_cmd_extra_args --batch --no-tty --pinentry-mode loopback", tool_log)
@@ -466,6 +476,28 @@ class RepositoryTests(unittest.TestCase):
             self.assertNotIn("%{__signature_filename}", tool_log)
             self.assertNotIn(self.passphrase_file.read_text().strip(), tool_log)
             self.assertEqual([], list(paths.repodata.parent.glob(".repodata.rollback-*")))
+
+    def test_build_rpm_repository_uses_one_signing_contract_for_rpm_4_and_6(self):
+        for rpm_major in ("4", "6"):
+            with self.subTest(rpm_major=rpm_major), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                log = root / "tool-log"
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "OSC_FAKE_RPM_MAJOR": rpm_major,
+                        "OSC_RPM_TOOL_LOG": os.fspath(log),
+                    },
+                ):
+                    self._build_rpm(root)
+                arguments = log.read_text(encoding="utf-8")
+                self.assertIn("_gpg_name " + self.throwaway_fingerprint, arguments)
+                self.assertIn("_openpgp_sign gpg", arguments)
+                self.assertIn("_openpgp_sign_id " + self.throwaway_fingerprint, arguments)
+                self.assertIn("_gpg_path ", arguments)
+                self.assertIn("_gpg_sign_cmd_extra_args ", arguments)
+                self.assertIn("--addsign", arguments)
+                self.assertNotIn("__gpg_sign_cmd", arguments)
 
     def test_fake_rpm_tools_reject_malformed_contracts_without_mutation_or_trust(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -500,6 +532,7 @@ class RepositoryTests(unittest.TestCase):
                 f"--faked-system-time {int(signing_created.timestamp())}!"
             )
             valid_sign_arguments = [
+                "--define", f"_gpg_name {self.throwaway_fingerprint}",
                 "--define", "_openpgp_sign gpg",
                 "--define", f"_openpgp_sign_id {self.throwaway_fingerprint}",
                 "--define", f"_gpg_path {home}",
@@ -522,18 +555,26 @@ class RepositoryTests(unittest.TestCase):
                     self.assertTrue(package.read_bytes().endswith(b"\nFAKE-RPM-SIGNATURE\n"))
             package.write_bytes(original)
             malformed_sign_arguments = (
-                valid_sign_arguments[:-2],
-                [*valid_sign_arguments[:-1], "--extra", valid_sign_arguments[-1]],
-                [*valid_sign_arguments[:3], "_openpgp_sign_id NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[4:]],
-                [*valid_sign_arguments[:5], "_gpg_path /wrong/home", *valid_sign_arguments[6:]],
-                [*valid_sign_arguments[:7], "__gpg_sign_cmd %{__gpg} --detach-sign", *valid_sign_arguments[8:]],
+                ("4", valid_sign_arguments[2:]),
+                ("4", [*valid_sign_arguments[:1], "_gpg_name NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[2:]]),
+                ("6", valid_sign_arguments[4:]),
+                ("6", [*valid_sign_arguments[:3], "_openpgp_sign not-gpg", *valid_sign_arguments[4:]]),
+                ("6", [*valid_sign_arguments[:5], "_openpgp_sign_id NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[6:]]),
+                ("6", [*valid_sign_arguments[:-2], "--define", "__gpg_sign_cmd %{__gpg} --detach-sign", *valid_sign_arguments[-2:]]),
+                ("4", valid_sign_arguments[:-2]),
+                ("4", [*valid_sign_arguments[:-1], "--extra", valid_sign_arguments[-1]]),
+                ("4", [*valid_sign_arguments[:7], "_gpg_path /wrong/home", *valid_sign_arguments[8:]]),
             )
-            for index, arguments in enumerate(malformed_sign_arguments):
-                with self.subTest(tool="rpmsign", case=index):
+            for index, (rpm_major, arguments) in enumerate(malformed_sign_arguments):
+                with self.subTest(tool="rpmsign", case=index, rpm_major=rpm_major):
                     result = subprocess.run(
                         [rpmsign, *arguments],
                         check=False,
-                        env={**os.environ, "GNUPGHOME": os.fspath(home)},
+                        env={
+                            **os.environ,
+                            "GNUPGHOME": os.fspath(home),
+                            "OSC_FAKE_RPM_MAJOR": rpm_major,
+                        },
                     )
                     self.assertNotEqual(0, result.returncode)
                     self.assertEqual(original, package.read_bytes())
@@ -593,7 +634,19 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(f"{signed}: digests signatures OK\n", valid_check.stdout)
             self.assertEqual(signed_bytes, signed.read_bytes())
 
-            for output in ("not-ok", "malformed", "trailing"):
+            with mock.patch.dict(os.environ, {"OSC_RPM_CHECKSIG_OUTPUT": "whitespace"}):
+                _verify_rpm_packages(
+                    os.fspath(rpm), self.public_key, [signed], self.throwaway_fingerprint
+                )
+
+            for output in (
+                "not-ok",
+                "malformed-ok",
+                "missing-signatures",
+                "uppercase-failures",
+                "trailing",
+                "wrong-package",
+            ):
                 with self.subTest(checksig_output=output), mock.patch.dict(
                     os.environ, {"OSC_RPM_CHECKSIG_OUTPUT": output}
                 ):

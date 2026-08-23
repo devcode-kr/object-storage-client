@@ -1072,16 +1072,15 @@ def _verify_rpm_packages(rpm_tool: str, public_key: pathlib.Path, packages: list
         _run_command([*base, "--import", os.fspath(public_key)], description="rpm public key import")
         for package in packages:
             result = _run_command([*base, "--checksig", os.fspath(package)], description="rpm package verification")
-            conclusions = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            conclusions = [line for line in result.stdout.splitlines() if line.strip()]
             prefix = f"{package}:"
             if (
-                not conclusions
-                or not conclusions[-1].startswith(prefix)
-                or conclusions[-1].split()[-1] != "OK"
-                or conclusions[-1].split()[-2:] == ["NOT", "OK"]
+                len(conclusions) != 1
+                or not conclusions[0].startswith(prefix)
+                or conclusions[0][len(prefix):].split() != ["digests", "signatures", "OK"]
             ):
                 raise RuntimeError(
-                    f"rpm package verification did not end with an OK conclusion: {package.name}"
+                    f"rpm package verification did not return the expected OK conclusion: {package.name}"
                 )
 
 
@@ -1220,7 +1219,8 @@ def build_rpm_repository(
                     f"--passphrase-file {shlex.quote(os.fspath(staged_passphrase))} "
                     f"--faked-system-time {int(signing_created.timestamp())}!"
                 )
-                _run_command([tools["rpmsign"], "--define", "_openpgp_sign gpg",
+                _run_command([tools["rpmsign"], "--define", f"_gpg_name {expected}",
+                              "--define", "_openpgp_sign gpg",
                               "--define", f"_openpgp_sign_id {expected}", "--define", f"_gpg_path {home}",
                               "--define", f"_gpg_sign_cmd_extra_args {extra_args}",
                               "--addsign", os.fspath(staged_package)],
