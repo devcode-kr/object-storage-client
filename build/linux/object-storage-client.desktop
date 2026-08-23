@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Object Storage Client
+Comment=Browse and transfer files in S3-compatible object storage
+Exec=object-storage-client
+Icon=object-storage-client
+Type=Application
+Categories=Network;FileTransfer;
+Terminal=false
