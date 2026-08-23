@@ -1334,6 +1334,195 @@ class SmokePackageScriptTests(unittest.TestCase):
     def read_script(self) -> str:
         return self.SCRIPT.read_text(encoding="utf-8")
 
+    def run_library(
+        self,
+        commands: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        library_env = os.environ.copy()
+        library_env["SMOKE_PACKAGE_LIBRARY_ONLY"] = "1"
+        if env:
+            library_env.update(env)
+        return subprocess.run(
+            ["/bin/sh", "-c", f'. "{self.SCRIPT}"\n{commands}'],
+            cwd=ROOT,
+            env=library_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_selects_distribution_specific_xdpyinfo_package_from_regular_os_release(self):
+        expected = {
+            "fedora": "xdpyinfo",
+            "rocky": "xorg-x11-utils",
+            "almalinux": "xorg-x11-utils",
+            "rhel": "xorg-x11-utils",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            os_release = pathlib.Path(directory) / "os-release"
+            for distro, package in expected.items():
+                with self.subTest(distro=distro):
+                    os_release.write_text(f'NAME="Fake"\nID="{distro}"\n', encoding="utf-8")
+                    result = self.run_library(
+                        "select_xdpyinfo_package",
+                        env={"OS_RELEASE_FILE": str(os_release)},
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual(package, result.stdout.strip())
+
+    def test_xdpyinfo_selector_rejects_unknown_missing_and_symlink_os_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            os_release = temporary / "os-release"
+            os_release.write_text("ID=centos\n", encoding="utf-8")
+            cases = [os_release, temporary / "missing"]
+            link = temporary / "os-release-link"
+            try:
+                link.symlink_to(os_release)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            cases.append(link)
+            for path in cases:
+                with self.subTest(path=path):
+                    result = self.run_library(
+                        "select_xdpyinfo_package",
+                        env={"OS_RELEASE_FILE": str(path)},
+                    )
+                    self.assertNotEqual(0, result.returncode)
+
+    def test_manifest_validator_accepts_only_approved_root_owned_normalized_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "root"
+            payload_dir = root / "usr/lib/object-storage-client"
+            payload_dir.mkdir(parents=True)
+            root.chmod(0o755)
+            payload_dir.chmod(0o755)
+            payload = payload_dir / "payload.dll"
+            payload.write_bytes(b"payload")
+            payload.chmod(0o644)
+            manifest = pathlib.Path(directory) / "manifest"
+            manifest.write_text("/.\n/usr/lib/object-storage-client\n/usr/lib/object-storage-client/payload.dll\n", encoding="utf-8")
+            fake_bin = pathlib.Path(directory) / "bin"
+            fake_bin.mkdir()
+            dpkg_query = fake_bin / "dpkg-query"
+            dpkg_query.write_text("#!/bin/sh\ncat \"$MANIFEST\"\n", encoding="utf-8")
+            dpkg_query.chmod(0o755)
+            rpm = fake_bin / "rpm"
+            rpm.write_text("#!/bin/sh\ncat \"$MANIFEST\"\n", encoding="utf-8")
+            rpm.chmod(0o755)
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text(
+                "#!/bin/sh\n"
+                "mode=$(/usr/bin/stat -c %a \"$3\") || exit\n"
+                "type=$(/usr/bin/stat -c %F \"$3\") || exit\n"
+                "printf '%s|%s|%s|%s\\n' \"$type\" \"${FAKE_UID:-0}\" \"${FAKE_GID:-0}\" \"$mode\"\n",
+                encoding="utf-8",
+            )
+            fake_stat.chmod(0o755)
+            base_env = {
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                "MANIFEST": str(manifest),
+                "SMOKE_ROOT": str(root),
+            }
+            for kind in ("deb", "rpm"):
+                with self.subTest(kind=kind):
+                    result = self.run_library(
+                        f'TEMP_ROOT="{directory}"; KIND={kind}; validate_manifest_entries',
+                        env=base_env,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+
+            invalid_cases = (
+                ("file mode", "/usr/lib/object-storage-client/payload.dll\n", payload, 0o666, {}),
+                ("directory mode", "/usr/lib/object-storage-client\n", payload_dir, 0o775, {}),
+                ("ownership", "/usr/lib/object-storage-client/payload.dll\n", payload, 0o644, {"FAKE_UID": "1000"}),
+                ("unapproved", "/usr/lib/object-storage-client.evil\n", payload, 0o644, {}),
+                ("missing", "/usr/lib/object-storage-client/missing\n", payload, 0o644, {}),
+            )
+            for name, listing, changed_path, changed_mode, extra_env in invalid_cases:
+                with self.subTest(name=name):
+                    old_mode = stat.S_IMODE(changed_path.stat().st_mode)
+                    changed_path.chmod(changed_mode)
+                    manifest.write_text(listing, encoding="utf-8")
+                    result = self.run_library(
+                        f'TEMP_ROOT="{directory}"; KIND=deb; validate_manifest_entries',
+                        env={**base_env, **extra_env},
+                    )
+                    self.assertNotEqual(0, result.returncode)
+                    changed_path.chmod(old_mode)
+
+    def test_manifest_validator_rejects_symlinks_and_special_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            root = temporary / "root"
+            payload_dir = root / "usr/lib/object-storage-client"
+            payload_dir.mkdir(parents=True)
+            target = payload_dir / "target"
+            target.write_bytes(b"target")
+            link = payload_dir / "link"
+            fifo = payload_dir / "fifo"
+            try:
+                link.symlink_to(target)
+                os.mkfifo(fifo)
+            except OSError as error:
+                self.skipTest(f"special filesystem fixtures unavailable: {error}")
+            fake_bin = temporary / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "dpkg-query").write_text("#!/bin/sh\nprintf '%s\\n' \"$MANIFEST_PATH\"\n", encoding="utf-8")
+            (fake_bin / "dpkg-query").chmod(0o755)
+            env = {
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                "SMOKE_ROOT": str(root),
+            }
+            for entry in ("/usr/lib/object-storage-client/link", "/usr/lib/object-storage-client/fifo"):
+                with self.subTest(entry=entry):
+                    result = self.run_library(
+                        f'TEMP_ROOT="{directory}"; KIND=deb; validate_manifest_entries',
+                        env={**env, "MANIFEST_PATH": entry},
+                    )
+                    self.assertNotEqual(0, result.returncode)
+
+    def test_snapshot_inputs_are_private_regular_copies_used_after_source_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            package = temporary / "source.deb"
+            key = temporary / "repository-key.asc"
+            package.write_bytes(b"original package")
+            key.write_bytes(b"original public key")
+            temp_root = temporary / "private"
+            temp_root.mkdir(mode=0o700)
+            commands = (
+                f'TEMP_ROOT="{temp_root}"; PACKAGE="{package}"; REPOSITORY_KEY="{key}"; '
+                "snapshot_inputs; "
+                f'printf changed > "{package}"; printf changed > "{key}"; '
+                "printf '%s|%s|%s|%s\\n' \"$(cat \"$PACKAGE_SNAPSHOT\")\" "
+                "\"$(stat -c %a \"$PACKAGE_SNAPSHOT\")\" \"$(cat \"$REPOSITORY_KEY_SNAPSHOT\")\" "
+                "\"$(stat -c %a \"$REPOSITORY_KEY_SNAPSHOT\")\""
+            )
+            result = self.run_library(commands)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("original package|444|original public key|600", result.stdout.strip())
+            self.assertFalse((temp_root / "package").is_symlink())
+            self.assertFalse((temp_root / "repository-key.asc").is_symlink())
+
+    def test_main_signals_and_bounded_operations_contract(self):
+        script = self.read_script()
+        self.assertIn("main()", script)
+        self.assertIn('[ "${SMOKE_PACKAGE_LIBRARY_ONLY:-0}" = 1 ] || main "$@"', script)
+        self.assertIn("trap cleanup 0", script)
+        self.assertNotIn("EXIT", script)
+        for status in (129, 130, 143):
+            self.assertIn(f"exit {status}", script)
+        self.assertIn("run_with_timeout()", script)
+        self.assertIn("command -v timeout", script)
+        self.assertIn("command -v xdpyinfo", script)
+        for operation in ("apt-get update", "apt-get install", "apt-get remove", "dnf -y install", "dnf -y remove", "dnf -y clean", "dnf -y makecache", "gpg --batch", "desktop-file-validate"):
+            matching_lines = [line for line in script.splitlines() if operation in line]
+            self.assertTrue(matching_lines, operation)
+            self.assertTrue(all("run_with_timeout" in line for line in matching_lines), matching_lines)
+
     def test_smoke_script_is_executable_posix_shell_with_required_functions(self):
         script = self.read_script()
         self.assertEqual(0o755, stat.S_IMODE(self.SCRIPT.stat().st_mode))
@@ -1359,7 +1548,7 @@ class SmokePackageScriptTests(unittest.TestCase):
             "xvfb desktop-file-utils curl gnupg procps x11-utils",
             "dnf -y install",
             "libX11 libICE libSM fontconfig ca-certificates",
-            "xorg-x11-server-Xvfb xorg-x11-utils desktop-file-utils curl gnupg2 procps-ng",
+            "xorg-x11-server-Xvfb desktop-file-utils curl gnupg2 procps-ng",
             'apt-get install -y "$PACKAGE"',
             'dnf -y install "$PACKAGE"',
             "FIXTURE=/root/.devcode/$PROGRAM/preserve-me",

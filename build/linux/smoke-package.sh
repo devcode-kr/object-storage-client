@@ -7,13 +7,30 @@ PROGRAM=object-storage-client
 FIXTURE=/root/.devcode/$PROGRAM/preserve-me
 FIXTURE_BYTES=object-storage-client-smoke-preserve-v1
 REPOSITORY_URL=${REPOSITORY_URL:-http://repository:8000}
+OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
+SMOKE_ROOT=${SMOKE_ROOT:-}
+PACKAGE_MANAGER_TIMEOUT_SECONDS=300
+GPG_TIMEOUT_SECONDS=30
+DESKTOP_VALIDATE_TIMEOUT_SECONDS=30
 APP_PID=
 XVFB_PID=
 TEMP_ROOT=
+GPG_HOME=
+PACKAGE=
+REPOSITORY_KEY=
+PACKAGE_SNAPSHOT=
+REPOSITORY_KEY_SNAPSHOT=
+CLEANED=0
 
 fail() {
     printf 'smoke-package: %s\n' "$*" >&2
     exit 1
+}
+
+run_with_timeout() {
+    timeout_seconds=$1
+    shift
+    timeout --foreground "$timeout_seconds" "$@"
 }
 
 stop_process() {
@@ -35,6 +52,8 @@ stop_process() {
 }
 
 cleanup() {
+    [ "$CLEANED" -eq 0 ] || return 0
+    CLEANED=1
     stop_process "$APP_PID"
     APP_PID=
     stop_process "$XVFB_PID"
@@ -44,50 +63,68 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT HUP INT TERM
+handle_hup() {
+    cleanup
+    exit 129
+}
 
-[ "$#" -eq 3 ] || fail "usage: smoke-package.sh deb|rpm PACKAGE REPOSITORY"
-KIND=$1
-PACKAGE=$2
-REPOSITORY=$3
+handle_int() {
+    cleanup
+    exit 130
+}
 
-case "$KIND" in
-    deb|rpm) ;;
-    *) fail "package kind must be deb or rpm" ;;
-esac
+handle_term() {
+    cleanup
+    exit 143
+}
 
-[ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package must be a regular non-symlink file"
-[ -d "$REPOSITORY" ] && [ ! -L "$REPOSITORY" ] || fail "repository must be a non-symlink directory"
-REPOSITORY_KEY=$REPOSITORY/repository-key.asc
-[ -f "$REPOSITORY_KEY" ] && [ ! -L "$REPOSITORY_KEY" ] || fail "repository-key.asc must be a regular non-symlink file"
+select_xdpyinfo_package() {
+    [ -f "$OS_RELEASE_FILE" ] && [ ! -L "$OS_RELEASE_FILE" ] || fail "os-release must be a regular non-symlink file"
+    os_id=$(awk -F= '
+        $1 == "ID" {
+            value = substr($0, index($0, "=") + 1)
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    ' "$OS_RELEASE_FILE")
+    case "$os_id" in
+        fedora) printf '%s\n' xdpyinfo ;;
+        rocky|almalinux|rhel) printf '%s\n' xorg-x11-utils ;;
+        *) fail "unsupported RPM distribution ID: ${os_id:-missing}" ;;
+    esac
+}
 
-case "$REPOSITORY_URL" in
-    http://?*|https://?*) ;;
-    *) fail "REPOSITORY_URL must use http:// or https://" ;;
-esac
-case "$REPOSITORY_URL" in
-    *[!A-Za-z0-9._:/%-]*) fail "REPOSITORY_URL contains unsafe characters" ;;
-esac
-
-[ "$(id -u)" -eq 0 ] || fail "root privileges are required"
-TEMP_ROOT=$(mktemp -d /tmp/object-storage-client-smoke.XXXXXX)
-GPG_HOME=$TEMP_ROOT/gnupg
-install -d -m 0700 "$GPG_HOME"
+snapshot_inputs() {
+    PACKAGE_SNAPSHOT=$TEMP_ROOT/package
+    REPOSITORY_KEY_SNAPSHOT=$TEMP_ROOT/repository-key.asc
+    install -m 0444 "$PACKAGE" "$PACKAGE_SNAPSHOT"
+    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package source changed while snapshotting"
+    [ -f "$PACKAGE_SNAPSHOT" ] && [ ! -L "$PACKAGE_SNAPSHOT" ] || fail "package snapshot is not a regular file"
+    install -m 0600 "$REPOSITORY_KEY" "$REPOSITORY_KEY_SNAPSHOT"
+    [ -f "$REPOSITORY_KEY" ] && [ ! -L "$REPOSITORY_KEY" ] || fail "repository key source changed while snapshotting"
+    [ -f "$REPOSITORY_KEY_SNAPSHOT" ] && [ ! -L "$REPOSITORY_KEY_SNAPSHOT" ] || fail "repository key snapshot is not a regular file"
+    PACKAGE=$PACKAGE_SNAPSHOT
+    REPOSITORY_KEY=$REPOSITORY_KEY_SNAPSHOT
+}
 
 install_dependencies() {
     case "$KIND" in
         deb)
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" apt-get update
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 libx11-6 libice6 libsm6 libfontconfig1 ca-certificates \
                 xvfb desktop-file-utils curl gnupg procps x11-utils
             ;;
         rpm)
-            dnf -y install \
+            xdpyinfo_package=$(select_xdpyinfo_package)
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install \
                 libX11 libICE libSM fontconfig ca-certificates \
-                xorg-x11-server-Xvfb xorg-x11-utils desktop-file-utils curl gnupg2 procps-ng
+                xorg-x11-server-Xvfb desktop-file-utils curl gnupg2 procps-ng \
+                "$xdpyinfo_package"
             ;;
     esac
+    command -v xdpyinfo >/dev/null 2>&1 || fail "xdpyinfo is unavailable after dependency installation"
 }
 
 install_local_package() {
@@ -96,32 +133,52 @@ install_local_package() {
     chmod 0644 "$FIXTURE"
 
     case "$KIND" in
-        deb) DEBIAN_FRONTEND=noninteractive apt-get install -y "$PACKAGE" ;;
-        rpm) dnf -y install "$PACKAGE" ;;
+        deb) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y "$PACKAGE" ;;
+        rpm) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install "$PACKAGE" ;;
     esac
 }
 
-require_directory() {
-    required_directory=$1
-    [ -d "$required_directory" ] && [ ! -L "$required_directory" ] || fail "missing package directory: $required_directory"
-    [ "$(stat -c '%a' "$required_directory")" = 755 ] || fail "unsafe directory mode: $required_directory"
+rooted_path() {
+    printf '%s%s\n' "$SMOKE_ROOT" "$1"
 }
 
-require_file_mode() {
-    required_file=$1
-    required_mode=$2
-    [ -f "$required_file" ] && [ ! -L "$required_file" ] || fail "missing package file: $required_file"
-    [ "$(stat -c '%a' "$required_file")" = "$required_mode" ] || fail "unexpected file mode: $required_file"
+validate_entry_metadata() {
+    installed_path=$1
+    actual_path=$(rooted_path "$installed_path")
+    [ -e "$actual_path" ] || [ -L "$actual_path" ] || fail "package manifest path does not exist: $installed_path"
+    [ ! -L "$actual_path" ] || fail "package-owned symlink is forbidden: $installed_path"
+    metadata=$(stat -c '%F|%u|%g|%a' "$actual_path") || fail "cannot stat package path: $installed_path"
+    entry_type=${metadata%%|*}
+    metadata=${metadata#*|}
+    entry_uid=${metadata%%|*}
+    metadata=${metadata#*|}
+    entry_gid=${metadata%%|*}
+    entry_mode=${metadata##*|}
+    [ "$entry_uid" = 0 ] && [ "$entry_gid" = 0 ] || fail "package path is not root-owned: $installed_path"
+    case "$entry_type" in
+        directory)
+            [ "$entry_mode" = 755 ] || fail "unsafe directory mode: $installed_path"
+            ;;
+        "regular file")
+            case "$entry_mode" in
+                644|755) ;;
+                *) fail "unsafe regular file mode: $installed_path" ;;
+            esac
+            ;;
+        *) fail "unsupported package entry type: $installed_path ($entry_type)" ;;
+    esac
 }
 
-validate_manifest_symlinks() {
+validate_manifest_entries() {
     manifest=$TEMP_ROOT/installed-files
     case "$KIND" in
         deb) dpkg-query -L "$PROGRAM" > "$manifest" ;;
         rpm) rpm -ql "$PROGRAM" > "$manifest" ;;
+        *) fail "package kind must be deb or rpm" ;;
     esac
+    manifest_count=0
     while IFS= read -r installed_path; do
-        [ ! -L "$installed_path" ] || fail "package-owned symlink is forbidden: $installed_path"
+        [ -n "$installed_path" ] || fail "package manifest contains an empty path"
         case "$installed_path" in
             /.|/usr|/usr/bin|/usr/lib|/usr/share|\
             /usr/share/applications|/usr/share/icons|/usr/share/icons/hicolor|\
@@ -136,7 +193,27 @@ validate_manifest_symlinks() {
             /usr/share/doc/object-storage-client/LICENSE) ;;
             *) fail "unapproved package path: $installed_path" ;;
         esac
+        validate_entry_metadata "$installed_path"
+        manifest_count=$((manifest_count + 1))
     done < "$manifest"
+    [ "$manifest_count" -gt 0 ] || fail "package manifest is empty"
+}
+
+require_directory() {
+    required_path=$1
+    required_directory=$(rooted_path "$required_path")
+    [ -d "$required_directory" ] && [ ! -L "$required_directory" ] || fail "missing package directory: $required_path"
+    metadata=$(stat -c '%u|%g|%a' "$required_directory") || fail "cannot stat package directory: $required_path"
+    [ "$metadata" = '0|0|755' ] || fail "unexpected directory ownership or mode: $required_path"
+}
+
+require_file_mode() {
+    required_path=$1
+    required_mode=$2
+    required_file=$(rooted_path "$required_path")
+    [ -f "$required_file" ] && [ ! -L "$required_file" ] || fail "missing package file: $required_path"
+    metadata=$(stat -c '%u|%g|%a' "$required_file") || fail "cannot stat package file: $required_path"
+    [ "$metadata" = "0|0|$required_mode" ] || fail "unexpected file ownership or mode: $required_path"
 }
 
 validate_installed_files() {
@@ -149,8 +226,8 @@ validate_installed_files() {
     require_file_mode /usr/share/doc/object-storage-client/README.md 644
     require_file_mode /usr/share/doc/object-storage-client/PRIVACY.md 644
     require_file_mode /usr/share/doc/object-storage-client/LICENSE 644
-    validate_manifest_symlinks
-    desktop-file-validate /usr/share/applications/object-storage-client.desktop
+    validate_manifest_entries
+    run_with_timeout "$DESKTOP_VALIDATE_TIMEOUT_SECONDS" desktop-file-validate "$(rooted_path /usr/share/applications/object-storage-client.desktop)"
 }
 
 print_launch_logs() {
@@ -207,8 +284,8 @@ launch_under_xvfb() {
 
 preserve_user_fixture_on_remove() {
     case "$KIND" in
-        deb) DEBIAN_FRONTEND=noninteractive apt-get remove -y object-storage-client ;;
-        rpm) dnf -y remove object-storage-client ;;
+        deb) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get remove -y object-storage-client ;;
+        rpm) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y remove object-storage-client ;;
     esac
 
     for removed_path in \
@@ -226,7 +303,7 @@ preserve_user_fixture_on_remove() {
 
 validate_repository_key() {
     key_listing=$TEMP_ROOT/repository-key.colons
-    GNUPGHOME=$GPG_HOME gpg --batch --show-keys --with-colons "$REPOSITORY_KEY" > "$key_listing" 2>/dev/null || fail "repository key is invalid"
+    run_with_timeout "$GPG_TIMEOUT_SECONDS" env GNUPGHOME="$GPG_HOME" gpg --batch --show-keys --with-colons "$REPOSITORY_KEY" > "$key_listing" 2>/dev/null || fail "repository key is invalid"
     public_primary_count=$(awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }' "$key_listing")
     secret_record_count=$(awk -F: '$1 == "sec" || $1 == "ssb" { count += 1 } END { print count + 0 }' "$key_listing")
     [ "$public_primary_count" -eq 1 ] || fail "repository key must contain exactly one public primary key"
@@ -239,13 +316,13 @@ install_from_repository() {
         deb)
             install -d -m 0755 /etc/apt/keyrings
             rm -f /etc/apt/keyrings/object-storage-client.gpg
-            GNUPGHOME=$GPG_HOME gpg --batch --yes --dearmor --output /etc/apt/keyrings/object-storage-client.gpg "$REPOSITORY_KEY"
+            run_with_timeout "$GPG_TIMEOUT_SECONDS" env GNUPGHOME="$GPG_HOME" gpg --batch --yes --dearmor --output /etc/apt/keyrings/object-storage-client.gpg "$REPOSITORY_KEY"
             chmod 0644 /etc/apt/keyrings/object-storage-client.gpg
             printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] %s stable main\n' \
                 "$REPOSITORY_URL/apt" > /etc/apt/sources.list.d/object-storage-client.list
             chmod 0644 /etc/apt/sources.list.d/object-storage-client.list
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y object-storage-client
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" apt-get update
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y object-storage-client
             ;;
         rpm)
             install -d -m 0755 /etc/pki/rpm-gpg /etc/yum.repos.d
@@ -260,9 +337,9 @@ install_from_repository() {
                 printf '%s\n' 'gpgkey=file:///etc/pki/rpm-gpg/object-storage-client.asc'
             } > /etc/yum.repos.d/object-storage-client.repo
             chmod 0644 /etc/yum.repos.d/object-storage-client.repo
-            dnf -y clean metadata
-            dnf -y makecache
-            dnf -y install object-storage-client
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y clean metadata
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y makecache
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install object-storage-client
             ;;
     esac
 }
@@ -274,11 +351,49 @@ print_installed_identity() {
     esac
 }
 
-install_dependencies
-install_local_package
-validate_installed_files
-launch_under_xvfb
-preserve_user_fixture_on_remove
-install_from_repository
-validate_installed_files
-print_installed_identity
+main() {
+    [ "$#" -eq 3 ] || fail "usage: smoke-package.sh deb|rpm PACKAGE REPOSITORY"
+    KIND=$1
+    PACKAGE=$2
+    REPOSITORY=$3
+
+    case "$KIND" in
+        deb|rpm) ;;
+        *) fail "package kind must be deb or rpm" ;;
+    esac
+
+    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package must be a regular non-symlink file"
+    [ -d "$REPOSITORY" ] && [ ! -L "$REPOSITORY" ] || fail "repository must be a non-symlink directory"
+    REPOSITORY_KEY=$REPOSITORY/repository-key.asc
+    [ -f "$REPOSITORY_KEY" ] && [ ! -L "$REPOSITORY_KEY" ] || fail "repository-key.asc must be a regular non-symlink file"
+
+    case "$REPOSITORY_URL" in
+        http://?*|https://?*) ;;
+        *) fail "REPOSITORY_URL must use http:// or https://" ;;
+    esac
+    case "$REPOSITORY_URL" in
+        *[!A-Za-z0-9._:/%-]*) fail "REPOSITORY_URL contains unsafe characters" ;;
+    esac
+
+    [ "$(id -u)" -eq 0 ] || fail "root privileges are required"
+    command -v timeout >/dev/null 2>&1 || fail "timeout command is required"
+    TEMP_ROOT=$(mktemp -d /tmp/object-storage-client-smoke.XXXXXX)
+    trap cleanup 0
+    trap handle_hup HUP
+    trap handle_int INT
+    trap handle_term TERM
+    GPG_HOME=$TEMP_ROOT/gnupg
+    install -d -m 0700 "$GPG_HOME"
+    snapshot_inputs
+
+    install_dependencies
+    install_local_package
+    validate_installed_files
+    launch_under_xvfb
+    preserve_user_fixture_on_remove
+    install_from_repository
+    validate_installed_files
+    print_installed_identity
+}
+
+[ "${SMOKE_PACKAGE_LIBRARY_ONLY:-0}" = 1 ] || main "$@"
