@@ -914,8 +914,8 @@ def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...
             backups[destination] = backup
         try:
             for destination, staged_path in staged:
-                os.replace(staged_path, destination)
                 published.append(destination)
+                os.replace(staged_path, destination)
             _fsync_directories([destination.parent for destination, _ in staged])
         except BaseException as publication_error:
             rollback_errors: list[BaseException] = []
@@ -1092,7 +1092,6 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
     backup = pathlib.Path(tempfile.mkdtemp(prefix=".repodata.rollback-", dir=parent))
     backup.rmdir()
     had_existing = False
-    preserve_backup = False
     try:
         staged.rmdir()
         shutil.copytree(source, staged, symlinks=True)
@@ -1102,19 +1101,60 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
             metadata = destination.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
                 raise RuntimeError("repodata destination collision is not a regular directory")
-            os.replace(destination, backup)
             had_existing = True
         try:
+            if had_existing:
+                os.replace(destination, backup)
             os.replace(staged, destination)
             _fsync_directories([parent])
         except BaseException as publication_error:
             try:
                 destination_metadata = destination.lstat()
             except FileNotFoundError:
-                pass
+                destination_metadata = None
+            try:
+                backup.lstat()
+            except FileNotFoundError:
+                backup_exists = False
             else:
+                backup_exists = True
+
+            if had_existing and backup_exists:
+                if destination_metadata is not None:
+                    try:
+                        if (
+                            stat.S_ISDIR(destination_metadata.st_mode)
+                            and not stat.S_ISLNK(destination_metadata.st_mode)
+                        ):
+                            shutil.rmtree(destination)
+                        else:
+                            destination.unlink()
+                    except OSError as cleanup_error:
+                        publication_error.add_note(
+                            f"Could not remove failed repodata destination {destination}: {cleanup_error}"
+                        )
                 try:
-                    if stat.S_ISDIR(destination_metadata.st_mode) and not stat.S_ISLNK(destination_metadata.st_mode):
+                    os.replace(backup, destination)
+                except BaseException as restore_error:
+                    rollback_error = RuntimeError(
+                        "repodata publication failed and rollback is incomplete; "
+                        f"preserved rollback backup for recovery at {backup}"
+                    )
+                    rollback_error.add_note(f"Original publication error: {publication_error!r}")
+                    raise rollback_error from restore_error
+            elif had_existing:
+                if destination_metadata is None:
+                    raise RuntimeError(
+                        "repodata publication failed and rollback is incomplete; "
+                        "live repodata and rollback backup are both missing"
+                    ) from publication_error
+                # The backup rename failed before mutating the live destination.
+            elif destination_metadata is not None:
+                try:
+                    if (
+                        stat.S_ISDIR(destination_metadata.st_mode)
+                        and not stat.S_ISLNK(destination_metadata.st_mode)
+                    ):
                         shutil.rmtree(destination)
                     else:
                         destination.unlink()
@@ -1122,17 +1162,9 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
                     publication_error.add_note(
                         f"Could not remove failed repodata destination {destination}: {cleanup_error}"
                     )
-            if had_existing:
-                try:
-                    os.replace(backup, destination)
-                except BaseException as restore_error:
-                    preserve_backup = True
-                    rollback_error = RuntimeError(
-                        "repodata publication failed and rollback is incomplete; "
-                        f"preserved rollback backup for recovery at {backup}"
-                    )
-                    rollback_error.add_note(f"Original publication error: {publication_error!r}")
-                    raise rollback_error from restore_error
+                    raise RuntimeError(
+                        "repodata publication failed and rollback is incomplete"
+                    ) from publication_error
             _fsync_directories([parent])
             raise
         if had_existing:
@@ -1140,7 +1172,7 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
     finally:
         if staged.exists():
             shutil.rmtree(staged)
-        if backup.exists() and not preserve_backup:
+        if backup.exists() and not had_existing:
             shutil.rmtree(backup)
 
 
@@ -1607,13 +1639,13 @@ def _publish_index_at(site_fd: int, source_fd: int) -> None:
         _copy_index_source(source_fd, temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
+        replaced = True
         os.replace(
             temporary_name,
             index_name,
             src_dir_fd=site_fd,
             dst_dir_fd=site_fd,
         )
-        replaced = True
         os.fsync(site_fd)
         metadata = os.stat(index_name, dir_fd=site_fd, follow_symlinks=False)
         if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o644:
@@ -1633,6 +1665,7 @@ def _publish_index_at(site_fd: int, source_fd: int) -> None:
                     src_dir_fd=site_fd,
                     dst_dir_fd=site_fd,
                 )
+                _unlink_index_name(site_fd, backup_name)
                 backup_exists = False
             elif not old_index_exists:
                 _unlink_index_name(site_fd, index_name)

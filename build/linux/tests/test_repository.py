@@ -734,6 +734,46 @@ class RepositoryTests(unittest.TestCase):
                     if backup.is_dir() and not backup.is_symlink():
                         shutil.rmtree(backup)
 
+    def test_publish_repodata_keeps_old_tree_when_backup_rename_interrupts(self):
+        for timing in ("before", "after"):
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                source = root / "source"
+                destination = root / "repodata"
+                source.mkdir()
+                destination.mkdir()
+                (source / "new.xml").write_bytes(b"new metadata\n")
+                (destination / "old.xml").write_bytes(b"old metadata\n")
+                real_replace = os.replace
+                interrupted = False
+
+                def interrupt_backup_rename(source_path, destination_path):
+                    nonlocal interrupted
+                    if pathlib.Path(source_path) == destination:
+                        interrupted = True
+                        if timing == "before":
+                            raise KeyboardInterrupt("before old repodata rename")
+                        result = real_replace(source_path, destination_path)
+                        raise KeyboardInterrupt("after old repodata rename")
+                    return real_replace(source_path, destination_path)
+
+                with mock.patch(
+                    "build.linux.repository.os.replace",
+                    side_effect=interrupt_backup_rename,
+                ):
+                    with self.assertRaisesRegex(
+                        KeyboardInterrupt, f"{timing} old repodata"
+                    ):
+                        _publish_repodata(source, destination)
+
+                self.assertTrue(interrupted)
+                self.assertEqual(
+                    b"old metadata\n", (destination / "old.xml").read_bytes()
+                )
+                self.assertFalse((destination / "new.xml").exists())
+                self.assertEqual([], list(root.glob(".repodata.publish-*")))
+                self.assertEqual([], list(root.glob(".repodata.rollback-*")))
+
     def test_rpm_build_recovers_one_stranded_valid_repodata_backup_before_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -1505,6 +1545,50 @@ class RepositoryTests(unittest.TestCase):
                     self._build(root, site=site)
             self.assertEqual(before, {path: path.read_bytes() for path in metadata})
 
+    def test_metadata_interrupt_before_or_after_replace_restores_exact_prior_state(self):
+        for timing in ("before", "after"):
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                existing = root / "existing"
+                absent = root / "absent"
+                existing.write_bytes(b"old existing bytes\x00\xff")
+                sources = (root / "existing.new", root / "absent.new")
+                sources[0].write_bytes(b"new existing bytes")
+                sources[1].write_bytes(b"new absent bytes")
+                real_replace = os.replace
+                interrupted = False
+
+                def interrupt_publication(source_path, destination_path):
+                    nonlocal interrupted
+                    source_candidate = pathlib.Path(source_path)
+                    destination_candidate = pathlib.Path(destination_path)
+                    is_target = (
+                        destination_candidate == absent
+                        and source_candidate.name.startswith(f".{absent.name}.publish-")
+                    )
+                    if is_target and timing == "before":
+                        interrupted = True
+                        raise KeyboardInterrupt("before metadata replace")
+                    result = real_replace(source_path, destination_path)
+                    if is_target:
+                        interrupted = True
+                        raise KeyboardInterrupt("after metadata replace")
+                    return result
+
+                with mock.patch(
+                    "build.linux.repository.os.replace", side_effect=interrupt_publication
+                ):
+                    with self.assertRaisesRegex(KeyboardInterrupt, f"{timing} metadata"):
+                        repository_module._publish_metadata(
+                            ((sources[0], existing), (sources[1], absent))
+                        )
+
+                self.assertTrue(interrupted)
+                self.assertEqual(b"old existing bytes\x00\xff", existing.read_bytes())
+                self.assertFalse(absent.exists())
+                self.assertEqual([], list(root.glob(".*.publish-*")))
+                self.assertEqual([], list(root.glob(".*.rollback-*")))
+
     def test_directory_open_failure_rolls_back_metadata_without_fd_or_backup_leaks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -2020,6 +2104,48 @@ class RepositoryTests(unittest.TestCase):
                     repository_module._publish_site_index(site, source)
             self.assertTrue(failed_directory_fsync)
             self.assertEqual(b"old page\n", destination.read_bytes())
+            self.assertEqual([], list(site.glob(".index.html.*")))
+
+    def test_site_index_interrupt_after_replace_restores_old_index_without_remnants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            site.mkdir()
+            source = root / "pages-index.html"
+            source.write_bytes(b"new page\n")
+            destination = site / "index.html"
+            destination.write_bytes(b"old page\x00\xff")
+            real_replace = os.replace
+            interrupted = False
+
+            def interrupt_after_index_replace(
+                source_name, destination_name, *, src_dir_fd=None, dst_dir_fd=None
+            ):
+                nonlocal interrupted
+                result = real_replace(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+                if (
+                    os.fspath(destination_name) == "index.html"
+                    and os.fspath(source_name).startswith(".index.html.tmp-")
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt("after index replace")
+                return result
+
+            with mock.patch.object(
+                repository_module.os,
+                "replace",
+                side_effect=interrupt_after_index_replace,
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "after index"):
+                    repository_module._publish_site_index(site, source)
+
+            self.assertTrue(interrupted)
+            self.assertEqual(b"old page\x00\xff", destination.read_bytes())
             self.assertEqual([], list(site.glob(".index.html.*")))
 
     def test_site_index_source_parent_swap_never_publishes_attacker_bytes(self):
