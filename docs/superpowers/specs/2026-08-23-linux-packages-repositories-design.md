@@ -149,22 +149,30 @@ Users configure DNF with `gpgcheck=1`, `repo_gpgcheck=1`, the stable x86-64 base
 
 ## Signing and key handling
 
-An existing deployment GPG key is reused. Private key material and its passphrase exist only as GitHub Repository Secrets:
+A dedicated repository-signing GPG key is created for Object Storage Client with this identity:
+
+```text
+Object Storage Client Linux Repository <devcode-kr@users.noreply.github.com>
+```
+
+The key is RSA 4096, signing-only, and expires three years after creation. Key rotation publishes the successor public key alongside the current key before repository metadata begins using the successor.
+
+Private key material and its generated passphrase are stored as GitHub Repository Secrets:
 
 ```text
 LINUX_REPO_GPG_PRIVATE_KEY
 LINUX_REPO_GPG_PASSPHRASE
 ```
 
-The expected full fingerprint is a GitHub Repository Variable:
+The full fingerprint is stored as a GitHub Repository Variable:
 
 ```text
 LINUX_REPO_GPG_FINGERPRINT
 ```
 
-The matching public key is committed as `build/linux/repository-key.asc` and copied to the Pages root. Release automation imports the private key into an ephemeral GnuPG home, derives its fingerprint, and requires exact agreement with both the configured fingerprint and committed public key before signing.
+The matching public key is committed as `build/linux/repository-key.asc` and copied to the Pages root. An encrypted private-key recovery export and its passphrase are also retained under `/workspace/hermes_home/secure/object-storage-client-linux-repository/` with directory mode `0700` and file mode `0600`; they are never placed in the product repository, artifacts, logs, chat, or documentation. Release automation imports the private key into an ephemeral GnuPG home, derives its fingerprint, and requires exact agreement with both the configured fingerprint and committed public key before signing.
 
-The workflow must not print the private key, passphrase, secret-bearing commands, or an environment dump. Temporary GnuPG state is removed after signing. A missing key, wrong fingerprint, signing error, or verification failure stops publication; the workflow never falls back to unsigned output.
+The workflow and provisioning procedure must not print the private key, passphrase, secret-bearing commands, or an environment dump. Temporary GnuPG state is removed after signing. A missing key, wrong fingerprint, expired key, signing error, or verification failure stops publication; the workflow never falls back to unsigned output.
 
 ## Release data flow
 
@@ -289,4 +297,4 @@ The feature is ready for a pull request when:
 6. tag-only publication and secret handling tests pass;
 7. the existing .NET test suite and platform release builds remain green;
 8. no release or Pages state is changed by pull request validation or manual workflow dispatch;
-9. a live tag release is not performed until the existing GPG secrets, fingerprint variable, public key, and GitHub Pages source are configured and verified.
+9. a live tag release is not performed until the dedicated GPG key backup, GitHub secrets, fingerprint variable, public key, and GitHub Pages source are configured and verified.
