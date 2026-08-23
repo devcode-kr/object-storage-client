@@ -14,7 +14,7 @@ _DEFAULT_BASE_URL = "https://devcode-kr.github.io/object-storage-client"
 _ASCII_WHITESPACE = " \t\n\r\v\f"
 _FINGERPRINT = re.compile(r"[0-9A-F]{40}")
 _KEY_CAPABILITIES = re.compile(r"[escaESCAD]+")
-_UNUSABLE_VALIDITY = frozenset({"r", "d", "i", "e"})
+_UNUSABLE_VALIDITY = frozenset({"r", "d", "i", "e", "n"})
 
 
 @dataclass(frozen=True)

@@ -305,7 +305,7 @@ class RepositoryTests(unittest.TestCase):
             _verify_controlled_output(output, dt.datetime(2026, 1, 1))
 
     def test_unusable_primary_validity_states_are_rejected_but_dash_is_accepted(self):
-        for validity in ("r", "d", "i", "e"):
+        for validity in ("r", "d", "i", "e", "n"):
             with self.subTest(validity=validity):
                 output = "\n".join(
                     (
@@ -420,15 +420,21 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual("A" * 40, _verify_controlled_output(output, now).fingerprint)
 
     def test_unusable_signing_subkey_does_not_authorize_key(self):
-        output = _key_output(
-            _colon_record(
-                "sub", validity="r", created=1_000, expires=1_900, capabilities="s"
-            )
-        )
-        with self.assertRaisesRegex(RuntimeError, "usable signing key"):
-            _verify_controlled_output(
-                output, dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
-            )
+        for validity in ("r", "n"):
+            with self.subTest(validity=validity):
+                output = _key_output(
+                    _colon_record(
+                        "sub",
+                        validity=validity,
+                        created=1_000,
+                        expires=1_900,
+                        capabilities="s",
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "usable signing key"):
+                    _verify_controlled_output(
+                        output, dt.datetime.fromtimestamp(1_500, tz=dt.timezone.utc)
+                    )
 
     def test_malformed_signing_record_timestamps_and_capabilities_are_clear(self):
         malformed = (
