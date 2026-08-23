@@ -9,8 +9,11 @@ import os
 import pathlib
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
+import time
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -102,6 +105,9 @@ def _fake_apt_ftparchive(
     *,
     malformed_release: bool = False,
     malformed_packages: bool = False,
+    release_overrides: tuple[tuple[str, str], ...] = (),
+    omitted_release_fields: tuple[str, ...] = (),
+    duplicate_release_fields: tuple[str, ...] = (),
 ) -> pathlib.Path:
     root.mkdir(parents=True, exist_ok=True)
     tool = root / "apt-ftparchive"
@@ -113,12 +119,18 @@ for item in args[:-2]:
     if item.startswith("APT::FTPArchive::Release::"):
         key, value = item.split("=", 1)
         fields[key.rsplit("::", 1)[1]] = value
-required = ("Origin", "Label", "Suite", "Codename", "Architectures", "Components", "Description")
+required = ("Origin", "Label", "Suite", "Codename", "Architectures", "Components", "Description", "Date", "Valid-Until")
 if any(name not in fields for name in required):
     sys.exit(24)
+output_fields = fields.copy()
+output_fields.update(dict(RELEASE_OVERRIDES))
+for name in OMITTED_RELEASE_FIELDS:
+    output_fields.pop(name, None)
 for name in required:
-    print(f"{name}: {fields[name]}")
-print("Date: Mon, 24 Aug 2026 00:00:00 +0000")
+    if name in output_fields:
+        print(f"{name}: {output_fields[name]}")
+for name in DUPLICATE_RELEASE_FIELDS:
+    print(f"{name}: {output_fields.get(name, 'duplicate')}")
 algorithms = (("MD5Sum", "md5"), ("SHA1", "sha1"), ("SHA256", "sha256"), ("SHA512", "sha512"))
 for section, algorithm in algorithms:
     print(f"{section}:")
@@ -129,12 +141,25 @@ for section, algorithm in algorithms:
 '''
     tool.write_text(
         "#!/usr/bin/env python3\n"
-        "import hashlib, pathlib, sys\n"
+        "import hashlib, os, pathlib, sys, time\n"
+        f"RELEASE_OVERRIDES = {release_overrides!r}\n"
+        f"OMITTED_RELEASE_FIELDS = {omitted_release_fields!r}\n"
+        f"DUPLICATE_RELEASE_FIELDS = {duplicate_release_fields!r}\n"
         "args = sys.argv[1:]\n"
         "cwd = pathlib.Path.cwd()\n"
         "if args == ['packages', 'pool/main/o/object-storage-client']:\n"
         "    packages = sorted((cwd / args[1]).glob('*.deb'))\n"
         "    if not packages: sys.exit(23)\n"
+        "    event_log = os.environ.get('OSC_APT_EVENT_LOG')\n"
+        "    if event_log:\n"
+        "        with open(event_log, 'a', encoding='utf-8') as stream:\n"
+        "            stream.write('packages-start ' + ','.join(package.name for package in packages) + '\\n')\n"
+        "            stream.flush(); os.fsync(stream.fileno())\n"
+        "    blocked = os.environ.get('OSC_APT_BLOCK_PACKAGE')\n"
+        "    if blocked and any(package.name == blocked for package in packages):\n"
+        "        pathlib.Path(os.environ['OSC_APT_READY']).touch()\n"
+        "        gate = pathlib.Path(os.environ['OSC_APT_GATE'])\n"
+        "        while not gate.exists(): time.sleep(0.01)\n"
         "    for index, package in enumerate(packages):\n"
         "        if index: print()\n"
         "        print('Package: object-storage-client')\n"
@@ -270,6 +295,7 @@ class RepositoryTests(unittest.TestCase):
         origin: str = "Object Storage Client",
         label: str = "Object Storage Client",
         base_url: str = BASE_URL,
+        now: dt.datetime | None = None,
     ) -> pathlib.Path:
         package = deb or (root / "object-storage-client_1.2.3_amd64.deb")
         if deb is None:
@@ -288,6 +314,7 @@ class RepositoryTests(unittest.TestCase):
             base_url=base_url,
             apt_ftparchive=tool,
             gpg=gpg,
+            now=now,
         )
         return destination
 
@@ -397,6 +424,154 @@ class RepositoryTests(unittest.TestCase):
                     self.assertEqual(hashlib.sha256(data).hexdigest(), stanza["SHA256"])
                     self.assertEqual(hashlib.sha512(data).hexdigest(), stanza["SHA512"])
             self.assertEqual(packages_bytes, gzip.decompress((paths.binary / "Packages.gz").read_bytes()))
+
+    def test_concurrent_publications_are_process_serialized_and_retain_both_versions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            first = root / "object-storage-client_1.0.0_amd64.deb"
+            second = root / "object-storage-client_2.0.0_amd64.deb"
+            first.write_bytes(b"concurrent version one\n")
+            second.write_bytes(b"concurrent version two\n")
+            tool = _fake_apt_ftparchive(root / "tools")
+            ready = root / "first-ready"
+            gate = root / "release-first"
+            event_log = root / "apt-events"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "OSC_APT_BLOCK_PACKAGE": first.name,
+                    "OSC_APT_READY": os.fspath(ready),
+                    "OSC_APT_GATE": os.fspath(gate),
+                    "OSC_APT_EVENT_LOG": os.fspath(event_log),
+                }
+            )
+            script = (
+                "from build.linux.repository import build_apt_repository; import sys; "
+                "build_apt_repository(site_dir=sys.argv[1], deb=sys.argv[2], "
+                "public_key=sys.argv[3], expected_fingerprint=sys.argv[4], "
+                "private_key=sys.argv[5], passphrase_file=sys.argv[6], "
+                "apt_ftparchive=sys.argv[7], gpg='gpg')"
+            )
+
+            def command(package: pathlib.Path) -> list[str]:
+                return [
+                    sys.executable,
+                    "-c",
+                    script,
+                    os.fspath(site),
+                    os.fspath(package),
+                    os.fspath(self.public_key),
+                    self.throwaway_fingerprint,
+                    os.fspath(self.secret_key),
+                    os.fspath(self.passphrase_file),
+                    os.fspath(tool),
+                ]
+
+            first_process = subprocess.Popen(
+                command(first), cwd=ROOT, env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True
+            )
+            second_process = None
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "first publication never reached apt-ftparchive")
+                active_locks = list(site.parent.glob(".osc-apt-*.lock"))
+                self.assertEqual(1, len(active_locks))
+                lock_inode = active_locks[0].stat().st_ino
+                second_process = subprocess.Popen(
+                    command(second), cwd=ROOT, env=environment, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True
+                )
+                time.sleep(0.5)
+                self.assertEqual(
+                    [f"packages-start {first.name}"],
+                    event_log.read_text(encoding="utf-8").splitlines(),
+                    "the second process entered metadata generation before the first released the site lock",
+                )
+                gate.touch()
+                first_stdout, first_stderr = first_process.communicate(timeout=60)
+                second_stdout, second_stderr = second_process.communicate(timeout=60)
+                self.assertEqual(0, first_process.returncode, first_stdout + first_stderr)
+                self.assertEqual(0, second_process.returncode, second_stdout + second_stderr)
+            finally:
+                gate.touch(exist_ok=True)
+                for process in (first_process, second_process):
+                    if process is not None:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate()
+
+            paths = apt_paths(site)
+            self.assertEqual({first.name, second.name}, {path.name for path in paths.pool.iterdir()})
+            packages = (paths.binary / "Packages").read_text(encoding="utf-8")
+            self.assertIn(first.name, packages)
+            self.assertIn(second.name, packages)
+            release = (paths.release / "Release").read_text(encoding="utf-8")
+            release_sha256 = {
+                fields[2]: (fields[0], fields[1])
+                for line in release.split("SHA256:\n", 1)[1].split("SHA512:\n", 1)[0].splitlines()
+                if len(fields := line.split()) == 3
+            }
+            for relative in ("main/binary-amd64/Packages", "main/binary-amd64/Packages.gz"):
+                path = paths.release / relative
+                self.assertEqual(
+                    (hashlib.sha256(path.read_bytes()).hexdigest(), str(path.stat().st_size)),
+                    release_sha256[relative],
+                )
+            lock_files = list(site.parent.glob(".osc-apt-*.lock"))
+            self.assertEqual(1, len(lock_files))
+            self.assertFalse(lock_files[0].is_symlink())
+            self.assertTrue(stat.S_ISREG(lock_files[0].lstat().st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(lock_files[0].stat().st_mode))
+            self.assertEqual(lock_inode, lock_files[0].stat().st_ino)
+
+    def test_release_dates_are_explicit_utc_and_exactly_seven_days_fresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            now = dt.datetime.now(tz=dt.timezone.utc).replace(microsecond=0)
+            site = self._build(root, now=now)
+            release = (apt_paths(site).release / "Release").read_text(encoding="utf-8")
+            self.assertIn(now.strftime("Date: %a, %d %b %Y %H:%M:%S GMT"), release)
+            self.assertIn(
+                (now + dt.timedelta(days=7)).strftime("Valid-Until: %a, %d %b %Y %H:%M:%S GMT"),
+                release,
+            )
+
+    def test_release_freshness_rejects_missing_malformed_stale_order_and_duplicates(self):
+        now = dt.datetime.now(tz=dt.timezone.utc).replace(microsecond=0)
+        formatted_now = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        day = dt.timedelta(days=1)
+
+        def formatted(value: dt.datetime) -> str:
+            return value.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        cases: tuple[tuple[dict[str, Any], str], ...] = (
+            ({"omitted_release_fields": ("Date",)}, "Date"),
+            ({"omitted_release_fields": ("Valid-Until",)}, "Valid-Until"),
+            ({"release_overrides": (("Date", "not-a-date"),)}, "Date"),
+            ({"release_overrides": (("Valid-Until", "not-a-date"),)}, "Valid-Until"),
+            ({"release_overrides": (("Date", "Mon, 24 Aug 2026 00:00:00"),)}, "Date"),
+            ({"release_overrides": (("Valid-Until", formatted_now),)}, "ordering"),
+            (
+                {"release_overrides": (("Valid-Until", formatted(now + 6 * day)),)},
+                "seven days|freshness",
+            ),
+            (
+                {"release_overrides": (("Date", formatted(now - 8 * day)), ("Valid-Until", formatted(now - day))),},
+                "expired",
+            ),
+            ({"duplicate_release_fields": ("Date",)}, "duplicate Date"),
+            ({"duplicate_release_fields": ("Valid-Until",)}, "duplicate Valid-Until"),
+        )
+        for index, (tool_options, message) in enumerate(cases):
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                tool = _fake_apt_ftparchive(root / "tool", **tool_options)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._build(root, apt_ftparchive=os.fspath(tool), now=now)
 
     def test_same_package_and_key_are_idempotent_but_collisions_are_immutable(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -569,11 +744,26 @@ class RepositoryTests(unittest.TestCase):
                 self._build(root, site=site)
             self.assertEqual([], list(elsewhere.iterdir()))
 
+    def test_site_lock_symlink_collision_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            lock_files = list(site.parent.glob(".osc-apt-*.lock"))
+            self.assertEqual(1, len(lock_files))
+            lock_files[0].unlink()
+            target = root / "lock-target"
+            target.write_bytes(b"must remain unchanged\n")
+            lock_files[0].symlink_to(target)
+            with self.assertRaisesRegex(RuntimeError, "lock|symlink|regular"):
+                self._build(root, site=site)
+            self.assertEqual(b"must remain unchanged\n", target.read_bytes())
+
     def test_missing_native_apt_ftparchive_status_is_explicit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            with self.assertRaisesRegex(RuntimeError, "apt-ftparchive.*not available"):
-                self._build(root, apt_ftparchive="apt-ftparchive")
+            with mock.patch("build.linux.repository.shutil.which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "apt-ftparchive.*not available"):
+                    self._build(root, apt_ftparchive="apt-ftparchive")
 
     def test_release_fields_reject_control_character_injection(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -706,6 +896,70 @@ class RepositoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, "publication"):
                     self._build(root, site=site)
             self.assertEqual(before, {path: path.read_bytes() for path in metadata})
+
+    def test_directory_open_failure_rolls_back_metadata_without_fd_or_backup_leaks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            metadata = tuple(paths.binary / name for name in ("Packages", "Packages.gz")) + tuple(
+                paths.release / name for name in ("Release", "InRelease", "Release.gpg")
+            )
+            for index, path in enumerate(metadata):
+                path.write_bytes(f"old open-failure metadata {index}\n".encode())
+            before = {path: path.read_bytes() for path in metadata}
+            descriptors_before = len(list(pathlib.Path("/proc/self/fd").iterdir()))
+            real_open = os.open
+            metadata_directory_opens = 0
+
+            def fail_second_metadata_directory_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal metadata_directory_opens
+                candidate = pathlib.Path(path)
+                if flags & os.O_DIRECTORY and candidate in {paths.binary, paths.release}:
+                    metadata_directory_opens += 1
+                    if metadata_directory_opens == 2:
+                        raise OSError("simulated metadata directory open failure")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch("build.linux.repository.os.open", side_effect=fail_second_metadata_directory_open):
+                with self.assertRaisesRegex(OSError, "directory open failure"):
+                    self._build(root, site=site)
+            self.assertEqual(before, {path: path.read_bytes() for path in metadata})
+            self.assertEqual(descriptors_before, len(list(pathlib.Path("/proc/self/fd").iterdir())))
+            self.assertEqual([], list(site.rglob(".*.publish-*")))
+            self.assertEqual([], list(site.rglob(".*.rollback-*")))
+
+    def test_directory_fsync_failure_rolls_back_metadata_without_fd_or_backup_leaks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            metadata = tuple(paths.binary / name for name in ("Packages", "Packages.gz")) + tuple(
+                paths.release / name for name in ("Release", "InRelease", "Release.gpg")
+            )
+            for index, path in enumerate(metadata):
+                path.write_bytes(f"old fsync-failure metadata {index}\n".encode())
+            before = {path: path.read_bytes() for path in metadata}
+            descriptors_before = len(list(pathlib.Path("/proc/self/fd").iterdir()))
+            real_fsync = os.fsync
+            failed = False
+
+            def fail_first_release_directory_fsync(descriptor):
+                nonlocal failed
+                target = pathlib.Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+                if not failed and target == paths.release:
+                    failed = True
+                    raise OSError("simulated metadata directory fsync failure")
+                return real_fsync(descriptor)
+
+            with mock.patch("build.linux.repository.os.fsync", side_effect=fail_first_release_directory_fsync):
+                with self.assertRaisesRegex(OSError, "directory fsync failure"):
+                    self._build(root, site=site)
+            self.assertTrue(failed)
+            self.assertEqual(before, {path: path.read_bytes() for path in metadata})
+            self.assertEqual(descriptors_before, len(list(pathlib.Path("/proc/self/fd").iterdir())))
+            self.assertEqual([], list(site.rglob(".*.publish-*")))
+            self.assertEqual([], list(site.rglob(".*.rollback-*")))
 
     def test_apt_paths_are_frozen_stable_only_and_pure(self):
         with tempfile.TemporaryDirectory() as temporary:

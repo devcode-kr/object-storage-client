@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 from dataclasses import dataclass
+from email.utils import format_datetime, parsedate_to_datetime
+import fcntl
 import gzip
 import hashlib
 import os
@@ -18,6 +21,7 @@ _ASCII_WHITESPACE = " \t\n\r\v\f"
 _FINGERPRINT = re.compile(r"[0-9A-F]{40}")
 _KEY_CAPABILITIES = re.compile(r"[escaESCAD]+")
 _UNUSABLE_VALIDITY = frozenset({"r", "d", "i", "e", "n"})
+_APT_METADATA_LIFETIME = dt.timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -398,6 +402,69 @@ def _mkdir_repository_tree(site: pathlib.Path, destination: pathlib.Path) -> Non
         _mkdir_mode(current)
 
 
+def _site_lock_path(site: pathlib.Path) -> pathlib.Path:
+    resolved = site.absolute().resolve(strict=False)
+    identity = hashlib.sha256(os.fsencode(resolved)).hexdigest()[:32]
+    return resolved.parent / f".osc-apt-{identity}.lock"
+
+
+@contextmanager
+def _exclusive_site_lock(site: pathlib.Path):
+    _reject_symlink_components(site, "site repository")
+    resolved = site.absolute().resolve(strict=False)
+    _reject_symlink_components(resolved.parent, "site lock parent")
+    _mkdir_mode(resolved.parent)
+    _reject_symlink_components(site, "site repository")
+    lock_path = _site_lock_path(resolved)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(
+            f"site lock must be a regular non-symlink file: {lock_path}"
+        ) from error
+    locked = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        try:
+            named = lock_path.lstat()
+        except OSError as error:
+            raise RuntimeError(f"cannot inspect site lock file: {lock_path}") from error
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise RuntimeError(
+                f"site lock must be the named regular non-symlink 0600 file: {lock_path}"
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        named_after_lock = lock_path.lstat()
+        if (
+            stat.S_ISLNK(named_after_lock.st_mode)
+            or not stat.S_ISREG(named_after_lock.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (named_after_lock.st_dev, named_after_lock.st_ino)
+        ):
+            raise RuntimeError(f"site lock path changed while acquiring lock: {lock_path}")
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _copy_immutable(source: pathlib.Path, destination: pathlib.Path) -> None:
     if _check_immutable_destination(source, destination):
         destination.chmod(0o644)
@@ -591,6 +658,9 @@ def _validate_release(
     label: str,
     description: str,
     release_root: pathlib.Path,
+    build_instant: dt.datetime,
+    expected_date: dt.datetime,
+    expected_valid_until: dt.datetime,
 ) -> None:
     if _CONTROL_CHARACTER.search(text.replace("\n", "")):
         raise RuntimeError("apt-ftparchive Release output contains control characters")
@@ -603,8 +673,34 @@ def _validate_release(
             if name in values:
                 raise RuntimeError(f"apt-ftparchive Release output contains duplicate {name} fields")
             values[name] = value.strip()
-    if not values.get("Date"):
-        raise RuntimeError("apt-ftparchive Release output has an invalid or missing Date field")
+    parsed_dates: dict[str, dt.datetime] = {}
+    for field in ("Date", "Valid-Until"):
+        value = values.get(field)
+        if not value:
+            raise RuntimeError(
+                f"apt-ftparchive Release output has an invalid or missing {field} field"
+            )
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"apt-ftparchive Release output has a malformed {field} field"
+            ) from error
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise RuntimeError(
+                f"apt-ftparchive Release output has a timezone-naive {field} field"
+            )
+        parsed_dates[field] = parsed.astimezone(dt.timezone.utc)
+    if parsed_dates["Valid-Until"] <= parsed_dates["Date"]:
+        raise RuntimeError("apt-ftparchive Release output has invalid Date and Valid-Until ordering")
+    if parsed_dates["Valid-Until"] - parsed_dates["Date"] != _APT_METADATA_LIFETIME:
+        raise RuntimeError("apt-ftparchive Release output freshness window is not exactly seven days")
+    if parsed_dates["Valid-Until"] <= build_instant:
+        raise RuntimeError("apt-ftparchive Release output is already expired at the build instant")
+    if parsed_dates["Date"] != expected_date:
+        raise RuntimeError("apt-ftparchive Release output Date does not match the build instant")
+    if parsed_dates["Valid-Until"] != expected_valid_until:
+        raise RuntimeError("apt-ftparchive Release output Valid-Until is not exactly seven days after Date")
     for name, value in expected.items():
         if values.get(name) != value:
             raise RuntimeError(f"apt-ftparchive Release output has an invalid or missing {name} field")
@@ -707,10 +803,32 @@ def _stage_publication(source: pathlib.Path, destination: pathlib.Path) -> pathl
         raise
 
 
+def _fsync_directories(directories: list[pathlib.Path]) -> None:
+    seen: set[pathlib.Path] = set()
+    for directory in directories:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        fsync_error: BaseException | None = None
+        try:
+            os.fsync(descriptor)
+        except BaseException as error:
+            fsync_error = error
+        try:
+            os.close(descriptor)
+        except BaseException:
+            if fsync_error is None:
+                raise
+        if fsync_error is not None:
+            raise fsync_error
+
+
 def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...]) -> None:
     staged: list[tuple[pathlib.Path, pathlib.Path]] = []
     backups: dict[pathlib.Path, pathlib.Path | None] = {}
     published: list[pathlib.Path] = []
+    cleanup_backups = True
     try:
         for source, destination in publications:
             staged.append((destination, _stage_publication(source, destination)))
@@ -738,8 +856,9 @@ def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...
             for destination, staged_path in staged:
                 os.replace(staged_path, destination)
                 published.append(destination)
+            _fsync_directories([destination.parent for destination, _ in staged])
         except BaseException as publication_error:
-            rollback_errors: list[OSError] = []
+            rollback_errors: list[BaseException] = []
             for destination in reversed(published):
                 backup = backups[destination]
                 try:
@@ -747,32 +866,62 @@ def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...
                         destination.unlink(missing_ok=True)
                     else:
                         os.replace(backup, destination)
-                except OSError as rollback_error:
+                except BaseException as rollback_error:
                     rollback_errors.append(rollback_error)
+            try:
+                _fsync_directories([destination.parent for destination in published])
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
             if rollback_errors:
+                cleanup_backups = False
                 raise RuntimeError(
                     "metadata publication failed and rollback was incomplete"
                 ) from publication_error
             raise
-        directory_descriptors = {
-            os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-            for destination, _ in staged
-        }
-        try:
-            for descriptor in directory_descriptors:
-                os.fsync(descriptor)
-        finally:
-            for descriptor in directory_descriptors:
-                os.close(descriptor)
     finally:
         for _, staged_path in staged:
             staged_path.unlink(missing_ok=True)
-        for backup in backups.values():
-            if backup is not None:
-                backup.unlink(missing_ok=True)
+        if cleanup_backups:
+            for backup in backups.values():
+                if backup is not None:
+                    backup.unlink(missing_ok=True)
 
 
 def build_apt_repository(
+    *,
+    site_dir: os.PathLike[str] | str,
+    deb: os.PathLike[str] | str,
+    public_key: os.PathLike[str] | str,
+    expected_fingerprint: str,
+    private_key: os.PathLike[str] | str,
+    passphrase_file: os.PathLike[str] | str,
+    origin: str = "Object Storage Client",
+    label: str = "Object Storage Client",
+    base_url: str = _DEFAULT_BASE_URL,
+    apt_ftparchive: str = "apt-ftparchive",
+    gpg: str = "gpg",
+    now: dt.datetime | None = None,
+) -> AptPaths:
+    site = _path(site_dir)
+    _reject_symlink_components(site, "site repository")
+    with _exclusive_site_lock(site):
+        return _build_apt_repository_locked(
+            site_dir=site,
+            deb=deb,
+            public_key=public_key,
+            expected_fingerprint=expected_fingerprint,
+            private_key=private_key,
+            passphrase_file=passphrase_file,
+            origin=origin,
+            label=label,
+            base_url=base_url,
+            apt_ftparchive=apt_ftparchive,
+            gpg=gpg,
+            now=now,
+        )
+
+
+def _build_apt_repository_locked(
     *,
     site_dir: os.PathLike[str] | str,
     deb: os.PathLike[str] | str,
@@ -820,6 +969,11 @@ def build_apt_repository(
     base_url = _validate_release_value("base_url", base_url)
     expected = normalize_fingerprint(expected_fingerprint)
     instant = now if now is not None else dt.datetime.now(tz=dt.timezone.utc)
+    if not isinstance(instant, dt.datetime):
+        raise TypeError("now must be a datetime")
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    instant = instant.astimezone(dt.timezone.utc).replace(microsecond=0)
 
     package_destination = paths.pool / package.name
     key_destination = site / "repository-key.asc"
@@ -863,6 +1017,7 @@ def build_apt_repository(
         os.utime(packages_gzip, (0, 0))
 
         description = f"Object Storage Client APT repository at {base_url}"
+        valid_until = instant + _APT_METADATA_LIFETIME
         options = {
             "Origin": origin,
             "Label": label,
@@ -871,6 +1026,8 @@ def build_apt_repository(
             "Architectures": "amd64",
             "Components": "main",
             "Description": description,
+            "Date": format_datetime(instant, usegmt=True),
+            "Valid-Until": format_datetime(valid_until, usegmt=True),
         }
         release_command = [apt_tool]
         for name, value in options.items():
@@ -882,7 +1039,14 @@ def build_apt_repository(
             cwd=build_root,
         )
         _validate_release(
-            release_result.stdout, origin, label, description, temporary_release
+            release_result.stdout,
+            origin,
+            label,
+            description,
+            temporary_release,
+            instant,
+            instant,
+            valid_until,
         )
         release_path = temporary_release / "Release"
         release_path.write_text(release_result.stdout, encoding="utf-8", newline="\n")
