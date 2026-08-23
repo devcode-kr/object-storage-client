@@ -18,6 +18,7 @@ from typing import Any
 import unittest
 from unittest import mock
 
+import build.linux.repository as repository_module
 from build.linux.repository import (
     AptPaths,
     PublicKeyInfo,
@@ -1929,6 +1930,219 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual("Object Storage Client", options.origin)
         self.assertEqual("Object Storage Client", options.label)
         self.assertEqual(BASE_URL, options.base_url)
+
+    def test_main_passes_exact_cli_values_to_both_repository_builders(self):
+        arguments = [
+            "--site-dir", "published-site",
+            "--deb", "input.deb",
+            "--rpm", "input.rpm",
+            "--public-key", "public.asc",
+            "--expected-fingerprint", "A" * 40,
+            "--private-key", "private.asc",
+            "--passphrase-file", "secret-input",
+        ]
+        common = {
+            "site_dir": pathlib.Path("published-site"),
+            "public_key": pathlib.Path("public.asc"),
+            "expected_fingerprint": "A" * 40,
+            "private_key": pathlib.Path("private.asc"),
+            "passphrase_file": pathlib.Path("secret-input"),
+        }
+        with (
+            mock.patch.object(repository_module, "build_apt_repository") as apt,
+            mock.patch.object(repository_module, "build_rpm_repository") as rpm,
+            mock.patch.object(repository_module, "_publish_site_index") as publish,
+        ):
+            self.assertEqual(0, repository_module.main(arguments))
+        apt.assert_called_once_with(
+            deb=pathlib.Path("input.deb"),
+            origin="Object Storage Client",
+            label="Object Storage Client",
+            base_url=BASE_URL,
+            **common,
+        )
+        rpm.assert_called_once_with(rpm_package=pathlib.Path("input.rpm"), **common)
+        publish.assert_called_once_with(
+            pathlib.Path("published-site"),
+            pathlib.Path(repository_module.__file__).with_name("pages-index.html"),
+        )
+
+    def test_site_index_publication_rejects_symlink_source_and_atomic_failure_preserves_old_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            site.mkdir()
+            source = root / "pages-index.html"
+            source.write_bytes(b"new page\n")
+            source_link = root / "page-link"
+            source_link.symlink_to(source)
+            destination = site / "index.html"
+            destination.write_bytes(b"old page\n")
+            with self.assertRaisesRegex(RuntimeError, "source.*symlink|symlink.*source"):
+                repository_module._publish_site_index(site, source_link)
+            self.assertEqual(b"old page\n", destination.read_bytes())
+
+            with mock.patch.object(repository_module.os, "replace", side_effect=OSError("injected")):
+                with self.assertRaisesRegex(RuntimeError, "publish.*index"):
+                    repository_module._publish_site_index(site, source)
+            self.assertEqual(b"old page\n", destination.read_bytes())
+            self.assertEqual([], list(site.glob(".index.html.*")))
+
+            with mock.patch.object(
+                repository_module,
+                "_fsync_directories",
+                side_effect=OSError("injected fsync failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "publish.*index"):
+                    repository_module._publish_site_index(site, source)
+            self.assertEqual(b"old page\n", destination.read_bytes())
+            self.assertEqual([], list(site.glob(".index.html.*")))
+
+    def _run_repository_cli(
+        self,
+        root: pathlib.Path,
+        *,
+        fail_rpm: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path, pathlib.Path, pathlib.Path]:
+        tools = root / "tools"
+        _fake_apt_ftparchive(tools)
+        _fake_rpm_tools(tools, self.throwaway_fingerprint)
+        deb = root / "object-storage-client_1.2.3_amd64.deb"
+        rpm = root / "object-storage-client-1.2.3-1.x86_64.rpm"
+        site = root / "site"
+        deb.write_bytes(b"CLI test deb package\n")
+        rpm.write_bytes(b"CLI test rpm package\n")
+        environment = os.environ.copy()
+        environment["PATH"] = os.fspath(tools) + os.pathsep + environment["PATH"]
+        environment["OSC_RPM_TOOL_LOG"] = os.fspath(root / "rpm-tool.log")
+        if fail_rpm:
+            environment["OSC_RPM_METADATA_FAIL"] = "1"
+        arguments = [
+            sys.executable,
+            os.fspath(LINUX / "repository.py"),
+            "--site-dir", os.fspath(site),
+            "--deb", os.fspath(deb),
+            "--rpm", os.fspath(rpm),
+            "--public-key", os.fspath(self.public_key),
+            "--expected-fingerprint", self.throwaway_fingerprint,
+            "--private-key", os.fspath(self.secret_key),
+            "--passphrase-file", os.fspath(self.passphrase_file),
+            "--origin", "CLI Origin",
+            "--label", "CLI Label",
+            "--base-url", "https://packages.example.invalid/client",
+        ]
+        result = subprocess.run(
+            arguments,
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        return result, site, deb, rpm
+
+    def test_package_import_is_quiet_and_direct_script_help_works_when_copied(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            before = set(root.iterdir())
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.fspath(ROOT)
+            imported = subprocess.run(
+                [sys.executable, "-c", "import build.linux.repository"],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, imported.returncode, imported.stderr)
+            self.assertEqual("", imported.stdout)
+            self.assertEqual("", imported.stderr)
+            self.assertEqual(before, set(root.iterdir()))
+
+            for source in (LINUX / "repository.py", LINUX / "pages-index.html"):
+                shutil.copy2(source, root / source.name)
+            for script in (LINUX / "repository.py", root / "repository.py"):
+                with self.subTest(script=script):
+                    helped = subprocess.run(
+                        [sys.executable, os.fspath(script), "--help"],
+                        cwd=ROOT,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, helped.returncode, helped.stderr)
+                    self.assertIn("--site-dir", helped.stdout)
+                    self.assertEqual("", helped.stderr)
+
+    def test_direct_cli_builds_complete_signed_apt_and_rpm_site_then_publishes_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            result, site, deb, rpm = self._run_repository_cli(root)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn(self.passphrase_file.read_text().strip(), result.stdout + result.stderr)
+            self.assertNotIn(self.throwaway_fingerprint, result.stdout + result.stderr)
+            expected_files = {
+                "apt/dists/stable/InRelease",
+                "apt/dists/stable/Release",
+                "apt/dists/stable/Release.gpg",
+                "apt/dists/stable/main/binary-amd64/Packages",
+                "apt/dists/stable/main/binary-amd64/Packages.gz",
+                f"apt/pool/main/o/object-storage-client/{deb.name}",
+                "index.html",
+                "repository-key.asc",
+                f"rpm/stable/x86_64/{rpm.name}",
+                "rpm/stable/x86_64/repodata/filelists.xml.gz",
+                "rpm/stable/x86_64/repodata/other.xml.gz",
+                "rpm/stable/x86_64/repodata/primary.xml.gz",
+                "rpm/stable/x86_64/repodata/repomd.xml",
+                "rpm/stable/x86_64/repodata/repomd.xml.asc",
+            }
+            actual_files = {
+                path.relative_to(site).as_posix()
+                for path in site.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(expected_files, actual_files)
+            for path in site.rglob("*"):
+                self.assertFalse(path.is_symlink(), path)
+                self.assertEqual(0o644 if path.is_file() else 0o755, stat.S_IMODE(path.stat().st_mode), path)
+            self.assertEqual((LINUX / "pages-index.html").read_bytes(), (site / "index.html").read_bytes())
+            self.assertEqual(self.public_key.read_bytes(), (site / "repository-key.asc").read_bytes())
+            published_text = "\n".join(path.relative_to(site).as_posix() for path in site.rglob("*"))
+            self.assertNotIn(self.secret_key.name, published_text)
+            self.assertNotIn(self.passphrase_file.name, published_text)
+
+            verify_home = root / "verify-home"
+            verify_home.mkdir(mode=0o700)
+            _run_gpg(verify_home, "--import", os.fspath(site / "repository-key.asc"))
+            release = site / "apt/dists/stable/Release"
+            _run_gpg(verify_home, "--verify", os.fspath(site / "apt/dists/stable/InRelease"))
+            _run_gpg(verify_home, "--verify", os.fspath(site / "apt/dists/stable/Release.gpg"), os.fspath(release))
+            repomd = site / "rpm/stable/x86_64/repodata/repomd.xml"
+            _run_gpg(verify_home, "--verify", os.fspath(repomd.with_suffix(".xml.asc")), os.fspath(repomd))
+            self.assertIn("CLI Origin", release.read_text(encoding="utf-8"))
+            self.assertIn("CLI Label", release.read_text(encoding="utf-8"))
+            self.assertIn("https://packages.example.invalid/client", release.read_text(encoding="utf-8"))
+
+    def test_rpm_failure_keeps_complete_apt_generation_and_existing_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            site.mkdir()
+            old_index = b"previous committed index\n"
+            (site / "index.html").write_bytes(old_index)
+            result, site, deb, rpm = self._run_repository_cli(root, fail_rpm=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(old_index, (site / "index.html").read_bytes())
+            self.assertTrue((site / f"apt/pool/main/o/object-storage-client/{deb.name}").is_file())
+            self.assertTrue((site / "apt/dists/stable/InRelease").is_file())
+            self.assertTrue((site / "apt/dists/stable/Release.gpg").is_file())
+            self.assertFalse((site / f"rpm/stable/x86_64/{rpm.name}").exists())
+            self.assertNotIn(self.passphrase_file.read_text().strip(), result.stdout + result.stderr)
+            self.assertNotIn(self.throwaway_fingerprint, result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     def test_pages_index_is_static_safe_and_complete(self):
         page = (LINUX / "pages-index.html").read_text(encoding="utf-8")

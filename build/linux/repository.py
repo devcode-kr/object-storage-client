@@ -1502,6 +1502,39 @@ def _build_apt_repository_locked(
     return paths
 
 
+def _publish_site_index(
+    site_dir: os.PathLike[str] | str,
+    source_page: os.PathLike[str] | str,
+) -> pathlib.Path:
+    site = _path(site_dir)
+    source = pathlib.Path(source_page)
+    _require_regular_file(source, "site index source")
+    _reject_symlink_components(source, "site index source")
+    _reject_symlink_components(site, "site repository")
+    destination = site / "index.html"
+
+    with _exclusive_site_lock(site):
+        _mkdir_mode(site)
+        with tempfile.TemporaryDirectory(prefix="osc-site-index-") as temporary:
+            snapshot = pathlib.Path(temporary) / "index.html"
+            _snapshot_regular_file(
+                source, snapshot, "site index source", mode=0o644
+            )
+            try:
+                _publish_metadata(((snapshot, destination),))
+            except (RuntimeError, OSError) as error:
+                raise RuntimeError(
+                    f"could not publish site index: {destination}"
+                ) from error
+
+        metadata = destination.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("published site index must be a regular non-symlink file")
+        if stat.S_IMODE(metadata.st_mode) != 0o644:
+            raise RuntimeError("published site index must have mode 0644")
+    return destination
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build signed Object Storage Client Linux repositories"
@@ -1517,3 +1550,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", default="Object Storage Client")
     parser.add_argument("--base-url", default=_DEFAULT_BASE_URL)
     return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    options = parser.parse_args(argv)
+    common = {
+        "site_dir": options.site_dir,
+        "public_key": options.public_key,
+        "expected_fingerprint": options.expected_fingerprint,
+        "private_key": options.private_key,
+        "passphrase_file": options.passphrase_file,
+    }
+    try:
+        build_apt_repository(
+            deb=options.deb,
+            origin=options.origin,
+            label=options.label,
+            base_url=options.base_url,
+            **common,
+        )
+    except (RuntimeError, ValueError, OSError):
+        parser.error(f"APT repository build failed for {options.site_dir}")
+    try:
+        build_rpm_repository(rpm_package=options.rpm, **common)
+    except (RuntimeError, ValueError, OSError):
+        parser.error(f"RPM repository build failed for {options.site_dir}")
+    source_page = pathlib.Path(__file__).with_name("pages-index.html")
+    try:
+        _publish_site_index(options.site_dir, source_page)
+    except (RuntimeError, ValueError, OSError):
+        parser.error(f"site index publication failed for {options.site_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
