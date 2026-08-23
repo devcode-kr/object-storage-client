@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import gzip
+import hashlib
 import html
 import os
 import pathlib
 import stat
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -17,11 +20,13 @@ from build.linux.repository import (
     RpmPaths,
     SigningKeyRecord,
     apt_paths,
+    build_apt_repository,
     build_parser,
     inspect_public_key,
     normalize_fingerprint,
     rpm_paths,
     verify_public_key_fingerprint,
+    _validsig_primary_fingerprints,
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -91,6 +96,64 @@ def _run_gpg(home: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess
     )
 
 
+def _fake_apt_ftparchive(
+    root: pathlib.Path,
+    *,
+    malformed_release: bool = False,
+    malformed_packages: bool = False,
+) -> pathlib.Path:
+    root.mkdir(parents=True, exist_ok=True)
+    tool = root / "apt-ftparchive"
+    release_body = "pass\n" if malformed_release else r'''
+fields = {}
+for item in args[:-2]:
+    if item == "-o":
+        continue
+    if item.startswith("APT::FTPArchive::Release::"):
+        key, value = item.split("=", 1)
+        fields[key.rsplit("::", 1)[1]] = value
+required = ("Origin", "Label", "Suite", "Codename", "Architectures", "Components", "Description")
+if any(name not in fields for name in required):
+    sys.exit(24)
+for name in required:
+    print(f"{name}: {fields[name]}")
+print("Date: Mon, 24 Aug 2026 00:00:00 +0000")
+algorithms = (("MD5Sum", "md5"), ("SHA1", "sha1"), ("SHA256", "sha256"), ("SHA512", "sha512"))
+for section, algorithm in algorithms:
+    print(f"{section}:")
+    for relative in ("main/binary-amd64/Packages", "main/binary-amd64/Packages.gz"):
+        path = cwd / "dists/stable" / relative
+        digest = hashlib.new(algorithm, path.read_bytes()).hexdigest()
+        print(f" {digest} {path.stat().st_size} {relative}")
+'''
+    tool.write_text(
+        "#!/usr/bin/env python3\n"
+        "import hashlib, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "cwd = pathlib.Path.cwd()\n"
+        "if args == ['packages', 'pool/main/o/object-storage-client']:\n"
+        "    packages = sorted((cwd / args[1]).glob('*.deb'))\n"
+        "    if len(packages) != 1: sys.exit(23)\n"
+        "    package = packages[0]\n"
+        "    print('Package: object-storage-client')\n"
+        "    print('Architecture: amd64')\n"
+        "    print(f'Filename: {package.relative_to(cwd).as_posix()}')\n"
+        "    print(f'Size: {package.stat().st_size}')\n"
+        "    data = package.read_bytes()\n"
+        "    print(f'MD5sum: {hashlib.md5(data).hexdigest()}')\n"
+        "    print(f'SHA1: {hashlib.sha1(data).hexdigest()}')\n"
+        f"    print('SHA256: {'0' * 64}' if {malformed_packages!r} else f'SHA256: {{hashlib.sha256(data).hexdigest()}}')\n"
+        "    print(f'SHA512: {hashlib.sha512(data).hexdigest()}')\n"
+        "elif args[-2:] == ['release', 'dists/stable']:\n"
+        f"{textwrap.indent(release_body, '    ')}"
+        "else:\n"
+        "    sys.exit(22)\n",
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+    return tool
+
+
 def _page_bootstrap_blocks() -> tuple[str, str]:
     page = html.unescape((LINUX / "pages-index.html").read_text(encoding="utf-8"))
     apt = page[page.index("<h2>APT"):page.index("<h2>DNF")]
@@ -131,14 +194,19 @@ class RepositoryTests(unittest.TestCase):
         cls.gnupg_home.mkdir(mode=0o700)
         cls.public_key = root / "public.asc"
         cls.secret_key = root / "secret.asc"
+        cls.passphrase_file = root / "key-passphrase"
+        cls.passphrase_file.write_text("correct horse battery staple\n", encoding="utf-8")
+        cls.passphrase_file.chmod(0o600)
         _run_gpg(
             cls.gnupg_home,
-            "--passphrase",
-            "",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase-file",
+            os.fspath(cls.passphrase_file),
             "--quick-generate-key",
             "Repository Test <repository-test@example.invalid>",
             "rsa2048",
-            "sign",
+            "cert",
             "3y",
         )
         listing = _run_gpg(cls.gnupg_home, "--with-colons", "--list-keys").stdout
@@ -148,8 +216,20 @@ class RepositoryTests(unittest.TestCase):
             if (fields := line.split(":"))[0] == "fpr"
         ]
         if len(fingerprints) != 1:
-            raise RuntimeError("throwaway key did not have exactly one fingerprint")
+            raise RuntimeError("throwaway primary key did not have exactly one fingerprint")
         cls.throwaway_fingerprint = fingerprints[0]
+        _run_gpg(
+            cls.gnupg_home,
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase-file",
+            os.fspath(cls.passphrase_file),
+            "--quick-add-key",
+            cls.throwaway_fingerprint,
+            "rsa2048",
+            "sign",
+            "3y",
+        )
         cls.public_key.write_text(
             _run_gpg(
                 cls.gnupg_home, "--armor", "--export", cls.throwaway_fingerprint
@@ -159,6 +239,10 @@ class RepositoryTests(unittest.TestCase):
         cls.secret_key.write_text(
             _run_gpg(
                 cls.gnupg_home,
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase-file",
+                os.fspath(cls.passphrase_file),
                 "--armor",
                 "--export-secret-keys",
                 cls.throwaway_fingerprint,
@@ -169,6 +253,342 @@ class RepositoryTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls._keys.cleanup()
+
+    def _build(
+        self,
+        root: pathlib.Path,
+        *,
+        site: pathlib.Path | None = None,
+        deb: pathlib.Path | None = None,
+        public_key: pathlib.Path | None = None,
+        private_key: pathlib.Path | None = None,
+        passphrase_file: pathlib.Path | None = None,
+        apt_ftparchive: str | None = None,
+        gpg: str = "gpg",
+        origin: str = "Object Storage Client",
+        label: str = "Object Storage Client",
+        base_url: str = BASE_URL,
+    ) -> pathlib.Path:
+        package = deb or (root / "object-storage-client_1.2.3_amd64.deb")
+        if deb is None:
+            package.write_bytes(b"test deb package bytes\n")
+        tool = apt_ftparchive or os.fspath(_fake_apt_ftparchive(root))
+        destination = site or (root / "site")
+        build_apt_repository(
+            site_dir=destination,
+            deb=package,
+            public_key=public_key or self.public_key,
+            expected_fingerprint=self.throwaway_fingerprint,
+            private_key=private_key or self.secret_key,
+            passphrase_file=passphrase_file or self.passphrase_file,
+            origin=origin,
+            label=label,
+            base_url=base_url,
+            apt_ftparchive=tool,
+            gpg=gpg,
+        )
+        return destination
+
+    def test_build_apt_repository_signs_complete_repository_with_real_gpg(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            package = paths.pool / "object-storage-client_1.2.3_amd64.deb"
+            expected_files = (
+                package,
+                paths.binary / "Packages",
+                paths.binary / "Packages.gz",
+                paths.release / "Release",
+                paths.release / "InRelease",
+                paths.release / "Release.gpg",
+                site / "repository-key.asc",
+            )
+            for path in expected_files:
+                with self.subTest(path=path):
+                    self.assertTrue(path.is_file())
+                    self.assertFalse(path.is_symlink())
+                    self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+            for directory in (
+                site / "apt",
+                site / "apt/pool/main/o/object-storage-client",
+                site / "apt/dists/stable",
+                site / "apt/dists/stable/main/binary-amd64",
+            ):
+                with self.subTest(directory=directory):
+                    self.assertEqual(0o755, stat.S_IMODE(directory.stat().st_mode))
+            packages = (paths.binary / "Packages").read_text(encoding="utf-8")
+            self.assertIn("Filename: pool/main/o/object-storage-client/", packages)
+            compressed = (paths.binary / "Packages.gz").read_bytes()
+            self.assertEqual(packages.encode(), gzip.decompress(compressed))
+            self.assertEqual(0, int.from_bytes(compressed[4:8], "little"))
+            release = (paths.release / "Release").read_text(encoding="utf-8")
+            for field in (
+                "Origin: Object Storage Client",
+                "Label: Object Storage Client",
+                "Suite: stable",
+                "Codename: stable",
+                "Architectures: amd64",
+                "Components: main",
+                "Description: Object Storage Client APT repository at " + BASE_URL,
+                "SHA256:",
+                "SHA512:",
+            ):
+                self.assertIn(field, release)
+            self.assertIn("BEGIN PGP SIGNED MESSAGE", (paths.release / "InRelease").read_text())
+            self.assertIn("BEGIN PGP SIGNATURE", (paths.release / "Release.gpg").read_text())
+            self.assertEqual(self.public_key.read_bytes(), (site / "repository-key.asc").read_bytes())
+            names = {path.name for path in site.rglob("*") if path.is_file()}
+            self.assertNotIn(self.secret_key.name, names)
+            self.assertNotIn(self.passphrase_file.name, names)
+
+    def test_packages_gzip_is_deterministic_across_rebuilds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            first = (apt_paths(site).binary / "Packages.gz").read_bytes()
+            self._build(root, site=site)
+            second = (apt_paths(site).binary / "Packages.gz").read_bytes()
+            self.assertEqual(first, second)
+
+    def test_same_package_and_key_are_idempotent_but_collisions_are_immutable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            package = apt_paths(site).pool / "object-storage-client_1.2.3_amd64.deb"
+            self._build(root, site=site)
+            package.write_bytes(b"other package")
+            with self.assertRaisesRegex(RuntimeError, "collision|different"):
+                self._build(root, site=site)
+            self.assertEqual(b"other package", package.read_bytes())
+            package.write_bytes(b"test deb package bytes\n")
+            (site / "repository-key.asc").write_bytes(b"other key")
+            with self.assertRaisesRegex(RuntimeError, "collision|different"):
+                self._build(root, site=site)
+            self.assertEqual(b"other key", (site / "repository-key.asc").read_bytes())
+
+    def test_tool_or_signing_failures_preserve_previous_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            metadata = tuple(
+                paths.binary / name for name in ("Packages", "Packages.gz")
+            ) + tuple(
+                paths.release / name
+                for name in ("Release", "InRelease", "Release.gpg")
+            )
+            before = {path: path.read_bytes() for path in metadata}
+            malformed = _fake_apt_ftparchive(root / "malformed", malformed_release=True)
+            with self.assertRaisesRegex(RuntimeError, "Release|field|hash"):
+                self._build(root, site=site, apt_ftparchive=os.fspath(malformed))
+            self.assertEqual(before, {path: path.read_bytes() for path in metadata})
+
+            wrapper = root / "gpg-fail-sign"
+            wrapper.write_text(
+                "#!/usr/bin/env python3\nimport os, sys\n"
+                "if '--clearsign' in sys.argv: sys.exit(9)\n"
+                "os.execvp('gpg', ['gpg', *sys.argv[1:]])\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "sign"):
+                self._build(root, site=site, gpg=os.fspath(wrapper))
+            self.assertEqual(before, {path: path.read_bytes() for path in metadata})
+
+    def test_signature_verification_failure_is_fatal_and_preserves_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            release = paths.release / "Release"
+            before = release.read_bytes()
+            wrapper = root / "gpg-fail-verify"
+            wrapper.write_text(
+                "#!/usr/bin/env python3\nimport os, sys\n"
+                "if '--verify' in sys.argv: sys.exit(8)\n"
+                "os.execvp('gpg', ['gpg', *sys.argv[1:]])\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "verify|signature"):
+                self._build(root, site=site, gpg=os.fspath(wrapper))
+            self.assertEqual(before, release.read_bytes())
+
+    def test_missing_inputs_and_tools_have_clear_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            missing = root / "missing.deb"
+            cases = (
+                ({"deb": missing}, "package|deb"),
+                ({"public_key": missing}, "public key"),
+                ({"private_key": missing}, "private key"),
+                ({"passphrase_file": missing}, "passphrase"),
+                ({"apt_ftparchive": "definitely-missing-apt-ftparchive"}, "apt-ftparchive.*not available"),
+            )
+            for overrides, message in cases:
+                with self.subTest(overrides=overrides):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        self._build(root, **overrides)
+
+    def test_wrong_passphrase_and_private_key_mismatch_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            wrong_passphrase = root / "wrong-passphrase"
+            wrong_passphrase.write_text("wrong\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "private key|passphrase|import|signing"):
+                self._build(root, passphrase_file=wrong_passphrase)
+            with self.assertRaisesRegex(RuntimeError, "private key.*fingerprint|mismatch"):
+                self._build(
+                    root,
+                    private_key=LINUX / "repository-key.asc",
+                )
+
+    def test_private_export_with_an_extra_primary_key_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            other_home = root / "other-home"
+            other_home.mkdir(mode=0o700)
+            _run_gpg(
+                other_home,
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase-file",
+                os.fspath(self.passphrase_file),
+                "--quick-generate-key",
+                "Other Repository Test <other-repository-test@example.invalid>",
+                "rsa2048",
+                "sign",
+                "3y",
+            )
+            other_listing = _run_gpg(other_home, "--with-colons", "--list-keys").stdout
+            other_fingerprints = [
+                fields[9]
+                for line in other_listing.splitlines()
+                if (fields := line.split(":"))[0] == "fpr"
+            ]
+            self.assertEqual(1, len(other_fingerprints))
+            other_secret = _run_gpg(
+                other_home,
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase-file",
+                os.fspath(self.passphrase_file),
+                "--armor",
+                "--export-secret-keys",
+                other_fingerprints[0],
+            ).stdout
+            combined = root / "combined-private.asc"
+            combined.write_text(
+                self.secret_key.read_text(encoding="ascii") + other_secret,
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(RuntimeError, "exactly one secret primary"):
+                self._build(root, private_key=combined)
+
+    def test_unsafe_package_names_symlinks_and_site_overlap_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            package = root / "unsafe name.deb"
+            package.write_bytes(b"deb")
+            with self.assertRaisesRegex((RuntimeError, ValueError), "filename|safe"):
+                self._build(root, deb=package)
+            package = root / "package.rpm"
+            package.write_bytes(b"rpm")
+            with self.assertRaisesRegex((RuntimeError, ValueError), "\.deb"):
+                self._build(root, deb=package)
+            real = root / "object-storage-client_1_amd64.deb"
+            real.write_bytes(b"deb")
+            link = root / "link.deb"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                self._build(root, deb=link)
+            site_parent = root / "site-parent"
+            site_parent.symlink_to(root / "real-site")
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                self._build(root, site=site_parent / "site", deb=real)
+            with self.assertRaisesRegex((RuntimeError, ValueError), "overlap"):
+                self._build(root, site=real, deb=real)
+
+    def test_existing_symlink_in_apt_tree_is_rejected_without_following_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = root / "site"
+            site.mkdir()
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            (site / "apt").symlink_to(elsewhere, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                self._build(root, site=site)
+            self.assertEqual([], list(elsewhere.iterdir()))
+
+    def test_missing_native_apt_ftparchive_status_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "apt-ftparchive.*not available"):
+                self._build(root, apt_ftparchive="apt-ftparchive")
+
+    def test_release_fields_reject_control_character_injection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            cases = (
+                ({"origin": "Trusted\nCodename: injected"}, "origin"),
+                ({"label": "Trusted\tLabel"}, "label"),
+                ({"base_url": "https://example.invalid/\x7fhidden"}, "base_url"),
+            )
+            for overrides, field in cases:
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(ValueError, "control"):
+                        self._build(root, **overrides)
+
+    def test_packages_hashes_must_match_the_staged_pool_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            malformed = _fake_apt_ftparchive(root / "malformed", malformed_packages=True)
+            with self.assertRaisesRegex(RuntimeError, "Packages|SHA256|hash"):
+                self._build(root, apt_ftparchive=os.fspath(malformed))
+
+    def test_validsig_requires_well_formed_signing_and_primary_fingerprints(self):
+        primary = "A" * 40
+        subkey = "B" * 40
+        common = "2026-08-24 1787529600 0 4 0 1 10 00"
+        primary_status = f"[GNUPG:] VALIDSIG {primary} {common} {primary}"
+        subkey_status = f"[GNUPG:] VALIDSIG {subkey} {common} {primary}"
+        self.assertEqual([primary], _validsig_primary_fingerprints(primary_status))
+        self.assertEqual([primary], _validsig_primary_fingerprints(subkey_status))
+        self.assertEqual(
+            [],
+            _validsig_primary_fingerprints(
+                f"[GNUPG:] VALIDSIG not-a-fingerprint {common} ignored {primary}"
+            ),
+        )
+
+    def test_replace_failure_rolls_back_all_existing_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            site = self._build(root)
+            paths = apt_paths(site)
+            metadata = tuple(paths.binary / name for name in ("Packages", "Packages.gz")) + tuple(
+                paths.release / name for name in ("Release", "InRelease", "Release.gpg")
+            )
+            for index, path in enumerate(metadata):
+                path.write_bytes(f"old metadata {index}\n".encode())
+            before = {path: path.read_bytes() for path in metadata}
+            real_replace = os.replace
+            publications = 0
+
+            def fail_third_publication(source, destination):
+                nonlocal publications
+                if pathlib.Path(destination) in metadata:
+                    publications += 1
+                    if publications == 3:
+                        raise OSError("simulated publication failure")
+                return real_replace(source, destination)
+
+            with mock.patch("build.linux.repository.os.replace", side_effect=fail_third_publication):
+                with self.assertRaisesRegex(OSError, "publication"):
+                    self._build(root, site=site)
+            self.assertEqual(before, {path: path.read_bytes() for path in metadata})
 
     def test_apt_paths_are_frozen_stable_only_and_pure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -240,7 +660,9 @@ class RepositoryTests(unittest.TestCase):
         info = inspect_public_key(self.public_key)
         self.assertIsInstance(info, PublicKeyInfo)
         self.assertEqual(self.throwaway_fingerprint, info.fingerprint)
-        self.assertIn("s", info.capabilities.lower())
+        self.assertTrue(
+            any("s" in key.capabilities.lower() for key in info.signing_keys)
+        )
         self.assertIsInstance(info.created, dt.datetime)
         self.assertIsInstance(info.expires, dt.datetime)
         self.assertLess(info.created, info.expires)

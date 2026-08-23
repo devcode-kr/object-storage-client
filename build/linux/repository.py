@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 from dataclasses import dataclass
+import gzip
+import hashlib
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -260,6 +263,656 @@ def verify_public_key_fingerprint(
     ):
         raise RuntimeError("public key does not have a usable signing key at this time")
     return info
+
+
+_SAFE_DEB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~-]*\.deb")
+_RELEASE_FIELDS = {
+    "Origin": None,
+    "Label": None,
+    "Suite": "stable",
+    "Codename": "stable",
+    "Architectures": "amd64",
+    "Components": "main",
+}
+_RELEASE_HASH_SECTIONS = ("MD5Sum", "SHA1", "SHA256", "SHA512")
+_HASH_ALGORITHMS = {
+    "MD5Sum": "md5",
+    "SHA1": "sha1",
+    "SHA256": "sha256",
+    "SHA512": "sha512",
+}
+_PACKAGE_HASH_FIELDS = {
+    "MD5sum": "md5",
+    "SHA1": "sha1",
+    "SHA256": "sha256",
+    "SHA512": "sha512",
+}
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _require_regular_file(path: pathlib.Path, description: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{description} path does not exist: {path}") from error
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect {description} path: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"{description} path must not be a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"{description} path must be a regular file")
+
+
+def _reject_symlink_components(path: pathlib.Path, description: str) -> None:
+    absolute = path.absolute()
+    current = pathlib.Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(f"cannot inspect {description} path component: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"{description} path must not contain symlink components: {current}")
+
+
+def _is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _file_digest(path: pathlib.Path, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _snapshot_regular_file(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    description: str,
+    *,
+    mode: int,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        raise RuntimeError(f"cannot open {description} without following symlinks: {source}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{description} path must be a regular file")
+        try:
+            with os.fdopen(descriptor, "rb", closefd=False) as input_stream, destination.open("xb") as output:
+                shutil.copyfileobj(input_stream, output)
+                output.flush()
+                os.fsync(output.fileno())
+            destination.chmod(mode)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _check_immutable_destination(source: pathlib.Path, destination: pathlib.Path) -> bool:
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"immutable destination collision is not a regular file: {destination}")
+    if _sha256(source) != _sha256(destination):
+        raise RuntimeError(f"immutable destination collision has different bytes: {destination}")
+    return True
+
+
+def _mkdir_mode(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"repository directory collision: {path}")
+    path.chmod(0o755)
+
+
+def _mkdir_repository_tree(site: pathlib.Path, destination: pathlib.Path) -> None:
+    _mkdir_mode(site)
+    current = site
+    for component in destination.relative_to(site).parts:
+        current /= component
+        _mkdir_mode(current)
+
+
+def _copy_immutable(source: pathlib.Path, destination: pathlib.Path) -> None:
+    if _check_immutable_destination(source, destination):
+        destination.chmod(0o644)
+        return
+    _mkdir_mode(destination.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_stream:
+            shutil.copyfileobj(input_stream, output)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(0o644)
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+        except FileExistsError:
+            if not _check_immutable_destination(source, destination):
+                raise RuntimeError(f"could not publish immutable file: {destination}")
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _run_command(
+    command: list[str],
+    *,
+    description: str,
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+            shell=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{description} is not available: {command[0]}") from error
+    except OSError as error:
+        raise RuntimeError(f"could not execute {description}: {command[0]}") from error
+    if result.returncode != 0:
+        raise RuntimeError(f"{description} failed with exit status {result.returncode}")
+    return result
+
+
+def _gpg_environment(home: pathlib.Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GNUPGHOME"] = os.fspath(home)
+    return environment
+
+
+def _parse_secret_key_listing(output: str, expected: str, now: dt.datetime) -> None:
+    primary_fingerprints: list[str] = []
+    signing_records: list[SigningKeyRecord] = []
+    secret_primary_records = 0
+    secret_records = 0
+    fingerprinted_records = 0
+    current: list[str] | None = None
+    current_type: str | None = None
+    for line in output.splitlines():
+        fields = line.split(":")
+        record_type = fields[0] if fields else ""
+        if record_type in {"sec", "ssb"}:
+            secret_records += 1
+            if record_type == "sec":
+                secret_primary_records += 1
+            current = fields
+            current_type = record_type
+            signing_records.append(
+                _signing_key_record(["pub" if record_type == "sec" else "sub", *fields[1:]])
+            )
+        elif record_type == "fpr" and current is not None:
+            if len(fields) <= 9:
+                raise RuntimeError("private key has a malformed fingerprint")
+            if current_type == "sec":
+                primary_fingerprints.append(normalize_fingerprint(fields[9]))
+            else:
+                normalize_fingerprint(fields[9])
+            fingerprinted_records += 1
+            current = None
+            current_type = None
+    if secret_primary_records != 1 or len(primary_fingerprints) != 1:
+        raise RuntimeError("private key must contain exactly one secret primary fingerprint")
+    if fingerprinted_records != secret_records:
+        raise RuntimeError("private key has a secret key record without a fingerprint")
+    if primary_fingerprints[0] != expected:
+        raise RuntimeError(
+            f"private key fingerprint mismatch: expected {expected}, got {primary_fingerprints[0]}"
+        )
+    if not any(
+        "s" in record.capabilities.lower()
+        and "d" not in record.capabilities.lower()
+        and record.validity.lower() not in _UNUSABLE_VALIDITY
+        and record.created <= now
+        and (record.expires is None or now < record.expires)
+        for record in signing_records
+    ):
+        raise RuntimeError("private key does not have a usable signing key")
+
+
+def _parse_single_stanza(text: str, description: str) -> dict[str, str]:
+    if _CONTROL_CHARACTER.search(text.replace("\n", "")):
+        raise RuntimeError(f"{description} contains control characters")
+    stanzas = [stanza for stanza in re.split(r"\n[ \t]*\n", text.strip()) if stanza.strip()]
+    if len(stanzas) != 1:
+        raise RuntimeError(f"{description} must contain exactly one package stanza")
+    values: dict[str, str] = {}
+    for line in stanzas[0].splitlines():
+        if not line or line.startswith((" ", "\t")) or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name in values:
+            raise RuntimeError(f"{description} contains duplicate {name} fields")
+        values[name] = value.strip()
+    return values
+
+
+def _validate_packages(text: str, package: pathlib.Path, filename: str) -> None:
+    values = _parse_single_stanza(text, "apt-ftparchive Packages output")
+    if values.get("Filename") != filename:
+        raise RuntimeError("apt-ftparchive Packages output has an invalid Filename field")
+    if values.get("Size") != str(package.stat().st_size):
+        raise RuntimeError("apt-ftparchive Packages output has an invalid Size field")
+    for field, algorithm in _PACKAGE_HASH_FIELDS.items():
+        if values.get(field, "").lower() != _file_digest(package, algorithm):
+            raise RuntimeError(f"apt-ftparchive Packages output has an invalid {field} hash")
+
+
+def _validate_release(
+    text: str,
+    origin: str,
+    label: str,
+    description: str,
+    release_root: pathlib.Path,
+) -> None:
+    if _CONTROL_CHARACTER.search(text.replace("\n", "")):
+        raise RuntimeError("apt-ftparchive Release output contains control characters")
+    expected = {**_RELEASE_FIELDS, "Origin": origin, "Label": label, "Description": description}
+    lines = text.splitlines()
+    values: dict[str, str] = {}
+    for line in lines:
+        if ":" in line and not line.startswith((" ", "\t")):
+            name, value = line.split(":", 1)
+            if name in values:
+                raise RuntimeError(f"apt-ftparchive Release output contains duplicate {name} fields")
+            values[name] = value.strip()
+    if not values.get("Date"):
+        raise RuntimeError("apt-ftparchive Release output has an invalid or missing Date field")
+    for name, value in expected.items():
+        if values.get(name) != value:
+            raise RuntimeError(f"apt-ftparchive Release output has an invalid or missing {name} field")
+    required_paths = {
+        "main/binary-amd64/Packages": release_root / "main/binary-amd64/Packages",
+        "main/binary-amd64/Packages.gz": release_root / "main/binary-amd64/Packages.gz",
+    }
+    for section in _RELEASE_HASH_SECTIONS:
+        marker = f"{section}:"
+        try:
+            index = lines.index(marker)
+        except ValueError as error:
+            raise RuntimeError(f"apt-ftparchive Release output is missing {section} hash section") from error
+        entries: dict[str, tuple[str, str]] = {}
+        for line in lines[index + 1 :]:
+            if not line.startswith((" ", "\t")):
+                break
+            fields = line.split()
+            if len(fields) != 3 or not fields[1].isdigit():
+                raise RuntimeError(f"apt-ftparchive Release output has a malformed {section} hash entry")
+            digest, size, relative = fields
+            if relative in entries:
+                raise RuntimeError(f"apt-ftparchive Release output has a duplicate {section} hash entry")
+            entries[relative] = (digest.lower(), size)
+        for relative, path in required_paths.items():
+            expected_entry = (_file_digest(path, _HASH_ALGORITHMS[section]), str(path.stat().st_size))
+            if entries.get(relative) != expected_entry:
+                raise RuntimeError(
+                    f"apt-ftparchive Release output has an invalid or missing {section} hash for {relative}"
+                )
+
+
+def _validsig_primary_fingerprints(status: str) -> list[str]:
+    fingerprints: list[str] = []
+    for line in status.splitlines():
+        fields = line.split()
+        if len(fields) == 12 and fields[0] == "[GNUPG:]" and fields[1] == "VALIDSIG":
+            signing = fields[2].upper()
+            primary = fields[11].upper()
+            if _FINGERPRINT.fullmatch(signing) and _FINGERPRINT.fullmatch(primary):
+                fingerprints.append(primary)
+    return fingerprints
+
+
+def _verify_repository_signatures(
+    *,
+    gpg: str,
+    public_key: pathlib.Path,
+    release: pathlib.Path,
+    inrelease: pathlib.Path,
+    detached: pathlib.Path,
+    expected: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="osc-apt-verify-") as temporary:
+        home = pathlib.Path(temporary)
+        home.chmod(0o700)
+        environment = _gpg_environment(home)
+        base = [gpg, "--batch", "--no-tty", "--homedir", os.fspath(home)]
+        _run_command(
+            [*base, "--import", os.fspath(public_key)],
+            description="gpg public key import for signature verification",
+            env=environment,
+        )
+        checks = (
+            ("InRelease", [os.fspath(inrelease)]),
+            ("Release.gpg", [os.fspath(detached), os.fspath(release)]),
+        )
+        for name, arguments in checks:
+            result = _run_command(
+                [*base, "--status-fd", "1", "--verify", *arguments],
+                description=f"gpg {name} signature verification",
+                env=environment,
+            )
+            if expected not in _validsig_primary_fingerprints(result.stdout):
+                raise RuntimeError(f"gpg {name} signature verification did not produce the expected VALIDSIG")
+
+
+def _validate_release_value(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    if _CONTROL_CHARACTER.search(value):
+        raise ValueError(f"{name} must not contain control characters")
+    return value
+
+
+def _stage_publication(source: pathlib.Path, destination: pathlib.Path) -> pathlib.Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.publish-", dir=destination.parent
+    )
+    staged = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_stream:
+            shutil.copyfileobj(input_stream, output)
+            output.flush()
+            os.fsync(output.fileno())
+        staged.chmod(0o644)
+        return staged
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...]) -> None:
+    staged: list[tuple[pathlib.Path, pathlib.Path]] = []
+    backups: dict[pathlib.Path, pathlib.Path | None] = {}
+    published: list[pathlib.Path] = []
+    try:
+        for source, destination in publications:
+            staged.append((destination, _stage_publication(source, destination)))
+        for destination, _ in staged:
+            try:
+                metadata = destination.lstat()
+            except FileNotFoundError:
+                backups[destination] = None
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(
+                    f"metadata destination collision is not a regular file: {destination}"
+                )
+            descriptor, backup_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.rollback-", dir=destination.parent
+            )
+            os.close(descriptor)
+            backup = pathlib.Path(backup_name)
+            backup.unlink()
+            _snapshot_regular_file(
+                destination, backup, "existing repository metadata", mode=0o644
+            )
+            backups[destination] = backup
+        try:
+            for destination, staged_path in staged:
+                os.replace(staged_path, destination)
+                published.append(destination)
+        except BaseException as publication_error:
+            rollback_errors: list[OSError] = []
+            for destination in reversed(published):
+                backup = backups[destination]
+                try:
+                    if backup is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup, destination)
+                except OSError as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                raise RuntimeError(
+                    "metadata publication failed and rollback was incomplete"
+                ) from publication_error
+            raise
+        directory_descriptors = {
+            os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+            for destination, _ in staged
+        }
+        try:
+            for descriptor in directory_descriptors:
+                os.fsync(descriptor)
+        finally:
+            for descriptor in directory_descriptors:
+                os.close(descriptor)
+    finally:
+        for _, staged_path in staged:
+            staged_path.unlink(missing_ok=True)
+        for backup in backups.values():
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+
+
+def build_apt_repository(
+    *,
+    site_dir: os.PathLike[str] | str,
+    deb: os.PathLike[str] | str,
+    public_key: os.PathLike[str] | str,
+    expected_fingerprint: str,
+    private_key: os.PathLike[str] | str,
+    passphrase_file: os.PathLike[str] | str,
+    origin: str = "Object Storage Client",
+    label: str = "Object Storage Client",
+    base_url: str = _DEFAULT_BASE_URL,
+    apt_ftparchive: str = "apt-ftparchive",
+    gpg: str = "gpg",
+    now: dt.datetime | None = None,
+) -> AptPaths:
+    site = _path(site_dir)
+    package = pathlib.Path(deb)
+    public = pathlib.Path(public_key)
+    private = pathlib.Path(private_key)
+    passphrase = pathlib.Path(passphrase_file)
+    if _SAFE_DEB_NAME.fullmatch(package.name) is None:
+        if package.suffix != ".deb":
+            raise ValueError("package filename must end in .deb")
+        raise ValueError("package must have a safe Debian filename")
+    for path, description in (
+        (package, "deb package"),
+        (public, "public key"),
+        (private, "private key"),
+        (passphrase, "passphrase file"),
+    ):
+        _require_regular_file(path, description)
+        _reject_symlink_components(path, description)
+    paths = apt_paths(site)
+    _reject_symlink_components(site, "site repository")
+    site_absolute = site.absolute().resolve(strict=False)
+    for path in (package, public, private, passphrase):
+        input_absolute = path.absolute().resolve(strict=False)
+        if input_absolute == site_absolute or _is_relative_to(input_absolute, site_absolute):
+            raise ValueError(f"site repository must not overlap input file: {path}")
+    for path in (site / "apt", paths.pool, paths.binary, paths.release):
+        _reject_symlink_components(path, "site repository")
+    if site.exists() and not site.is_dir():
+        raise RuntimeError("site repository root must be a directory")
+    origin = _validate_release_value("origin", origin)
+    label = _validate_release_value("label", label)
+    base_url = _validate_release_value("base_url", base_url)
+    expected = normalize_fingerprint(expected_fingerprint)
+    instant = now if now is not None else dt.datetime.now(tz=dt.timezone.utc)
+
+    package_destination = paths.pool / package.name
+    key_destination = site / "repository-key.asc"
+    apt_tool = shutil.which(apt_ftparchive)
+    if apt_tool is None:
+        raise RuntimeError(f"apt-ftparchive is not available: {apt_ftparchive}")
+
+    with tempfile.TemporaryDirectory(prefix="osc-apt-build-") as temporary:
+        temporary_root = pathlib.Path(temporary)
+        staged_public = temporary_root / "repository-key.asc"
+        staged_private = temporary_root / "private-key.asc"
+        staged_passphrase = temporary_root / "passphrase"
+        _snapshot_regular_file(public, staged_public, "public key", mode=0o644)
+        _snapshot_regular_file(private, staged_private, "private key", mode=0o600)
+        _snapshot_regular_file(passphrase, staged_passphrase, "passphrase file", mode=0o600)
+        verify_public_key_fingerprint(staged_public, expected, now=instant, gpg=gpg)
+
+        build_root = temporary_root / "apt"
+        temporary_pool = build_root / "pool/main/o/object-storage-client"
+        temporary_binary = build_root / "dists/stable/main/binary-amd64"
+        temporary_release = build_root / "dists/stable"
+        for directory in (temporary_pool, temporary_binary):
+            _mkdir_mode(directory)
+        temporary_package = temporary_pool / package.name
+        _snapshot_regular_file(package, temporary_package, "deb package", mode=0o644)
+        packages_result = _run_command(
+            [apt_tool, "packages", "pool/main/o/object-storage-client"],
+            description="apt-ftparchive packages",
+            cwd=build_root,
+        )
+        package_filename = f"pool/main/o/object-storage-client/{package.name}"
+        _validate_packages(packages_result.stdout, temporary_package, package_filename)
+        packages_path = temporary_binary / "Packages"
+        packages_path.write_text(packages_result.stdout, encoding="utf-8", newline="\n")
+        packages_path.chmod(0o644)
+        os.utime(packages_path, (0, 0))
+        packages_gzip = temporary_binary / "Packages.gz"
+        with packages_path.open("rb") as source, packages_gzip.open("wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                shutil.copyfileobj(source, compressed)
+        packages_gzip.chmod(0o644)
+        os.utime(packages_gzip, (0, 0))
+
+        description = f"Object Storage Client APT repository at {base_url}"
+        options = {
+            "Origin": origin,
+            "Label": label,
+            "Suite": "stable",
+            "Codename": "stable",
+            "Architectures": "amd64",
+            "Components": "main",
+            "Description": description,
+        }
+        release_command = [apt_tool]
+        for name, value in options.items():
+            release_command.extend(("-o", f"APT::FTPArchive::Release::{name}={value}"))
+        release_command.extend(("release", "dists/stable"))
+        release_result = _run_command(
+            release_command,
+            description="apt-ftparchive release",
+            cwd=build_root,
+        )
+        _validate_release(
+            release_result.stdout, origin, label, description, temporary_release
+        )
+        release_path = temporary_release / "Release"
+        release_path.write_text(release_result.stdout, encoding="utf-8", newline="\n")
+        release_path.chmod(0o644)
+
+        with tempfile.TemporaryDirectory(prefix="osc-apt-sign-") as signing_temporary:
+            signing_home = pathlib.Path(signing_temporary)
+            signing_home.chmod(0o700)
+            environment = _gpg_environment(signing_home)
+            base = [gpg, "--batch", "--no-tty", "--homedir", os.fspath(signing_home)]
+            _run_command(
+                [
+                    *base,
+                    "--pinentry-mode",
+                    "loopback",
+                    "--passphrase-file",
+                    os.fspath(staged_passphrase),
+                    "--import",
+                    os.fspath(staged_private),
+                ],
+                description="gpg private key import",
+                env=environment,
+            )
+            listing = _run_command(
+                [*base, "--with-colons", "--fingerprint", "--list-secret-keys"],
+                description="gpg private key inspection",
+                env=environment,
+            )
+            _parse_secret_key_listing(listing.stdout, expected, instant)
+            inrelease = temporary_release / "InRelease"
+            detached = temporary_release / "Release.gpg"
+            signing_options = [
+                *base,
+                "--yes",
+                "--armor",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase-file",
+                os.fspath(staged_passphrase),
+                "--local-user",
+                expected,
+            ]
+            _run_command(
+                [*signing_options, "--output", os.fspath(inrelease), "--clearsign", os.fspath(release_path)],
+                description="gpg InRelease signing",
+                env=environment,
+            )
+            _run_command(
+                [*signing_options, "--output", os.fspath(detached), "--detach-sign", os.fspath(release_path)],
+                description="gpg Release.gpg signing",
+                env=environment,
+            )
+        for signed in (inrelease, detached):
+            signed.chmod(0o644)
+        _verify_repository_signatures(
+            gpg=gpg,
+            public_key=staged_public,
+            release=release_path,
+            inrelease=inrelease,
+            detached=detached,
+            expected=expected,
+        )
+
+        _mkdir_repository_tree(site, paths.pool)
+        _mkdir_repository_tree(site, paths.binary)
+        _copy_immutable(temporary_package, package_destination)
+        _copy_immutable(staged_public, key_destination)
+        for directory in (paths.binary, paths.release):
+            _mkdir_repository_tree(site, directory)
+        publications = (
+            (packages_path, paths.binary / "Packages"),
+            (packages_gzip, paths.binary / "Packages.gz"),
+            (release_path, paths.release / "Release"),
+            (inrelease, paths.release / "InRelease"),
+            (detached, paths.release / "Release.gpg"),
+        )
+        _publish_metadata(publications)
+    return paths
 
 
 def build_parser() -> argparse.ArgumentParser:
