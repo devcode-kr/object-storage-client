@@ -12,6 +12,25 @@ _APPROVED_DESTINATIONS = frozenset(
 )
 
 
+def resolved_path(path: Path) -> Path:
+    """Resolve a path, including symlinked parents, without requiring it to exist."""
+    return Path(path).resolve()
+
+
+def is_same_or_descendant(path: Path, ancestor: Path) -> bool:
+    """Return whether path resolves to ancestor or anywhere below it."""
+    return resolved_path(path).is_relative_to(resolved_path(ancestor))
+
+
+def paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether two resolved paths are equal or contain one another."""
+    resolved_first = resolved_path(first)
+    resolved_second = resolved_path(second)
+    return resolved_first.is_relative_to(
+        resolved_second
+    ) or resolved_second.is_relative_to(resolved_first)
+
+
 def _destination(package_root: Path, installed_path: str) -> Path:
     """Map an approved absolute package path below the staging root."""
     if installed_path not in _APPROVED_DESTINATIONS:
@@ -27,6 +46,26 @@ def stage_payload(repo_root: Path, publish_dir: Path, package_root: Path) -> Non
     publish_dir = Path(publish_dir)
     package_root = Path(package_root)
 
+    source_files = {
+        LAUNCHER_PATH: repo_root / "build/linux/object-storage-client",
+        DESKTOP_PATH: repo_root / "build/linux/object-storage-client.desktop",
+        ICON_PATH: repo_root / "src/ObjectStorageClient.App/Assets/appicon.png",
+    }
+    documents = [repo_root / name for name in ("README.md", "PRIVACY.md", "LICENSE")]
+    package_sources = (*source_files.values(), *documents)
+
+    if paths_overlap(package_root, publish_dir):
+        raise ValueError(
+            f"package root and publish directory must not overlap: "
+            f"{resolved_path(package_root)} and {resolved_path(publish_dir)}"
+        )
+    for source in package_sources:
+        if is_same_or_descendant(source, package_root):
+            raise ValueError(
+                f"package root must not contain a package source: "
+                f"{resolved_path(package_root)} contains {resolved_path(source)}"
+            )
+
     if not publish_dir.is_dir():
         raise NotADirectoryError(f"publish path is not a directory: {publish_dir}")
 
@@ -36,22 +75,9 @@ def stage_payload(repo_root: Path, publish_dir: Path, package_root: Path) -> Non
     if not apphost.stat().st_mode & stat.S_IXUSR:
         raise PermissionError(f"publish apphost is not owner-executable: {apphost}")
 
-    source_files = {
-        LAUNCHER_PATH: repo_root / "build/linux/object-storage-client",
-        DESKTOP_PATH: repo_root / "build/linux/object-storage-client.desktop",
-        ICON_PATH: repo_root / "src/ObjectStorageClient.App/Assets/appicon.png",
-    }
-    documents = [repo_root / name for name in ("README.md", "PRIVACY.md", "LICENSE")]
-    for source in (*source_files.values(), *documents):
+    for source in package_sources:
         if not source.is_file():
             raise FileNotFoundError(f"package source is missing: {source}")
-
-    resolved_publish = publish_dir.resolve()
-    resolved_package_root = package_root.resolve()
-    if resolved_publish == resolved_package_root or resolved_publish.is_relative_to(
-        resolved_package_root
-    ):
-        raise ValueError("package root must not contain the publish directory")
 
     if package_root.exists():
         if package_root.is_symlink() or not package_root.is_dir():

@@ -13,7 +13,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from package_contract import DEB_ARCH, DEB_DEPENDENCIES, PACKAGE_NAME, NativeVersion
-from stage_payload import stage_payload
+from stage_payload import is_same_or_descendant, paths_overlap, resolved_path, stage_payload
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
 MAINTAINER = "Devcode <129266150+devcode-kr@users.noreply.github.com>"
@@ -58,10 +58,26 @@ def build_deb(
     if tool is None:
         raise FileNotFoundError("required packaging tool was not found: dpkg-deb")
 
-    repo_root = Path(repo_root).resolve()
-    publish_dir = Path(publish_dir).resolve()
-    output_dir = Path(output_dir).resolve()
-    package_root = repo_root / "obj/linux-packages/deb/root"
+    repo_root = resolved_path(repo_root)
+    publish_dir = resolved_path(publish_dir)
+    output_dir = resolved_path(output_dir)
+    package_root = resolved_path(repo_root / "obj/linux-packages/deb/root")
+    output = output_dir / (
+        f"ObjectStorageClient-{version.application}-{version.package_release}"
+        "-linux-x64.deb"
+    )
+
+    for tree_name, tree in (("package root", package_root), ("publish directory", publish_dir)):
+        if paths_overlap(output_dir, tree):
+            raise ValueError(
+                f"output directory and {tree_name} must not overlap: "
+                f"{output_dir} and {tree}"
+            )
+        if is_same_or_descendant(output, tree):
+            raise ValueError(
+                f"output path must not overlap the {tree_name}: "
+                f"{resolved_path(output)} is inside {tree}"
+            )
 
     stage_payload(repo_root, publish_dir, package_root)
     control_dir = package_root / "DEBIAN"
@@ -73,10 +89,6 @@ def build_deb(
     control.chmod(0o644)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / (
-        f"ObjectStorageClient-{version.application}-{version.package_release}"
-        "-linux-x64.deb"
-    )
     output.unlink(missing_ok=True)
     subprocess.run(
         [
