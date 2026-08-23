@@ -508,32 +508,81 @@ def _parse_secret_key_listing(output: str, expected: str, now: dt.datetime) -> N
         raise RuntimeError("private key does not have a usable signing key")
 
 
-def _parse_single_stanza(text: str, description: str) -> dict[str, str]:
+def _parse_package_stanzas(text: str, description: str) -> list[dict[str, str]]:
     if _CONTROL_CHARACTER.search(text.replace("\n", "")):
         raise RuntimeError(f"{description} contains control characters")
     stanzas = [stanza for stanza in re.split(r"\n[ \t]*\n", text.strip()) if stanza.strip()]
-    if len(stanzas) != 1:
-        raise RuntimeError(f"{description} must contain exactly one package stanza")
-    values: dict[str, str] = {}
-    for line in stanzas[0].splitlines():
-        if not line or line.startswith((" ", "\t")) or ":" not in line:
-            continue
-        name, value = line.split(":", 1)
-        if name in values:
-            raise RuntimeError(f"{description} contains duplicate {name} fields")
-        values[name] = value.strip()
-    return values
+    if not stanzas:
+        raise RuntimeError(f"{description} must contain one or more package stanzas")
+    parsed: list[dict[str, str]] = []
+    for stanza in stanzas:
+        values: dict[str, str] = {}
+        for line in stanza.splitlines():
+            if not line or line.startswith((" ", "\t")) or ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            if name in values:
+                raise RuntimeError(f"{description} contains duplicate {name} fields")
+            values[name] = value.strip()
+        parsed.append(values)
+    return parsed
 
 
-def _validate_packages(text: str, package: pathlib.Path, filename: str) -> None:
-    values = _parse_single_stanza(text, "apt-ftparchive Packages output")
-    if values.get("Filename") != filename:
-        raise RuntimeError("apt-ftparchive Packages output has an invalid Filename field")
-    if values.get("Size") != str(package.stat().st_size):
-        raise RuntimeError("apt-ftparchive Packages output has an invalid Size field")
-    for field, algorithm in _PACKAGE_HASH_FIELDS.items():
-        if values.get(field, "").lower() != _file_digest(package, algorithm):
-            raise RuntimeError(f"apt-ftparchive Packages output has an invalid {field} hash")
+def _validate_packages(text: str, packages: dict[str, pathlib.Path]) -> None:
+    description = "apt-ftparchive Packages output"
+    stanzas = _parse_package_stanzas(text, description)
+    indexed: dict[str, dict[str, str]] = {}
+    for values in stanzas:
+        filename = values.get("Filename", "")
+        if filename in indexed:
+            raise RuntimeError(f"{description} contains duplicate Filename fields")
+        indexed[filename] = values
+    if set(indexed) != set(packages):
+        raise RuntimeError(
+            f"{description} Filename set does not exactly match the staged package pool"
+        )
+    for filename, package in packages.items():
+        values = indexed[filename]
+        if values.get("Size") != str(package.stat().st_size):
+            raise RuntimeError(f"{description} has an invalid Size field for {filename}")
+        for field, algorithm in _PACKAGE_HASH_FIELDS.items():
+            if values.get(field, "").lower() != _file_digest(package, algorithm):
+                raise RuntimeError(f"{description} has an invalid {field} hash for {filename}")
+
+
+def _stage_apt_pool(
+    existing_pool: pathlib.Path,
+    temporary_pool: pathlib.Path,
+    package: pathlib.Path,
+) -> dict[str, pathlib.Path]:
+    if existing_pool.exists():
+        metadata = existing_pool.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"existing APT package pool is not a regular directory: {existing_pool}")
+        for existing in existing_pool.iterdir():
+            entry = existing.lstat()
+            if _SAFE_DEB_NAME.fullmatch(existing.name) is None:
+                raise RuntimeError(f"existing APT package pool contains an unsafe entry: {existing}")
+            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+                raise RuntimeError(
+                    f"existing APT package pool entry is not a regular non-symlink file: {existing}"
+                )
+            _snapshot_regular_file(
+                existing,
+                temporary_pool / existing.name,
+                "existing APT package",
+                mode=0o644,
+            )
+    staged_package = temporary_pool / package.name
+    if _check_immutable_destination(package, staged_package):
+        staged_package.chmod(0o644)
+    else:
+        _snapshot_regular_file(package, staged_package, "deb package", mode=0o644)
+    prefix = "pool/main/o/object-storage-client"
+    return {
+        f"{prefix}/{staged.name}": staged
+        for staged in sorted(temporary_pool.iterdir(), key=lambda path: path.name)
+    }
 
 
 def _validate_release(
@@ -794,15 +843,14 @@ def build_apt_repository(
         temporary_release = build_root / "dists/stable"
         for directory in (temporary_pool, temporary_binary):
             _mkdir_mode(directory)
+        staged_packages = _stage_apt_pool(paths.pool, temporary_pool, package)
         temporary_package = temporary_pool / package.name
-        _snapshot_regular_file(package, temporary_package, "deb package", mode=0o644)
         packages_result = _run_command(
             [apt_tool, "packages", "pool/main/o/object-storage-client"],
             description="apt-ftparchive packages",
             cwd=build_root,
         )
-        package_filename = f"pool/main/o/object-storage-client/{package.name}"
-        _validate_packages(packages_result.stdout, temporary_package, package_filename)
+        _validate_packages(packages_result.stdout, staged_packages)
         packages_path = temporary_binary / "Packages"
         packages_path.write_text(packages_result.stdout, encoding="utf-8", newline="\n")
         packages_path.chmod(0o644)

@@ -26,6 +26,7 @@ from build.linux.repository import (
     normalize_fingerprint,
     rpm_paths,
     verify_public_key_fingerprint,
+    _validate_packages,
     _validsig_primary_fingerprints,
 )
 
@@ -133,17 +134,18 @@ for section, algorithm in algorithms:
         "cwd = pathlib.Path.cwd()\n"
         "if args == ['packages', 'pool/main/o/object-storage-client']:\n"
         "    packages = sorted((cwd / args[1]).glob('*.deb'))\n"
-        "    if len(packages) != 1: sys.exit(23)\n"
-        "    package = packages[0]\n"
-        "    print('Package: object-storage-client')\n"
-        "    print('Architecture: amd64')\n"
-        "    print(f'Filename: {package.relative_to(cwd).as_posix()}')\n"
-        "    print(f'Size: {package.stat().st_size}')\n"
-        "    data = package.read_bytes()\n"
-        "    print(f'MD5sum: {hashlib.md5(data).hexdigest()}')\n"
-        "    print(f'SHA1: {hashlib.sha1(data).hexdigest()}')\n"
-        f"    print('SHA256: {'0' * 64}' if {malformed_packages!r} else f'SHA256: {{hashlib.sha256(data).hexdigest()}}')\n"
-        "    print(f'SHA512: {hashlib.sha512(data).hexdigest()}')\n"
+        "    if not packages: sys.exit(23)\n"
+        "    for index, package in enumerate(packages):\n"
+        "        if index: print()\n"
+        "        print('Package: object-storage-client')\n"
+        "        print('Architecture: amd64')\n"
+        "        print(f'Filename: {package.relative_to(cwd).as_posix()}')\n"
+        "        print(f'Size: {package.stat().st_size}')\n"
+        "        data = package.read_bytes()\n"
+        "        print(f'MD5sum: {hashlib.md5(data).hexdigest()}')\n"
+        "        print(f'SHA1: {hashlib.sha1(data).hexdigest()}')\n"
+        f"        print('SHA256: {'0' * 64}' if {malformed_packages!r} else f'SHA256: {{hashlib.sha256(data).hexdigest()}}')\n"
+        "        print(f'SHA512: {hashlib.sha512(data).hexdigest()}')\n"
         "elif args[-2:] == ['release', 'dists/stable']:\n"
         f"{textwrap.indent(release_body, '    ')}"
         "else:\n"
@@ -351,6 +353,51 @@ class RepositoryTests(unittest.TestCase):
             second = (apt_paths(site).binary / "Packages.gz").read_bytes()
             self.assertEqual(first, second)
 
+    def test_retained_package_versions_are_all_indexed_and_rebuild_idempotently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first = root / "object-storage-client_1.0.0_amd64.deb"
+            second = root / "object-storage-client_2.0.0_amd64.deb"
+            first.write_bytes(b"immutable package version 1.0.0\n")
+            second.write_bytes(b"distinct immutable package version 2.0.0\n")
+
+            site = self._build(root, deb=first)
+            self._build(root, site=site, deb=second)
+            self._build(root, site=site, deb=second)
+
+            paths = apt_paths(site)
+            expected = {
+                f"pool/main/o/object-storage-client/{package.name}": package
+                for package in (first, second)
+            }
+            self.assertEqual(
+                {package.name for package in expected.values()},
+                {package.name for package in paths.pool.iterdir()},
+            )
+            for filename, source in expected.items():
+                retained = paths.pool / pathlib.PurePosixPath(filename).name
+                with self.subTest(filename=filename):
+                    self.assertEqual(source.read_bytes(), retained.read_bytes())
+                    self.assertEqual(0o644, stat.S_IMODE(retained.stat().st_mode))
+
+            packages_bytes = (paths.binary / "Packages").read_bytes()
+            stanzas = [
+                dict(line.split(": ", 1) for line in stanza.splitlines())
+                for stanza in packages_bytes.decode("utf-8").strip().split("\n\n")
+            ]
+            self.assertEqual(2, len(stanzas))
+            self.assertEqual(set(expected), {stanza["Filename"] for stanza in stanzas})
+            for stanza in stanzas:
+                source = expected[stanza["Filename"]]
+                data = source.read_bytes()
+                with self.subTest(filename=stanza["Filename"]):
+                    self.assertEqual(str(len(data)), stanza["Size"])
+                    self.assertEqual(hashlib.md5(data).hexdigest(), stanza["MD5sum"])
+                    self.assertEqual(hashlib.sha1(data).hexdigest(), stanza["SHA1"])
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), stanza["SHA256"])
+                    self.assertEqual(hashlib.sha512(data).hexdigest(), stanza["SHA512"])
+            self.assertEqual(packages_bytes, gzip.decompress((paths.binary / "Packages.gz").read_bytes()))
+
     def test_same_package_and_key_are_idempotent_but_collisions_are_immutable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -547,6 +594,76 @@ class RepositoryTests(unittest.TestCase):
             malformed = _fake_apt_ftparchive(root / "malformed", malformed_packages=True)
             with self.assertRaisesRegex(RuntimeError, "Packages|SHA256|hash"):
                 self._build(root, apt_ftparchive=os.fspath(malformed))
+
+    def test_packages_validation_rejects_duplicate_missing_and_extra_stanzas(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first = root / "first.deb"
+            second = root / "second.deb"
+            first.write_bytes(b"first package\n")
+            second.write_bytes(b"second package\n")
+            filenames = {
+                "pool/main/o/object-storage-client/first.deb": first,
+                "pool/main/o/object-storage-client/second.deb": second,
+            }
+
+            def stanza(filename: str, package: pathlib.Path) -> str:
+                data = package.read_bytes()
+                return "\n".join(
+                    (
+                        "Package: object-storage-client",
+                        f"Filename: {filename}",
+                        f"Size: {len(data)}",
+                        f"MD5sum: {hashlib.md5(data).hexdigest()}",
+                        f"SHA1: {hashlib.sha1(data).hexdigest()}",
+                        f"SHA256: {hashlib.sha256(data).hexdigest()}",
+                        f"SHA512: {hashlib.sha512(data).hexdigest()}",
+                    )
+                )
+
+            first_stanza = stanza(next(iter(filenames)), first)
+            second_stanza = stanza(next(iter(tuple(filenames)[1:])), second)
+            cases = (
+                ("", "one or more"),
+                (first_stanza + "\nSize: 999\n", "duplicate Size"),
+                (first_stanza + "\n\n" + first_stanza + "\n", "duplicate Filename"),
+                (first_stanza + "\n", "exactly match"),
+                (
+                    first_stanza
+                    + "\n\n"
+                    + second_stanza
+                    + "\n\n"
+                    + stanza("pool/main/o/object-storage-client/extra.deb", first)
+                    + "\n",
+                    "exactly match",
+                ),
+            )
+            for output, message in cases:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        _validate_packages(output, filenames)
+
+    def test_existing_pool_rejects_unexpected_files_directories_and_symlinks(self):
+        cases = ("unsafe-file", "directory", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                site = root / "site"
+                pool = apt_paths(site).pool
+                pool.mkdir(parents=True)
+                if case == "unsafe-file":
+                    (pool / "README").write_text("unexpected\n", encoding="utf-8")
+                    message = "unsafe entry"
+                elif case == "directory":
+                    (pool / "nested.deb").mkdir()
+                    message = "regular non-symlink"
+                else:
+                    target = root / "target.deb"
+                    target.write_bytes(b"target\n")
+                    (pool / "linked.deb").symlink_to(target)
+                    message = "regular non-symlink"
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._build(root, site=site)
 
     def test_validsig_requires_well_formed_signing_and_primary_fingerprints(self):
         primary = "A" * 40
