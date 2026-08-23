@@ -791,6 +791,38 @@ class DebianCliTests(unittest.TestCase):
 
             self.assertEqual(first_hash, second_hash)
 
+    def test_installed_size_matches_extracted_data_archive(self):
+        if package_deb.shutil.which("dpkg-deb") is None:
+            self.skipTest("dpkg-deb is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            repo = make_fake_repo(temporary)
+            publish_parent = temporary / "payload"
+            publish_parent.mkdir()
+            publish = make_publish(publish_parent)
+            package = package_deb.build_deb(
+                repo,
+                NativeVersion.parse("1.0.0", 1),
+                publish,
+                temporary / "output",
+            )
+            field = subprocess.run(
+                ["dpkg-deb", "--field", str(package), "Installed-Size"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            extracted_data_root = temporary / "extracted-data"
+            subprocess.run(
+                ["dpkg-deb", "--extract", str(package), str(extracted_data_root)],
+                check=True,
+            )
+
+            self.assertEqual(
+                package_deb.installed_size(extracted_data_root),
+                int(field),
+            )
+
     def test_build_rejects_and_cleans_non_regular_temporary_output(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)

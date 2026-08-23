@@ -132,12 +132,13 @@ def build_deb(
             )
 
     stage_payload(repo_root, publish_dir, package_root)
+    payload_installed_size = installed_size(package_root)
     control_dir = package_root / "DEBIAN"
     control_dir.mkdir(parents=True)
     control_dir.chmod(0o755)
     control = control_dir / "control"
     control.write_text(
-        render_control(version, installed_size(package_root)), encoding="utf-8"
+        render_control(version, payload_installed_size), encoding="utf-8"
     )
     control.chmod(0o644)
 
