@@ -11,6 +11,7 @@ import hashlib
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -826,6 +827,61 @@ def _fsync_directories(directories: list[pathlib.Path]) -> None:
             raise fsync_error
 
 
+def _fsync_repodata_tree(root: pathlib.Path) -> None:
+    def fsync_path(path: pathlib.Path, *, directory: bool) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if directory:
+            flags |= os.O_DIRECTORY
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+            if not expected_type(metadata.st_mode):
+                raise RuntimeError(f"staged repodata entry has an unsafe file type: {path}")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def visit(directory: pathlib.Path) -> None:
+        metadata = directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"staged repodata entry is not a regular directory: {directory}")
+        entries = sorted(directory.iterdir(), key=lambda path: path.name)
+        for entry in entries:
+            entry_metadata = entry.lstat()
+            if stat.S_ISLNK(entry_metadata.st_mode):
+                raise RuntimeError(f"staged repodata entry must not be a symlink: {entry}")
+            if stat.S_ISDIR(entry_metadata.st_mode):
+                visit(entry)
+            elif stat.S_ISREG(entry_metadata.st_mode):
+                fsync_path(entry, directory=False)
+            else:
+                raise RuntimeError(f"staged repodata entry has an unsafe file type: {entry}")
+        fsync_path(directory, directory=True)
+
+    visit(root)
+
+
+def _chmod_repodata_tree(root: pathlib.Path) -> None:
+    def visit(directory: pathlib.Path) -> None:
+        metadata = directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"staged repodata entry is not a regular directory: {directory}")
+        for entry in sorted(directory.iterdir(), key=lambda path: path.name):
+            entry_metadata = entry.lstat()
+            if stat.S_ISLNK(entry_metadata.st_mode):
+                raise RuntimeError(f"staged repodata entry must not be a symlink: {entry}")
+            if stat.S_ISDIR(entry_metadata.st_mode):
+                visit(entry)
+            elif stat.S_ISREG(entry_metadata.st_mode):
+                entry.chmod(0o644)
+            else:
+                raise RuntimeError(f"staged repodata entry has an unsafe file type: {entry}")
+        directory.chmod(0o755)
+
+    visit(root)
+
+
 def _publish_metadata(publications: tuple[tuple[pathlib.Path, pathlib.Path], ...]) -> None:
     staged: list[tuple[pathlib.Path, pathlib.Path]] = []
     backups: dict[pathlib.Path, pathlib.Path | None] = {}
@@ -924,7 +980,9 @@ def _stage_rpm_packages(existing: pathlib.Path, staged: pathlib.Path, package: p
     return destination
 
 
-def _validate_repodata(repodata: pathlib.Path) -> pathlib.Path:
+def _validate_repodata(
+    repodata: pathlib.Path, *, require_signature: bool = False
+) -> pathlib.Path:
     try:
         metadata = repodata.lstat()
     except FileNotFoundError as error:
@@ -961,10 +1019,49 @@ def _validate_repodata(repodata: pathlib.Path) -> pathlib.Path:
                 or (checksum.text or "").lower() != _file_digest(path, algorithm)):
             raise RuntimeError(f"repomd.xml has an invalid checksum for {kind} metadata")
         expected.add(path.name)
+    if require_signature:
+        _require_regular_file(repodata / "repomd.xml.asc", "rollback repomd.xml signature")
+        expected.add("repomd.xml.asc")
     actual = {entry.name for entry in repodata.iterdir()}
     if actual != expected:
         raise RuntimeError("createrepo_c repodata contains unexpected or unreferenced entries")
     return repomd
+
+
+def _recover_repodata_rollback(destination: pathlib.Path) -> None:
+    parent = destination.parent
+    try:
+        parent_metadata = parent.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise RuntimeError("RPM package directory is not a regular directory")
+    backups = sorted(
+        (entry for entry in parent.iterdir() if entry.name.startswith(".repodata.rollback-")),
+        key=lambda path: path.name,
+    )
+    if not backups:
+        return
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        live_exists = False
+    else:
+        live_exists = True
+    if live_exists or len(backups) != 1:
+        raise RuntimeError(
+            "ambiguous repodata rollback state: expected one backup and no live repodata"
+        )
+    backup = backups[0]
+    metadata = backup.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"unsafe repodata rollback backup: {backup}")
+    try:
+        _validate_repodata(backup, require_signature=True)
+    except RuntimeError as error:
+        raise RuntimeError(f"unsafe or invalid repodata rollback backup: {backup}") from error
+    os.replace(backup, destination)
+    _fsync_directories([parent])
 
 
 def _verify_rpm_packages(rpm_tool: str, public_key: pathlib.Path, packages: list[pathlib.Path], expected: str) -> None:
@@ -975,9 +1072,17 @@ def _verify_rpm_packages(rpm_tool: str, public_key: pathlib.Path, packages: list
         _run_command([*base, "--import", os.fspath(public_key)], description="rpm public key import")
         for package in packages:
             result = _run_command([*base, "--checksig", os.fspath(package)], description="rpm package verification")
-            output = (result.stdout + result.stderr).lower()
-            if "ok" not in output or expected[-16:].lower() not in output or "not ok" in output:
-                raise RuntimeError(f"rpm package verification did not trust expected key: {package.name}")
+            conclusions = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            prefix = f"{package}:"
+            if (
+                not conclusions
+                or not conclusions[-1].startswith(prefix)
+                or conclusions[-1].split()[-1] != "OK"
+                or conclusions[-1].split()[-2:] == ["NOT", "OK"]
+            ):
+                raise RuntimeError(
+                    f"rpm package verification did not end with an OK conclusion: {package.name}"
+                )
 
 
 def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
@@ -989,11 +1094,9 @@ def _publish_repodata(source: pathlib.Path, destination: pathlib.Path) -> None:
     preserve_backup = False
     try:
         staged.rmdir()
-        shutil.copytree(source, staged, symlinks=False)
-        for directory, _, files in os.walk(staged):
-            pathlib.Path(directory).chmod(0o755)
-            for name in files:
-                (pathlib.Path(directory) / name).chmod(0o644)
+        shutil.copytree(source, staged, symlinks=True)
+        _chmod_repodata_tree(staged)
+        _fsync_repodata_tree(staged)
         if destination.exists():
             metadata = destination.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
@@ -1090,6 +1193,7 @@ def build_rpm_repository(
         if instant.tzinfo is None or instant.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
         instant = instant.astimezone(dt.timezone.utc).replace(microsecond=0)
+        _recover_repodata_rollback(paths.repodata)
         with tempfile.TemporaryDirectory(prefix="osc-rpm-build-") as temporary:
             root = pathlib.Path(temporary)
             staged_public, staged_private, staged_passphrase = root / "repository-key.asc", root / "private.asc", root / "passphrase"
@@ -1111,14 +1215,15 @@ def build_rpm_repository(
                 _parse_secret_key_listing(listing.stdout, expected, instant)
                 signing_created = min(key.created for key in info.signing_keys if "s" in key.capabilities.lower()
                                       and key.created <= instant and (key.expires is None or instant < key.expires))
-                macro = (
-                    f"%{{__gpg}} --batch --no-tty --no-armor --pinentry-mode loopback "
-                    f"--passphrase-file {staged_passphrase} --local-user {expected} "
-                    f"--faked-system-time {int(signing_created.timestamp())}! --detach-sign "
-                    "--output %{__signature_filename} %{__plaintext_filename}"
+                extra_args = (
+                    "--batch --no-tty --pinentry-mode loopback "
+                    f"--passphrase-file {shlex.quote(os.fspath(staged_passphrase))} "
+                    f"--faked-system-time {int(signing_created.timestamp())}!"
                 )
-                _run_command([tools["rpmsign"], "--define", f"_gpg_name {expected}", "--define", f"_gpg_path {home}",
-                              "--define", f"__gpg_sign_cmd {macro}", "--addsign", os.fspath(staged_package)],
+                _run_command([tools["rpmsign"], "--define", "_openpgp_sign gpg",
+                              "--define", f"_openpgp_sign_id {expected}", "--define", f"_gpg_path {home}",
+                              "--define", f"_gpg_sign_cmd_extra_args {extra_args}",
+                              "--addsign", os.fspath(staged_package)],
                              description="rpmsign package signing", cwd=packages, env=environment)
             staged_package.chmod(0o644)
             package_in_tree = packages / package.name

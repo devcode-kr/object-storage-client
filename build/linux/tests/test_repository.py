@@ -32,6 +32,7 @@ from build.linux.repository import (
     rpm_paths,
     verify_public_key_fingerprint,
     _publish_repodata,
+    _verify_rpm_packages,
     _validate_packages,
     _validsig_primary_fingerprints,
 )
@@ -192,28 +193,27 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
         "import os, pathlib, re, shlex, subprocess, sys\n"
         f"fingerprint = {fingerprint!r}\n"
         "args = sys.argv[1:]\n"
-        "if len(args) != 8 or args[0] != '--define' or args[2] != '--define' or args[4] != '--define' or args[6] != '--addsign': sys.exit(30)\n"
-        "if args[1] != '_gpg_name ' + fingerprint: sys.exit(30)\n"
+        "if os.environ.get('OSC_FAKE_RPM_MAJOR', '4') not in ('4', '6'): sys.exit(30)\n"
+        "if len(args) != 10 or any(args[index] != '--define' for index in (0, 2, 4, 6)) or args[8] != '--addsign': sys.exit(30)\n"
+        "defines = dict(value.split(' ', 1) for value in (args[1], args[3], args[5], args[7]))\n"
+        "if set(defines) != {'_openpgp_sign', '_openpgp_sign_id', '_gpg_path', '_gpg_sign_cmd_extra_args'}: sys.exit(30)\n"
+        "if defines['_openpgp_sign'] != 'gpg' or defines['_openpgp_sign_id'] != fingerprint: sys.exit(30)\n"
         "home = os.environ.get('GNUPGHOME', '')\n"
-        "if args[3] != '_gpg_path ' + home or not home: sys.exit(30)\n"
+        "if defines['_gpg_path'] != home or not home: sys.exit(30)\n"
         "home_path = pathlib.Path(home)\n"
         "if home_path.is_symlink() or not home_path.is_dir(): sys.exit(30)\n"
-        "prefix = '__gpg_sign_cmd '\n"
-        "if not args[5].startswith(prefix): sys.exit(30)\n"
-        "try: macro = shlex.split(args[5][len(prefix):])\n"
+        "if any('__gpg_sign_cmd' in value or '%{__signature_filename}' in value or '%{__plaintext_filename}' in value for value in args): sys.exit(30)\n"
+        "try: extra = shlex.split(defines['_gpg_sign_cmd_extra_args'])\n"
         "except ValueError: sys.exit(30)\n"
-        "if len(macro) != 16: sys.exit(30)\n"
-        "if macro[:7] != ['%{__gpg}', '--batch', '--no-tty', '--no-armor', '--pinentry-mode', 'loopback', '--passphrase-file']: sys.exit(30)\n"
-        "passphrase = pathlib.Path(macro[7])\n"
+        "if len(extra) != 8 or extra[:5] != ['--batch', '--no-tty', '--pinentry-mode', 'loopback', '--passphrase-file']: sys.exit(30)\n"
+        "passphrase = pathlib.Path(extra[5])\n"
         "if passphrase.is_symlink() or not passphrase.is_file(): sys.exit(30)\n"
-        "if macro[8:10] != ['--local-user', fingerprint]: sys.exit(30)\n"
-        "if macro[10] != '--faked-system-time' or re.fullmatch(r'[0-9]+!', macro[11]) is None: sys.exit(30)\n"
+        "if extra[6] != '--faked-system-time' or re.fullmatch(r'[0-9]+!', extra[7]) is None: sys.exit(30)\n"
         "listing = subprocess.run(['gpg', '--batch', '--no-tty', '--homedir', home, '--with-colons', '--list-secret-keys'], capture_output=True, text=True)\n"
         "if listing.returncode != 0: sys.exit(30)\n"
         "signing_times = [int(fields[5]) for line in listing.stdout.splitlines() if len(fields := line.split(':')) > 11 and fields[0] in ('sec', 'ssb') and 's' in fields[11].lower()]\n"
-        "if not signing_times or macro[11] != str(min(signing_times)) + '!': sys.exit(30)\n"
-        "if macro[12:] != ['--detach-sign', '--output', '%{__signature_filename}', '%{__plaintext_filename}']: sys.exit(30)\n"
-        "path = pathlib.Path(args[7])\n"
+        "if not signing_times or extra[7] != str(min(signing_times)) + '!': sys.exit(30)\n"
+        "path = pathlib.Path(args[9])\n"
         "if path.is_symlink() or not path.is_file(): sys.exit(30)\n"
         "if os.environ.get('OSC_RPM_SIGN_FAIL'): sys.exit(31)\n"
         "data = path.read_bytes()\n"
@@ -273,7 +273,12 @@ def _fake_rpm_tools(root: pathlib.Path, fingerprint: str) -> tuple[pathlib.Path,
         "marker = db / 'imported'\n"
         "if not marker.is_file() or marker.is_symlink() or marker.read_text(encoding='ascii') != fingerprint: sys.exit(34)\n"
         "if not target.read_bytes().endswith(b'\\nFAKE-RPM-SIGNATURE\\n'): sys.exit(35)\n"
-        "print(f'{target}: digests signatures OK key ID {fingerprint[-16:]}')\n",
+        "mode = os.environ.get('OSC_RPM_CHECKSIG_OUTPUT', 'ok')\n"
+        "if mode == 'ok': print(f'{target}: digests signatures OK')\n"
+        "elif mode == 'not-ok': print(f'{target}: digests signatures NOT OK')\n"
+        "elif mode == 'malformed': print(f'{target}: digests signatures VERIFIED')\n"
+        "elif mode == 'trailing': print(f'{target}: digests signatures OK\\ntrailing diagnostic')\n"
+        "else: sys.exit(30)\n",
         encoding="utf-8",
     )
     for tool in (rpmsign, createrepo, rpm):
@@ -453,8 +458,12 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue(package.read_bytes().endswith(b"\nFAKE-RPM-SIGNATURE\n"))
             self.assertIn("BEGIN PGP SIGNATURE", (paths.repodata / "repomd.xml.asc").read_text())
             tool_log = log.read_text(encoding="utf-8")
-            self.assertIn("--local-user " + self.throwaway_fingerprint, tool_log)
+            self.assertIn("_openpgp_sign gpg", tool_log)
+            self.assertIn("_openpgp_sign_id " + self.throwaway_fingerprint, tool_log)
+            self.assertIn("_gpg_sign_cmd_extra_args --batch --no-tty --pinentry-mode loopback", tool_log)
             self.assertIn("--passphrase-file", tool_log)
+            self.assertNotIn("__gpg_sign_cmd", tool_log)
+            self.assertNotIn("%{__signature_filename}", tool_log)
             self.assertNotIn(self.passphrase_file.read_text().strip(), tool_log)
             self.assertEqual([], list(paths.repodata.parent.glob(".repodata.rollback-*")))
 
@@ -471,24 +480,53 @@ class RepositoryTests(unittest.TestCase):
             home.mkdir(mode=0o700)
             passphrase = root / "passphrase"
             passphrase.write_text("secret\n", encoding="utf-8")
-            macro = (
-                f"%{{__gpg}} --batch --no-tty --no-armor --pinentry-mode loopback "
-                f"--passphrase-file {passphrase} --local-user {self.throwaway_fingerprint} "
-                "--faked-system-time 1234567890! --detach-sign "
-                "--output %{__signature_filename} %{__plaintext_filename}"
+            subprocess.run(
+                [
+                    "gpg", "--batch", "--no-tty", "--homedir", os.fspath(home),
+                    "--pinentry-mode", "loopback", "--passphrase-file",
+                    os.fspath(self.passphrase_file), "--import", os.fspath(self.secret_key),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            signing_created = min(
+                key.created
+                for key in inspect_public_key(self.public_key).signing_keys
+                if "s" in key.capabilities.lower()
+            )
+            extra_args = (
+                f"--batch --no-tty --pinentry-mode loopback --passphrase-file {passphrase} "
+                f"--faked-system-time {int(signing_created.timestamp())}!"
             )
             valid_sign_arguments = [
-                "--define", f"_gpg_name {self.throwaway_fingerprint}",
+                "--define", "_openpgp_sign gpg",
+                "--define", f"_openpgp_sign_id {self.throwaway_fingerprint}",
                 "--define", f"_gpg_path {home}",
-                "--define", f"__gpg_sign_cmd {macro}",
+                "--define", f"_gpg_sign_cmd_extra_args {extra_args}",
                 "--addsign", os.fspath(package),
             ]
+            for rpm_major in ("4", "6"):
+                with self.subTest(tool="rpmsign", rpm_major=rpm_major):
+                    package.write_bytes(original)
+                    result = subprocess.run(
+                        [rpmsign, *valid_sign_arguments],
+                        check=False,
+                        env={
+                            **os.environ,
+                            "GNUPGHOME": os.fspath(home),
+                            "OSC_FAKE_RPM_MAJOR": rpm_major,
+                        },
+                    )
+                    self.assertEqual(0, result.returncode)
+                    self.assertTrue(package.read_bytes().endswith(b"\nFAKE-RPM-SIGNATURE\n"))
+            package.write_bytes(original)
             malformed_sign_arguments = (
                 valid_sign_arguments[:-2],
                 [*valid_sign_arguments[:-1], "--extra", valid_sign_arguments[-1]],
-                [*valid_sign_arguments[:1], "_gpg_name NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[2:]],
-                [*valid_sign_arguments[:3], "_gpg_path /wrong/home", *valid_sign_arguments[4:]],
-                [*valid_sign_arguments[:5], "__gpg_sign_cmd %{__gpg} --detach-sign", *valid_sign_arguments[6:]],
+                [*valid_sign_arguments[:3], "_openpgp_sign_id NOT-THE-EXPECTED-FINGERPRINT", *valid_sign_arguments[4:]],
+                [*valid_sign_arguments[:5], "_gpg_path /wrong/home", *valid_sign_arguments[6:]],
+                [*valid_sign_arguments[:7], "__gpg_sign_cmd %{__gpg} --detach-sign", *valid_sign_arguments[8:]],
             )
             for index, arguments in enumerate(malformed_sign_arguments):
                 with self.subTest(tool="rpmsign", case=index):
@@ -552,8 +590,17 @@ class RepositoryTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(0, valid_check.returncode)
-            self.assertIn(self.throwaway_fingerprint[-16:], valid_check.stdout)
+            self.assertEqual(f"{signed}: digests signatures OK\n", valid_check.stdout)
             self.assertEqual(signed_bytes, signed.read_bytes())
+
+            for output in ("not-ok", "malformed", "trailing"):
+                with self.subTest(checksig_output=output), mock.patch.dict(
+                    os.environ, {"OSC_RPM_CHECKSIG_OUTPUT": output}
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "verification"):
+                        _verify_rpm_packages(
+                            os.fspath(rpm), self.public_key, [signed], self.throwaway_fingerprint
+                        )
 
     def test_publish_repodata_preserves_backup_when_publication_and_restore_fail(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -630,6 +677,121 @@ class RepositoryTests(unittest.TestCase):
                 for backup in root.glob(".repodata.rollback-*"):
                     if backup.is_dir() and not backup.is_symlink():
                         shutil.rmtree(backup)
+
+    def test_rpm_build_recovers_one_stranded_valid_repodata_backup_before_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+            site = self._build_rpm(root, tools=tools)
+            paths = rpm_paths(site)
+            backup = paths.packages / ".repodata.rollback-stranded"
+            os.replace(paths.repodata, backup)
+            second = root / "object-storage-client-2.0.0-1.x86_64.rpm"
+            second.write_bytes(b"second rpm version\n")
+            replacements: list[tuple[pathlib.Path, pathlib.Path]] = []
+            real_replace = os.replace
+
+            def record_replace(source, destination):
+                replacements.append((pathlib.Path(source), pathlib.Path(destination)))
+                return real_replace(source, destination)
+
+            with mock.patch("build.linux.repository.os.replace", side_effect=record_replace):
+                self._build_rpm(root, site=site, rpm_package=second, tools=tools)
+
+            repodata_replacements = [pair for pair in replacements if pair[1] == paths.repodata]
+            self.assertGreaterEqual(len(repodata_replacements), 2)
+            self.assertEqual((backup, paths.repodata), repodata_replacements[0])
+            self.assertTrue(paths.repodata.is_dir())
+            self.assertEqual([], list(paths.packages.glob(".repodata.rollback-*")))
+            self.assertEqual(
+                {"object-storage-client-1.2.3-1.x86_64.rpm", second.name},
+                {path.name for path in paths.packages.glob("*.rpm")},
+            )
+
+    def test_rpm_build_rejects_and_preserves_ambiguous_or_unsafe_rollback_backups(self):
+        for case in ("live-and-backup", "multiple", "symlink"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                tools = _fake_rpm_tools(root / "tools", self.throwaway_fingerprint)
+                site = self._build_rpm(root, tools=tools)
+                paths = rpm_paths(site)
+                first = paths.packages / ".repodata.rollback-first"
+                if case == "live-and-backup":
+                    shutil.copytree(paths.repodata, first)
+                elif case == "multiple":
+                    os.replace(paths.repodata, first)
+                    shutil.copytree(first, paths.packages / ".repodata.rollback-second")
+                else:
+                    rescued = paths.packages / ".rescued-repodata"
+                    os.replace(paths.repodata, rescued)
+                    first.symlink_to(rescued, target_is_directory=True)
+                before = {
+                    path.relative_to(paths.packages): (
+                        "symlink", os.readlink(path)
+                    ) if path.is_symlink() else (
+                        "file", path.read_bytes()
+                    ) if path.is_file() else ("directory", None)
+                    for path in paths.packages.rglob("*")
+                }
+                package = root / "object-storage-client-2.0.0-1.x86_64.rpm"
+                package.write_bytes(b"new package must not publish\n")
+                expected_error = (
+                    "ambiguous.*rollback|rollback.*ambiguous"
+                    if case in {"live-and-backup", "multiple"}
+                    else "unsafe.*rollback|rollback.*unsafe"
+                )
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    self._build_rpm(root, site=site, rpm_package=package, tools=tools)
+                after = {
+                    path.relative_to(paths.packages): (
+                        "symlink", os.readlink(path)
+                    ) if path.is_symlink() else (
+                        "file", path.read_bytes()
+                    ) if path.is_file() else ("directory", None)
+                    for path in paths.packages.rglob("*")
+                }
+                self.assertEqual(before, after)
+
+    def test_publish_repodata_fsyncs_staged_tree_bottom_up_before_first_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source"
+            destination = root / "repodata"
+            (source / "nested").mkdir(parents=True)
+            destination.mkdir()
+            (source / "top.xml").write_bytes(b"top\n")
+            (source / "nested/deep.xml").write_bytes(b"deep\n")
+            (destination / "old.xml").write_bytes(b"old\n")
+            fsynced: list[pathlib.Path] = []
+            real_fsync = os.fsync
+            real_replace = os.replace
+            checked_first_rename = False
+
+            def record_fsync(descriptor):
+                fsynced.append(pathlib.Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+                return real_fsync(descriptor)
+
+            def assert_tree_durable_before_rename(source_path, destination_path):
+                nonlocal checked_first_rename
+                if not checked_first_rename:
+                    checked_first_rename = True
+                    staged = next(root.glob(".repodata.publish-*"))
+                    expected = [
+                        staged / "top.xml",
+                        staged / "nested/deep.xml",
+                        staged / "nested",
+                        staged,
+                    ]
+                    self.assertTrue(all(path in fsynced for path in expected), (expected, fsynced))
+                    self.assertLess(fsynced.index(staged / "nested/deep.xml"), fsynced.index(staged / "nested"))
+                    self.assertLess(fsynced.index(staged / "nested"), fsynced.index(staged))
+                return real_replace(source_path, destination_path)
+
+            with mock.patch("build.linux.repository.os.fsync", side_effect=record_fsync), mock.patch(
+                "build.linux.repository.os.replace", side_effect=assert_tree_durable_before_rename
+            ):
+                _publish_repodata(source, destination)
+            self.assertTrue(checked_first_rename)
 
     def test_rpm_repository_retains_versions_and_is_idempotent_but_rejects_collision(self):
         with tempfile.TemporaryDirectory() as temporary:
