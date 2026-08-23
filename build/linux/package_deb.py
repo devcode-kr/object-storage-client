@@ -32,8 +32,12 @@ def installed_size(package_root: Path) -> int:
     return (total_bytes + 1023) // 1024
 
 
-def render_control(version: NativeVersion, size_kib: int) -> str:
-    if isinstance(size_kib, bool) or not isinstance(size_kib, int) or size_kib < 0:
+def render_control(version: NativeVersion, installed_size_kib: int) -> str:
+    if (
+        isinstance(installed_size_kib, bool)
+        or not isinstance(installed_size_kib, int)
+        or installed_size_kib < 0
+    ):
         raise ValueError("installed size must be a non-negative integer")
     dependencies = ", ".join(DEB_DEPENDENCIES)
     return (
@@ -42,7 +46,7 @@ def render_control(version: NativeVersion, size_kib: int) -> str:
         "Section: net\n"
         "Priority: optional\n"
         f"Architecture: {DEB_ARCH}\n"
-        f"Installed-Size: {size_kib}\n"
+        f"Installed-Size: {installed_size_kib}\n"
         f"Maintainer: {MAINTAINER}\n"
         f"Depends: {dependencies}\n"
         f"Homepage: {HOMEPAGE}\n"

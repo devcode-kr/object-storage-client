@@ -302,7 +302,9 @@ class StagePayloadTests(unittest.TestCase):
 
 class DebianControlTests(unittest.TestCase):
     def test_render_control_is_the_exact_complete_body(self):
-        control = package_deb.render_control(NativeVersion.parse("1.2.3", 4), 50000)
+        control = package_deb.render_control(
+            NativeVersion.parse("1.2.3", 4), installed_size_kib=50000
+        )
         self.assertEqual(EXPECTED_CONTROL, control)
         self.assertTrue(control.endswith("\n"))
         self.assertNotIn(".devcode", control)
@@ -324,7 +326,7 @@ class DebianControlTests(unittest.TestCase):
         for invalid in (-1, True, 1.5, "50000", None):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
-                    package_deb.render_control(version, invalid)
+                    package_deb.render_control(version, installed_size_kib=invalid)
 
 
 class DebianCliTests(unittest.TestCase):
