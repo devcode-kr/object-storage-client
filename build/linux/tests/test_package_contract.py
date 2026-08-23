@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import pathlib
+import stat
 import sys
 import unittest
 
@@ -24,6 +26,7 @@ class PackageContractTests(unittest.TestCase):
     def test_package_identity_and_paths_are_stable(self):
         contract = load_contract()
         self.assertEqual("object-storage-client", contract.PACKAGE_NAME)
+        self.assertEqual("Object Storage Client", contract.PRODUCT_NAME)
         self.assertEqual("amd64", contract.DEB_ARCH)
         self.assertEqual("x86_64", contract.RPM_ARCH)
         self.assertEqual("/usr/lib/object-storage-client", contract.APP_DIR)
@@ -36,6 +39,10 @@ class PackageContractTests(unittest.TestCase):
             "/usr/share/icons/hicolor/256x256/apps/object-storage-client.png",
             contract.ICON_PATH,
         )
+        self.assertEqual(
+            "/usr/share/doc/object-storage-client",
+            contract.DOC_DIR,
+        )
 
     def test_version_mapping_uses_native_package_release(self):
         contract = load_contract()
@@ -43,6 +50,17 @@ class PackageContractTests(unittest.TestCase):
         self.assertEqual("1.2.3-4", version.debian)
         self.assertEqual("1.2.3", version.rpm_version)
         self.assertEqual("4", version.rpm_release)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            version.package_release = 5
+
+    def test_valid_release_boundaries_map_to_native_versions(self):
+        contract = load_contract()
+        for release in (1, 65535):
+            with self.subTest(release=release):
+                version = contract.NativeVersion.parse("1.2.3", release)
+                self.assertEqual(f"1.2.3-{release}", version.debian)
+                self.assertEqual("1.2.3", version.rpm_version)
+                self.assertEqual(str(release), version.rpm_release)
 
     def test_invalid_versions_and_releases_are_rejected(self):
         contract = load_contract()
@@ -70,11 +88,13 @@ class PackageContractTests(unittest.TestCase):
         )
 
     def test_launcher_uses_absolute_application_path(self):
-        launcher = (LINUX / "object-storage-client").read_text(encoding="utf-8")
+        launcher_path = LINUX / "object-storage-client"
+        launcher = launcher_path.read_text(encoding="utf-8")
         self.assertEqual(
             "#!/bin/sh\nexec /usr/lib/object-storage-client/ObjectStorageClient.App \"$@\"\n",
             launcher,
         )
+        self.assertTrue(launcher_path.stat().st_mode & stat.S_IXUSR)
 
     def test_desktop_entry_uses_installed_command_and_icon(self):
         desktop = (LINUX / "object-storage-client.desktop").read_text(encoding="utf-8")
@@ -90,13 +110,44 @@ class PackageContractTests(unittest.TestCase):
             desktop,
         )
 
+    def test_linux_packaging_ignore_entries_are_exact(self):
+        expected = {
+            "artifacts/linux-packages/",
+            "obj/linux-packages/",
+            "obj/linux-repositories/",
+            "obj/linux-smoke/",
+            "obj/gnupg-test/",
+        }
+        entries = [
+            line.strip()
+            for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+        for entry in expected:
+            with self.subTest(entry=entry):
+                self.assertEqual(1, entries.count(entry))
+
+        linux_entries = {
+            entry
+            for entry in entries
+            if entry.startswith(("artifacts/linux-", "obj/linux-"))
+        }
+        self.assertEqual(expected - {"obj/gnupg-test/"}, linux_entries)
+
     def test_packaging_sources_never_reference_user_state(self):
-        forbidden = ".devcode/object-storage-client"
-        for path in LINUX.glob("*"):
-            if path.is_file() and path.name not in {"package_contract.py"}:
+        forbidden = ".devcode" + "/object-storage-client"
+        for path in LINUX.rglob("*"):
+            if (
+                path.is_file()
+                and path.name != "package_contract.py"
+                and "__pycache__" not in path.parts
+                and path.suffix != ".pyc"
+            ):
                 self.assertNotIn(
                     forbidden,
                     path.read_text(encoding="utf-8", errors="ignore"),
+                    str(path.relative_to(ROOT)),
                 )
 
 
