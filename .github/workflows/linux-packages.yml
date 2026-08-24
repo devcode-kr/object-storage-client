@@ -3,6 +3,17 @@ name: Linux package validation
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Application version override
+        required: false
+        type: string
+        default: ''
+      package_release:
+        description: Native package release
+        required: false
+        type: string
+        default: '1'
   workflow_call:
     inputs:
       version:
@@ -98,6 +109,17 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts/logs
           python3 -m unittest discover -s build/linux/tests -p 'test_*.py' 2>&1 | tee artifacts/logs/linux-contract-tests.log
+
+      - name: Upload failed test logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-test-failure-logs
+          path: |
+            artifacts/logs/managed-tests.log
+            artifacts/logs/linux-contract-tests.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Publish Linux application once
         env:
@@ -317,6 +339,8 @@ jobs:
           network="osc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
           server="osc-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
           target="osc-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          mkdir -p artifacts/logs
+          docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
           docker rm -f "$target" "$server" 2>/dev/null || true
           docker network rm "$network" 2>/dev/null || true
 

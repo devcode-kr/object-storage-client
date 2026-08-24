@@ -76,6 +76,8 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
         self.assertEqual("string", inputs["package_release"]["type"])
         self.assertEqual("false", inputs["package_release"]["required"])
         self.assertEqual("1", inputs["package_release"]["default"])
+        dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs, dispatch_inputs)
 
     def test_permissions_concurrency_and_timeouts_are_restrictive(self):
         loaded = load_workflow()
@@ -107,6 +109,10 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
         self.assertRegex(
             text,
             r"python3 -m unittest discover -s build/linux/tests[^\n]*\| tee artifacts/logs/linux-contract-tests\.log",
+        )
+        self.assertRegex(
+            text,
+            r"(?s)name: Upload failed test logs.*?if: failure\(\).*?name: linux-test-failure-logs.*?artifacts/logs/managed-tests\.log.*?artifacts/logs/linux-contract-tests\.log",
         )
         self.assertRegex(text, r"(?s)docker run --rm .*?debian:12 .*?package_deb\.py")
         self.assertRegex(text, r"(?s)docker run --rm .*?fedora:44 .*?package_rpm\.py")
@@ -161,6 +167,10 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
         self.assertIn('"/repository"', text)
         self.assertRegex(text, r"(?s)(?:while|for) .*repository:8000.*sleep")
         self.assertIn("if: always()", text)
+        self.assertRegex(
+            text,
+            r'(?s)name: Clean up isolated smoke resources.*?docker logs "\$server".*?docker rm -f',
+        )
         self.assertIn("docker network rm", text)
 
     def test_all_actions_are_immutable(self):
