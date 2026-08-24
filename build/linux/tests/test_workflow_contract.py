@@ -9,6 +9,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github" / "workflows" / "linux-packages.yml"
 PUBLICATION_WORKFLOW = ROOT / ".github" / "workflows" / "publish-linux-repositories.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_MATRIX = {
     ("debian:12", "debian-12", "deb"),
     ("ubuntu:22.04", "ubuntu-22-04", "deb"),
@@ -475,9 +476,166 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             with self.subTest(snippet=snippet[:80]):
                 compile(snippet, "<workflow-python>", "exec")
 
-    def test_release_integration_is_deferred_to_task_6b2(self):
-        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-        self.assertNotIn("publish-linux-repositories.yml", release)
+
+class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
+    def setUp(self):
+        loaded = load_workflow(RELEASE_WORKFLOW)
+        self.assertIsInstance(loaded, dict)
+        assert loaded is not None
+        self.loaded = loaded
+        self.text = workflow_text(RELEASE_WORKFLOW)
+
+    def test_release_yaml_triggers_and_job_interface_are_exact(self):
+        self.assertEqual({"push", "workflow_dispatch"}, set(self.loaded["on"]))
+        self.assertEqual(["v*"], self.loaded["on"]["push"]["tags"])
+        self.assertEqual({}, self.loaded["on"]["workflow_dispatch"] or {})
+        self.assertEqual(
+            {
+                "verify", "test", "package", "linux_packages",
+                "prepare_linux_repositories", "release", "publish_linux_repositories",
+            },
+            set(self.loaded["jobs"]),
+        )
+
+        linux = self.loaded["jobs"]["linux_packages"]
+        self.assertEqual("verify", linux["needs"])
+        self.assertEqual("./.github/workflows/linux-packages.yml", linux["uses"])
+        self.assertEqual(
+            {"version": "${{ needs.verify.outputs.version }}", "package_release": "1"},
+            linux["with"],
+        )
+        self.assertNotIn("if", linux)
+
+        expected_secrets = {
+            "LINUX_REPO_GPG_PRIVATE_KEY": "${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}",
+            "LINUX_REPO_GPG_PASSPHRASE": "${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}",
+        }
+        for name, mode in (("prepare_linux_repositories", "prepare"), ("publish_linux_repositories", "publish")):
+            job = self.loaded["jobs"][name]
+            self.assertEqual("./.github/workflows/publish-linux-repositories.yml", job["uses"])
+            self.assertEqual(
+                {
+                    "mode": mode,
+                    "version": "${{ needs.verify.outputs.version }}",
+                    "package_release": "1",
+                    "validation_artifact": "linux-package-validation",
+                    "candidate_artifact": "linux-pages-candidate",
+                },
+                job["with"],
+            )
+            self.assertEqual(expected_secrets, job["secrets"])
+
+    def test_dependency_order_tag_guards_and_manual_safety_are_exact(self):
+        jobs = self.loaded["jobs"]
+        self.assertEqual({"verify", "linux_packages"}, set(jobs["prepare_linux_repositories"]["needs"]))
+        self.assertEqual(
+            {"verify", "package", "linux_packages", "prepare_linux_repositories"},
+            set(jobs["release"]["needs"]),
+        )
+        self.assertEqual(
+            {"release", "prepare_linux_repositories", "verify"},
+            set(jobs["publish_linux_repositories"]["needs"]),
+        )
+        for name in ("prepare_linux_repositories", "release", "publish_linux_repositories"):
+            guard = jobs[name]["if"]
+            self.assertIn("github.ref_type == 'tag'", guard)
+            self.assertIn("startsWith(github.ref, 'refs/tags/v')", guard)
+        publish_guard = jobs["publish_linux_repositories"]["if"]
+        self.assertIn("needs.release.result == 'success'", publish_guard)
+        self.assertNotIn("workflow_dispatch", publish_guard)
+        self.assertNotIn("if", jobs["linux_packages"])
+        self.assertLess(self.text.index("  release:"), self.text.index("  publish_linux_repositories:"))
+
+    def test_top_and_job_permissions_are_least_privilege(self):
+        self.assertEqual({"contents": "read"}, self.loaded["permissions"])
+        expected = {
+            "verify": {"contents": "read"},
+            "test": {"contents": "read"},
+            "package": {"contents": "read"},
+            "linux_packages": {"contents": "read"},
+            "prepare_linux_repositories": {"contents": "read"},
+            "release": {"contents": "write"},
+            "publish_linux_repositories": {
+                "contents": "write", "pages": "write", "id-token": "write"
+            },
+        }
+        self.assertEqual(set(expected), set(self.loaded["jobs"]))
+        for name, permissions in expected.items():
+            self.assertEqual(permissions, self.loaded["jobs"][name]["permissions"])
+
+    def test_release_actions_are_immutable_and_local_calls_are_exact(self):
+        uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", self.text)
+        self.assertTrue(uses)
+        allowed_local = {
+            "./.github/workflows/linux-packages.yml",
+            "./.github/workflows/publish-linux-repositories.yml",
+        }
+        for action in uses:
+            with self.subTest(action=action):
+                if action.startswith("./"):
+                    self.assertIn(action, allowed_local)
+                else:
+                    self.assertRegex(action, ACTION_SHA)
+        expected_pins = {
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9",
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        }
+        self.assertTrue(expected_pins.issubset(set(uses)))
+
+    def test_release_verifies_signed_packages_and_collects_every_asset_type(self):
+        release = self.loaded["jobs"]["release"]
+        steps = release["steps"]
+        downloads = [step for step in steps if step.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual(2, len(downloads))
+        platform = next(step for step in downloads if step["with"].get("pattern") == "release-*")
+        signed = next(step for step in downloads if step["with"].get("name") == "linux-release-packages")
+        self.assertEqual("downloaded/platform", platform["with"]["path"])
+        self.assertEqual("downloaded/linux-release-packages", signed["with"]["path"])
+
+        collect = next(step["run"] for step in steps if step.get("name") == "Verify and collect release artifacts")
+        for marker in (
+            "sha256sum --check SHA256SUMS", "*.deb", "*.rpm", "*.tar.gz", "*.zip",
+            "SHA256SUMS.txt", "ObjectStorageClient-${VERSION}-linux-x64.tar.gz",
+            "ObjectStorageClient-${VERSION}-osx-arm64.zip",
+            "ObjectStorageClient-${VERSION}-osx-x64.zip",
+        ):
+            self.assertIn(marker, collect)
+        self.assertRegex(collect, r"find .* -name '\*\.deb'.*wc -l.*-eq 1")
+        self.assertRegex(collect, r"find .* -name '\*\.rpm'.*wc -l.*-eq 1")
+        self.assertLess(collect.index("sha256sum --check SHA256SUMS"), collect.index("mkdir -p artifacts"))
+        self.assertIn("artifacts/*", steps[-1]["run"])
+        for marker in ("Build MSIX for the Store", "Upload MSIX", "STORE_URL", "build/release-body.md"):
+            self.assertIn(marker, self.text)
+
+    def test_gpg_identifiers_are_configured_without_bypass_or_secret_dumping(self):
+        combined = self.text + workflow_text(PUBLICATION_WORKFLOW)
+        for identifier in (
+            "LINUX_REPO_GPG_PRIVATE_KEY",
+            "LINUX_REPO_GPG_PASSPHRASE",
+            "LINUX_REPO_GPG_FINGERPRINT",
+        ):
+            self.assertIn(identifier, combined)
+        lowered = combined.lower()
+        for marker in ("trusted=yes", "--nogpgcheck", "printenv", "export -p", "echo $private", "echo $passphrase"):
+            self.assertNotIn(marker, lowered)
+
+    def test_release_multiline_bash_steps_parse(self):
+        snippets = [
+            step["run"]
+            for job in self.loaded["jobs"].values()
+            if "steps" in job
+            for step in job["steps"]
+            if "run" in step and step.get("shell", "bash") != "pwsh"
+        ]
+        self.assertTrue(snippets)
+        for body in snippets:
+            with tempfile.NamedTemporaryFile("w", suffix=".bash", encoding="utf-8") as script:
+                script.write(body)
+                script.flush()
+                result = subprocess.run(["bash", "-n", script.name], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 if __name__ == "__main__":
