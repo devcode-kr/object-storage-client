@@ -21,6 +21,8 @@
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+sudo apt-get update
+sudo apt-get install -y ca-certificates wget gnupg
 wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
 gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" &gt; "$tmpdir/key-info"
 fingerprint=$(awk -F: '
@@ -45,6 +47,7 @@ sudo apt install object-storage-client</code></pre>
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+sudo dnf install -y ca-certificates wget gnupg2
 wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
 gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" &gt; "$tmpdir/key-info"
 fingerprint=$(awk -F: '

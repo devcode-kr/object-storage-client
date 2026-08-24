@@ -9,25 +9,32 @@
 
 | 플랫폼 | 배포 경로 | 서명 |
 | --- | --- | --- |
-| Windows | Microsoft Store | **Microsoft가 서명한다** |
-| macOS | GitHub 릴리즈 `.zip` | 없음; `SHA256SUMS.txt`만 제공 |
-| 리눅스 네이티브 패키지 | GitHub Pages APT/DNF | **프로젝트 GPG 키로 서명** |
+| Windows | Microsoft Store 예정; 목록·인증 대기 중 | Store 인증 뒤 Microsoft 서명 시작 |
+| macOS | GitHub 릴리즈 `.zip` | 현재 아카이브는 서명·공증 없음; `SHA256SUMS.txt`만 제공 |
+| 리눅스 네이티브 패키지 | 첫 네이티브 릴리즈에 GitHub Pages APT/DNF 예정 | 공개되면 **프로젝트 GPG 키로 서명** |
 | 리눅스 휴대용 tar.gz | GitHub 릴리즈 | 없음; `SHA256SUMS.txt`만 제공 |
 
 ### Windows
 
-Windows 서명 경로는 리눅스와 별개다. 개발자 계정은 승인되었지만 Store 인증과 공개 목록은 아직
-대기 중이다. 제출한 MSIX가 인증을 통과하면 **Microsoft Store가 Microsoft 인증서로 다시 서명**하고
+Windows 서명 경로는 리눅스와 별개다. 개발자 계정은 승인되었지만 Store 목록과 인증은 아직 대기
+중이다. 제출한 MSIX가 인증을 통과하면 **Microsoft Store가 Microsoft 인증서로 다시 서명**하고
 업데이트도 맡는다. 프로젝트 GPG 키는 Windows에 쓰지 않는다. `.exe`나 `.msi`를 직접 배포하는 경로도
-없다.
+없다. 과거 GitHub 릴리즈의 Windows ZIP은 현재 공식 Store 경로가 아닌, 서명되지 않은 레거시 테스트
+산출물이다.
 
 ### macOS
 
 macOS `.zip` 아카이브는 Apple 개발자 서명이나 공증 없이 나간다. `SHA256SUMS.txt`는 내려받은 파일의
-바이트가 릴리즈에 기록된 값과 같은지만 확인하며, 누가 만들었는지는 보증하지 않는다. Gatekeeper의
-격리 경고를 처리하는 방법은 README와 릴리즈 노트에 둔다.
+바이트가 릴리즈에 기록된 값과 같은지만 확인하며, 누가 만들었는지는 보증하지 않는다. Gatekeeper가
+실행을 막을 수 있으며, README는 보안을 약화하는 대신 소스 빌드나 서명·공증된 배포를 기다리도록
+안내한다.
 
 ### 리눅스
+
+서명 저장소는 **첫 네이티브 Linux 패키지 릴리즈**와 함께 공개된다. 해당 태그와 GitHub Pages 배포가
+끝나기 전에는 저장소 URL이 **404**를 반환할 수 있으며, 그동안은 서명되지 않은 릴리즈 tar.gz가 수동
+설치 대안이다. 아래 서명 동작은 저장소가 공개된 뒤의 정책이며, 배포 전 URL을 지금 쓸 수 있다는
+주장이 아니다.
 
 APT와 DNF가 확인하는 대상은 다음과 같다.
 
@@ -46,7 +53,7 @@ GPG 서명을 대신하지 않는다.
 
 - URL: <https://devcode-kr.github.io/object-storage-client/repository-key.asc>
 - 전체 지문: `843B0BB9F1A4488C8C7B60133F8AC712C8C56B90`
-- 만료일: `2029-08-22` (생성일로부터 **3 years**)
+- 만료일: `2029-08-22` (생성일로부터 **3년**)
 
 설치 절차는 전체 지문과 키 구조를 확인하고 로컬 keyring에 넣는다. APT는 그 keyring을 해당 저장소의
 `signed-by`에만 연결하고, DNF는 로컬 키 파일로 패키지와 메타데이터 확인을 모두 켠다.

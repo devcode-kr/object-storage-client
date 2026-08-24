@@ -4,7 +4,7 @@
 
 A cross-platform desktop client for S3-compatible object storage, with a FileZilla-style
 two-pane interface. Built with [Avalonia UI](https://avaloniaui.net) on .NET 9, and runs on
-Windows 11, Debian-family Linux, and macOS from one codebase.
+Windows 11, Debian-family and RPM-family Linux, and macOS from one codebase.
 
 ## Features
 
@@ -30,21 +30,24 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 
 ## Install
 
-**Windows is distributed through the Microsoft Store.** The developer account is approved; Store
-certification and the public listing link are still pending, so there is no live Store claim yet.
-Microsoft signs a certified MSIX and the Store owns its updates.
+**Windows will be distributed through the Microsoft Store.** The developer account is approved, but
+the Store listing and certification are still pending, so there is no current official Windows
+download channel. Once approved, Microsoft will sign the certified MSIX and the Store will own its
+updates. Historical Windows ZIPs on GitHub releases are not the current official Store channel;
+they are unsigned legacy test artifacts and are not recommended as an installation path.
 
-**macOS** remains an unsigned `.zip` archive on the
-[latest release](https://github.com/devcode-kr/object-storage-client/releases/latest).
-`SHA256SUMS.txt` checks the download but is not a developer signature, so Gatekeeper may report the
-app as *"damaged"* on first launch. Move it to `/Applications`, then clear quarantine:
+**macOS** release archives are unsigned and not notarised. Gatekeeper may therefore block them.
+The safest choices are to build from source or wait for a signed and notarised distribution; this
+documentation does not recommend weakening or circumventing Gatekeeper. `SHA256SUMS.txt` can detect
+a changed download. **A checksum does not establish provenance** or replace developer signing.
 
-```bash
-xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
-```
+**Availability note:** the signed APT/DNF repositories are staged and become available with the
+**first native Linux package release**. Their URLs may return **404** until that release's `v*` tag
+and Pages deployment complete. Until then, use the latest release's `linux-x64.tar.gz` manual asset
+or build from source. Once published, the commands below are the canonical installation path.
 
-**On Linux, the signed APT/DNF repositories are the recommended installation path.** Native
-packages carry the .NET runtime and declare their system dependencies. Support is **x86-64** only:
+Native packages carry the .NET runtime and declare their system dependencies. Support is
+**x86-64** only:
 
 | Family | Supported releases |
 | --- | --- |
@@ -52,10 +55,11 @@ packages carry the .NET runtime and declare their system dependencies. Support i
 | Fedora | Fedora 44, Fedora 43 (the latest two releases) |
 | Enterprise Linux | Rocky Linux 9, AlmaLinux 9, RHEL 9 |
 
-The first public tag is gated on **manual RHEL 9 validation** of the GUI and S3 operations on a
-subscribed desktop. The app targets X11 directly and uses XWayland in a Wayland session. On a
-minimal install, add `fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-cjk-fonts` (RPM family) if
-CJK text is needed.
+The **first native Linux package release** and every later native release are gated on
+**manual RHEL 9 validation** of the GUI, S3 operations, and package behavior on a subscribed desktop.
+The release workflow enforces an exact per-release **version marker** recorded only after that validation.
+The app targets X11 directly and uses XWayland in a Wayland session. On a minimal install, add
+`fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-cjk-fonts` (RPM family) if CJK text is needed.
 
 ### APT (Debian / Ubuntu)
 

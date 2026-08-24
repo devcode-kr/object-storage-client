@@ -255,9 +255,37 @@ jobs:
       version: ${{ needs.verify.outputs.version }}
       package_release: '1'
 
+  # One-time repository setup: create the rhel-9-manual-validation environment with a required reviewer.
+  # RHEL9_MANUAL_VALIDATION_VERSION is an environment variable, not a secret, and is
+  # manually updated only after real subscribed RHEL 9 GUI, S3, and native package validation.
+  # The tag-only guard leaves workflow_dispatch package-validation artifacts unblocked.
+  rhel_release_gate:
+    name: Confirm manual RHEL 9 validation
+    needs: verify
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    environment: rhel-9-manual-validation
+    steps:
+      - name: Require the exact manually validated release version
+        env:
+          VALIDATED_VERSION: ${{ vars.RHEL9_MANUAL_VALIDATION_VERSION }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VALIDATED_VERSION" ]] || {
+            echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
+            exit 1
+          }
+          [[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}" ]] || {
+            echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
+            exit 1
+          }
+
   prepare_linux_repositories:
     name: Prepare signed Linux repositories
-    needs: [verify, linux_packages]
+    needs: [verify, linux_packages, rhel_release_gate]
     if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read

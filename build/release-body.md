@@ -4,36 +4,34 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 | 플랫폼 | 파일 |
 | --- | --- |
-| Windows 11 (x64) | [Microsoft Store](@STORE_URL@) |
-| 리눅스 (x64, 데비안 계열) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
+| Windows 11 (x64) | Microsoft Store 공개 예정: @STORE_URL@ |
+| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
+| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
+| 리눅스 휴대용 대안 (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
 
 .NET 런타임까지 들어 있어서 따로 설치할 게 없다.
 
-## Windows는 Microsoft Store에서
+## Windows는 Microsoft Store 공개 예정
 
-Windows용은 Store로만 배포한다. Store가 패키지에 서명하고 업데이트도 알아서 챙겨주니, 경고를
-넘길 일도 직접 받아 압축을 풀 일도 없다.
+개발자 계정은 승인됐지만 공개 목록과 인증은 아직 대기 중이다. 공개 뒤에는 Store가 MSIX에 서명하고
+업데이트를 맡는다. 과거 GitHub 릴리즈의 Windows ZIP은 서명되지 않은 레거시 테스트 산출물이다.
 
-## macOS와 리눅스는 서명이 없습니다
+## macOS와 리눅스 서명
 
-이 둘은 서명 없이 나간다. macOS는 그래서 경고를 띄우는데, 넘어가는 방법은 아래에 있다. 그냥
-실행하기가 꺼려지면 체크섬부터 확인하면 된다.
+리눅스 네이티브 패키지와 서명된 APT/DNF 저장소는 프로젝트 GPG 키로 검증한다. 휴대용 tar.gz와
+macOS ZIP은 서명되지 않았고 체크섬만 제공한다. 체크섬은 파일 손상은 찾지만 출처는 증명하지 않는다.
 
 ### macOS
 
-서명이 없는 앱을 macOS는 *"손상되었기 때문에 열 수 없습니다"*라고 알린다. 앱이 망가진 게 아니라,
-서명 없이 격리된 번들에 Gatekeeper가 붙이는 문구다. 앱을 옮겨놓고 격리 딱지를 떼면 실행된다.
-
-```sh
-xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
-```
+현재 ZIP은 서명·notarization이 없어 Gatekeeper가 실행을 막을 수 있다. 플랫폼 보호 기능을 끄는 절차는
+제공하지 않는다. 소스에서 직접 빌드하거나 서명·notarization된 배포를 기다리는 편이 안전하다.
 
 ### 리눅스
 
-막는 서명 검사가 없다. 다만 최소 설치 환경이라면 Avalonia가 쓰는 라이브러리를 먼저 깔아야 할 수
-있다.
+권장 설치 경로는 signed APT/DNF 저장소다. 첫 네이티브 Linux 패키지 릴리즈 전에는 Pages URL이
+404를 반환할 수 있다. 그때까지 tar.gz는 수동 대안으로만 제공한다.
 
 ```sh
 sudo apt install libx11-6 libice6 libsm6 libfontconfig1
@@ -72,37 +70,37 @@ two-pane interface.
 
 | Platform | File |
 | --- | --- |
-| Windows 11 (x64) | [Microsoft Store](@STORE_URL@) |
-| Linux (x64, Debian family) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
+| Windows 11 (x64) | Microsoft Store listing planned: @STORE_URL@ |
+| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
+| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
+| Portable Linux fallback (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
 
 Every build is self-contained — no .NET runtime installation is required.
 
-## Windows comes from the Microsoft Store
+## Windows is planned for the Microsoft Store
 
-Windows is distributed through the Store only. The Store signs the package and handles updates,
-so there is no warning to click past and no archive to unblock.
+The developer account is approved, but listing and certification are still pending. Once public,
+the Store will sign the MSIX and handle updates. Historical Windows ZIPs on GitHub are unsigned
+legacy test artifacts.
 
-## The macOS and Linux builds are not code-signed
+## macOS and Linux signatures
 
-These two ship unsigned, so macOS will warn you. Getting past it is below. Verify the checksums
-first if you would rather not take that on faith.
+Native Linux packages and the signed APT/DNF repositories are verified with the project GPG key.
+The portable tar.gz and macOS ZIP remain unsigned and have checksums only. A checksum detects file
+damage but does not authenticate where a file came from.
 
 ### macOS
 
-macOS reports unsigned apps as *"damaged and can't be opened"*. The app is not damaged; that is
-the Gatekeeper message for a quarantined bundle without a signature. Remove the quarantine
-attribute after moving the app into place:
-
-```sh
-xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
-```
+The current ZIP is neither signed nor notarised, so Gatekeeper may refuse to run it. This project
+does not document a way to disable that protection. Build from source or wait for a signed and
+notarised distribution.
 
 ### Linux
 
-No signature checks stand in the way. On a minimal install you may need the libraries Avalonia
-depends on:
+The signed APT/DNF repositories are the recommended install path. Their Pages URLs may return 404
+until the first native Linux package release. Until then, the tar.gz is a manual fallback:
 
 ```sh
 sudo apt install libx11-6 libice6 libsm6 libfontconfig1

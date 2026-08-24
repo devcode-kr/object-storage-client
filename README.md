@@ -3,8 +3,8 @@
 *한국어 · [English](README.en.md)*
 
 S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면은 FileZilla처럼 좌우 2단으로 나뉜다.
-[Avalonia UI](https://avaloniaui.net)와 .NET 9로 만들었고, 코드베이스 하나로 Windows 11과 데비안
-계열 리눅스, macOS를 모두 지원한다.
+[Avalonia UI](https://avaloniaui.net)와 .NET 9로 만들었고, 코드베이스 하나로 Windows 11,
+데비안 계열과 RPM 계열 리눅스, macOS를 모두 지원한다.
 
 ## 기능
 
@@ -28,21 +28,23 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 ## 설치
 
-**Windows는 Microsoft Store로 배포한다.** 개발자 계정은 승인되었고, 현재 Store 인증과 공개 목록
-링크를 기다리고 있다. 목록이 열리기 전까지 존재하지 않는 Store 링크를 안내하지 않는다. 인증을
-통과한 MSIX는 Microsoft가 서명하고 Store가 업데이트를 맡는다.
+**Windows는 앞으로 Microsoft Store로 배포할 예정이다.** 개발자 계정은 승인되었지만 Store 목록과
+인증은 아직 대기 중이므로 현재 공식 Windows 다운로드 경로는 없다. 승인된 뒤에는 Microsoft가 MSIX에
+서명하고 Store가 업데이트를 맡는다. 과거 GitHub 릴리즈의 Windows ZIP은 현재 공식 Store 경로가
+아니며, 서명되지 않은 레거시 테스트 산출물이므로 설치 경로로 권장하지 않는다.
 
-**macOS는** [최신 릴리즈](https://github.com/devcode-kr/object-storage-client/releases/latest)의
-서명되지 않은 `.zip` 아카이브로 제공한다. `SHA256SUMS.txt`로 내려받은 파일을 확인할 수 있지만
-개발자 서명은 아니므로, 처음 실행할 때 Gatekeeper가 "손상되었기 때문에 열 수 없습니다"라고 할 수
-있다. 앱을 `/Applications`로 옮긴 뒤 격리 속성을 지우면 된다.
+**macOS 릴리즈 아카이브는 서명되거나 공증되지 않았다.** 따라서 Gatekeeper가 실행을 차단할 수 있다.
+가장 안전한 선택은 소스에서 빌드하거나 서명되고 공증된 배포를 기다리는 것이며, 이 문서는
+Gatekeeper 보안을 약화하거나 우회하는 방법을 권장하지 않는다. `SHA256SUMS.txt`는 내려받은 파일의
+변경 여부만 확인한다. **체크섬은 출처를 증명하지 않는다.**
 
-```bash
-xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
-```
+**배포 전 안내:** 서명된 APT/DNF 저장소는 **첫 네이티브 Linux 패키지 릴리즈**와 함께 공개된다.
+해당 `v*` 태그와 Pages 배포 전에는 저장소 URL이 **404**를 반환할 수 있다. 그때까지는 최신 릴리즈의
+`linux-x64.tar.gz` 수동 설치 자산을 쓰거나 소스에서 빌드한다. 게시된 뒤에는 아래 명령이 표준 설치
+경로다.
 
-**리눅스는 서명된 APT/DNF 저장소가 권장 설치 경로다.** 아래 패키지는 .NET 런타임과 필요한 시스템
-의존성을 함께 처리한다. 지원 범위는 모두 **x86-64**이며 다음과 같다.
+네이티브 패키지는 .NET 런타임과 필요한 시스템 의존성을 함께 처리한다. 지원 범위는 모두
+**x86-64**이며 다음과 같다.
 
 | 계열 | 지원 버전 |
 | --- | --- |
@@ -50,9 +52,11 @@ xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
 | Fedora | Fedora 44, Fedora 43 (최신 두 버전) |
 | Enterprise Linux | Rocky Linux 9, AlmaLinux 9, RHEL 9 |
 
-RHEL 9는 구독된 데스크톱에서 실제 GUI와 S3 동작을 확인하는 **RHEL 9 수동 검증**을 첫 공개 태그
-전에 통과해야 한다. 앱은 X11을 직접 쓰며 Wayland에서는 XWayland를 거친다. 최소 설치에서 CJK 글자가
-필요하면 `fonts-noto-cjk`(Debian/Ubuntu) 또는 `google-noto-cjk-fonts`(RPM 계열)를 추가한다.
+**첫 네이티브 Linux 패키지 릴리즈**와 이후 릴리즈는 구독된 RHEL 9 데스크톱에서 GUI, S3 동작,
+패키지 동작을 확인하는 **RHEL 9 수동 검증**을 통과해야 한다. 릴리즈 워크플로는 검증 뒤에만 기록하는
+릴리즈별 정확한 **버전 마커**로 이를 강제한다. 앱은 X11을 직접 쓰며 Wayland에서는 XWayland를 거친다.
+최소 설치에서 CJK 글자가 필요하면 `fonts-noto-cjk`(Debian/Ubuntu) 또는
+`google-noto-cjk-fonts`(RPM 계열)를 추가한다.
 
 ### APT (Debian / Ubuntu)
 

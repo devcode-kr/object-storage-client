@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import pathlib
+import re
 import stat
 import sys
 import unittest
@@ -248,21 +249,46 @@ class PackageContractTests(unittest.TestCase):
             "README.md": (
                 ("앱 자체 업데이트 기능은 없다", "앱은 스스로 업데이트하지 않는다"),
                 ("RHEL 9 수동 검증", "RHEL 9에서 수동으로 검증"),
+                ("데비안 계열과 RPM 계열 리눅스", "Debian 계열과 RPM 계열 Linux"),
+                ("첫 네이티브 Linux 패키지 릴리즈",),
+                ("태그와 Pages 배포 전에는", "태그 및 Pages 배포 전에는"),
+                ("404",),
+                ("최신 릴리즈의 `linux-x64.tar.gz`",),
+                ("버전 마커",),
+                ("Store 목록과 인증은 아직 대기 중", "Store 공개 목록과 인증은 아직 대기 중"),
+                ("과거 GitHub 릴리즈의 Windows ZIP",),
+                ("서명되지 않은 레거시 테스트 산출물",),
+                ("소스에서 빌드",),
+                ("서명되고 공증된 배포를 기다리는 것",),
+                ("체크섬은 출처를 증명하지 않는다",),
             ),
             "README.en.md": (
                 ("The app does not update itself", "The application does not self-update"),
                 ("manual RHEL 9 validation", "manually validated on RHEL 9"),
+                ("Debian-family and RPM-family Linux",),
+                ("first native Linux package release",),
+                ("tag and Pages deployment",),
+                ("404",),
+                ("latest release's `linux-x64.tar.gz`",),
+                ("version marker",),
+                ("Store listing and certification are still pending",),
+                ("Historical Windows ZIPs on GitHub releases",),
+                ("unsigned legacy test artifacts",),
+                ("build from source",),
+                ("wait for a signed and notarised distribution", "wait for a signed and notarized distribution"),
+                ("A checksum does not establish provenance",),
             ),
         }
 
         for name, alternatives in language_markers.items():
             text = (ROOT / name).read_text(encoding="utf-8")
+            searchable = re.sub(r"\s+", " ", text)
             with self.subTest(readme=name):
                 for marker in exact_markers:
                     self.assertIn(marker, text)
                 for accepted in alternatives:
                     self.assertTrue(
-                        any(marker in text for marker in accepted),
+                        any(marker in searchable for marker in accepted),
                         f"{name} must contain one of {accepted!r}",
                     )
 
@@ -282,8 +308,35 @@ class PackageContractTests(unittest.TestCase):
                     "curl |",
                     "curl|",
                     "--no-check-certificate",
+                    "xattr -dr com.apple.quarantine",
+                    "bypass gatekeeper",
+                    "disable gatekeeper",
                 ):
                     self.assertNotIn(forbidden, lowered)
+
+    def test_pages_install_blocks_prepare_prerequisites_before_download(self):
+        text = (LINUX / "pages-index.html").read_text(encoding="utf-8")
+        apt_start = text.index("<h2>APT")
+        dnf_start = text.index("<h2>DNF")
+        apt = text[apt_start:dnf_start]
+        dnf = text[dnf_start:]
+
+        apt_trap = apt.index("trap '")
+        apt_update = apt.index("sudo apt-get update")
+        apt_install = apt.index("sudo apt-get install -y ca-certificates wget gnupg")
+        apt_wget = apt.index("wget -O")
+        self.assertLess(apt_trap, apt_update)
+        self.assertLess(apt_update, apt_install)
+        self.assertLess(apt_install, apt_wget)
+
+        dnf_trap = dnf.index("trap '")
+        dnf_install = dnf.index("sudo dnf install -y ca-certificates wget gnupg2")
+        dnf_wget = dnf.index("wget -O")
+        self.assertLess(dnf_trap, dnf_install)
+        self.assertLess(dnf_install, dnf_wget)
+        lowered = text.lower()
+        self.assertNotIn("xattr -dr com.apple.quarantine", lowered)
+        self.assertNotIn("bypass gatekeeper", lowered)
 
     def test_signing_policies_document_linux_repository_trust(self):
         exact_markers = (
@@ -295,7 +348,6 @@ class PackageContractTests(unittest.TestCase):
             "https://devcode-kr.github.io/object-storage-client/repository-key.asc",
             "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90",
             "2029-08-22",
-            "3 years",
             "GitHub Secrets",
             "/workspace/hermes_home/secure/object-storage-client-linux-repository/",
             "Microsoft Store",
@@ -312,6 +364,12 @@ class PackageContractTests(unittest.TestCase):
                 ("서명되지 않은 상태로 대체", "서명 없는 배포로 전환"),
                 ("macOS",),
                 ("tar.gz",),
+                ("3년",),
+                ("첫 네이티브 Linux 패키지 릴리즈",),
+                ("404",),
+                ("Store 목록과 인증은 아직 대기 중", "Store 공개 목록과 인증은 아직 대기 중"),
+                ("과거 GitHub 릴리즈의 Windows",),
+                ("레거시 테스트 산출물",),
             ),
             "CODE_SIGNING_POLICY.en.md": (
                 ("RPM package signatures", "signs each RPM package"),
@@ -323,17 +381,24 @@ class PackageContractTests(unittest.TestCase):
                 ("no unsigned fallback", "never falls back to unsigned"),
                 ("macOS",),
                 ("tar.gz",),
+                ("3 years",),
+                ("first native Linux package release",),
+                ("404",),
+                ("Store listing and certification are still pending",),
+                ("Historical Windows",),
+                ("legacy test artifacts",),
             ),
         }
 
         for name, alternatives in language_markers.items():
             text = (ROOT / name).read_text(encoding="utf-8")
+            searchable = re.sub(r"\s+", " ", text)
             with self.subTest(policy=name):
                 for marker in exact_markers:
                     self.assertIn(marker, text)
                 for accepted in alternatives:
                     self.assertTrue(
-                        any(marker in text for marker in accepted),
+                        any(marker in searchable for marker in accepted),
                         f"{name} must contain one of {accepted!r}",
                     )
                 lowered = text.lower()
@@ -344,6 +409,22 @@ class PackageContractTests(unittest.TestCase):
                     "setenforce=0",
                 ):
                     self.assertNotIn(forbidden, lowered)
+                if name == "CODE_SIGNING_POLICY.md":
+                    self.assertNotIn("3 years", text)
+
+    def test_release_body_matches_native_assets_without_platform_bypasses(self):
+        text = (ROOT / "build/release-body.md").read_text(encoding="utf-8")
+        for marker in (
+            "ObjectStorageClient-@VERSION@-1-linux-x64.deb",
+            "ObjectStorageClient-@VERSION@-1-linux-x64.rpm",
+            "ObjectStorageClient-@VERSION@-linux-x64.tar.gz",
+            "signed APT/DNF",
+            "서명된 APT/DNF",
+        ):
+            self.assertIn(marker, text)
+        lowered = text.lower()
+        self.assertNotIn("xattr -dr com.apple.quarantine", lowered)
+        self.assertNotIn("remove the quarantine", lowered)
 
 
 if __name__ == "__main__":

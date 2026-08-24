@@ -9,25 +9,32 @@ running a signed program deserves to know what stands behind the signature.
 
 | Platform | Distribution | Signature |
 | --- | --- | --- |
-| Windows | Microsoft Store | **Signed by Microsoft** |
-| macOS | GitHub release `.zip` | None; `SHA256SUMS.txt` only |
-| Native Linux packages | GitHub Pages APT/DNF | **Signed with the project GPG key** |
+| Windows | Microsoft Store planned; listing/certification pending | Microsoft signing begins after Store certification |
+| macOS | GitHub release `.zip` | Current archives are unsigned and not notarised; `SHA256SUMS.txt` only |
+| Native Linux packages | GitHub Pages APT/DNF scheduled for the first native release | Will be **signed with the project GPG key** |
 | Portable Linux tar.gz | GitHub releases | None; `SHA256SUMS.txt` only |
 
 ### Windows
 
-The Windows signing path is separate from Linux. The developer account is approved, while Store
-certification and the public listing are still pending. Once a submitted MSIX passes certification,
+The Windows signing path is separate from Linux. The developer account is approved, while the
+Store listing and certification are still pending. Once a submitted MSIX passes certification,
 **the Microsoft Store re-signs it with a Microsoft certificate** and handles updates. The project
-GPG key is not used for Windows, and no `.exe` or `.msi` is distributed directly.
+GPG key is not used for Windows, and no `.exe` or `.msi` is distributed directly. Historical Windows
+ZIPs in GitHub releases are unsigned legacy test artifacts, not the current official Store channel.
 
 ### macOS
 
 The macOS `.zip` archive has no Apple developer signature or notarisation. `SHA256SUMS.txt` can
 show that the downloaded bytes match the release record; it cannot establish who produced them.
-The README and release notes cover Gatekeeper's quarantine warning.
+Gatekeeper may block these builds; the README recommends building from source or waiting for a
+signed and notarised distribution instead of weakening Gatekeeper.
 
 ### Linux
+
+The signed repository becomes available with the **first native Linux package release**. Until its
+tag and GitHub Pages deployment complete, repository URLs may return **404**; the unsigned release
+tar.gz remains the manual fallback meanwhile. The signature behavior below describes the repository
+once it has been published, not a claim that the pre-release URLs are currently usable.
 
 APT and DNF verify different, complementary layers:
 

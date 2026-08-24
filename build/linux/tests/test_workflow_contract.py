@@ -505,7 +505,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         self.assertEqual({}, self.loaded["on"]["workflow_dispatch"] or {})
         self.assertEqual(
             {
-                "verify", "test", "package", "linux_packages",
+                "verify", "test", "package", "linux_packages", "rhel_release_gate",
                 "prepare_linux_repositories", "release", "publish_linux_repositories",
             },
             set(self.loaded["jobs"]),
@@ -539,9 +539,42 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             )
             self.assertEqual(expected_secrets, job["secrets"])
 
+        gate = self.loaded["jobs"]["rhel_release_gate"]
+        self.assertEqual("verify", gate["needs"])
+        self.assertEqual("ubuntu-latest", gate["runs-on"])
+        self.assertEqual("rhel-9-manual-validation", gate["environment"])
+        self.assertEqual(10, gate["timeout-minutes"])
+        self.assertEqual({"contents": "read"}, gate["permissions"])
+        self.assertIn("github.ref_type == 'tag'", gate["if"])
+        self.assertIn("startsWith(github.ref, 'refs/tags/v')", gate["if"])
+
+        self.assertEqual(1, len(gate["steps"]))
+        step = gate["steps"][0]
+        self.assertEqual(
+            {"VALIDATED_VERSION": "${{ vars.RHEL9_MANUAL_VALIDATION_VERSION }}"},
+            step["env"],
+        )
+        script = step["run"]
+        self.assertEqual("set -euo pipefail", script.splitlines()[0])
+        self.assertIn('[[ -n "$VALIDATED_VERSION" ]]', script)
+        self.assertIn(
+            '[[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}" ]]',
+            script,
+        )
+        self.assertNotIn("secrets.", str(gate))
+        self.assertNotIn("$VALIDATED_VERSION", "\n".join(
+            line for line in script.splitlines() if "error" in line.lower()
+        ))
+        self.assertIn("required reviewer", self.text.lower())
+        self.assertIn("subscribed RHEL 9", self.text)
+        self.assertIn("GUI, S3, and native package", self.text)
+
     def test_dependency_order_tag_guards_and_manual_safety_are_exact(self):
         jobs = self.loaded["jobs"]
-        self.assertEqual({"verify", "linux_packages"}, set(jobs["prepare_linux_repositories"]["needs"]))
+        self.assertEqual(
+            {"verify", "linux_packages", "rhel_release_gate"},
+            set(jobs["prepare_linux_repositories"]["needs"]),
+        )
         self.assertEqual(
             {"verify", "package", "linux_packages", "prepare_linux_repositories"},
             set(jobs["release"]["needs"]),
@@ -550,7 +583,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             {"release", "prepare_linux_repositories", "verify"},
             set(jobs["publish_linux_repositories"]["needs"]),
         )
-        for name in ("prepare_linux_repositories", "release", "publish_linux_repositories"):
+        for name in ("rhel_release_gate", "prepare_linux_repositories", "release", "publish_linux_repositories"):
             guard = jobs[name]["if"]
             self.assertIn("github.ref_type == 'tag'", guard)
             self.assertIn("startsWith(github.ref, 'refs/tags/v')", guard)
@@ -567,6 +600,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             "test": {"contents": "read"},
             "package": {"contents": "read"},
             "linux_packages": {"contents": "read"},
+            "rhel_release_gate": {"contents": "read"},
             "prepare_linux_repositories": {"contents": "read"},
             "release": {"contents": "write"},
             "publish_linux_repositories": {
@@ -578,7 +612,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             self.assertEqual(permissions, self.loaded["jobs"][name]["permissions"])
 
     def test_release_executable_jobs_have_bounded_timeouts(self):
-        expected = {"verify": 10, "test": 30, "package": 35, "release": 15}
+        expected = {"verify": 10, "test": 30, "package": 35, "rhel_release_gate": 10, "release": 15}
         for name, timeout in expected.items():
             self.assertEqual(timeout, self.loaded["jobs"][name]["timeout-minutes"])
         for name in ("linux_packages", "prepare_linux_repositories", "publish_linux_repositories"):
