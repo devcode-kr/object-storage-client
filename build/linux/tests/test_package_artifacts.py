@@ -1002,6 +1002,7 @@ mkdir -p %{buildroot}
 cp -a .%{_prefix} %{buildroot}/
 
 %files
+%dir /usr/share/doc/object-storage-client
 %license /usr/share/doc/object-storage-client/LICENSE
 %doc /usr/share/doc/object-storage-client/README.md
 %doc /usr/share/doc/object-storage-client/PRIVACY.md
@@ -1691,7 +1692,7 @@ class SmokePackageScriptTests(unittest.TestCase):
             "libX11 libICE libSM fontconfig ca-certificates",
             "xorg-x11-server-Xvfb desktop-file-utils gnupg2 procps-ng",
             'apt-get install -y "$PACKAGE"',
-            'dnf -y install "$PACKAGE"',
+            'dnf --setopt=tsflags= -y install "$PACKAGE"',
             "FIXTURE=/root/.devcode/$PROGRAM/preserve-me",
             "/usr/bin/object-storage-client",
             "/usr/lib/object-storage-client",
@@ -1733,7 +1734,7 @@ class SmokePackageScriptTests(unittest.TestCase):
             "gpgkey=file:///etc/pki/rpm-gpg/object-storage-client.asc",
             "dnf -y clean metadata",
             "dnf -y makecache",
-            "dnf -y install object-storage-client",
+            "dnf --setopt=tsflags= -y install object-storage-client",
             "dpkg-query -W",
             "rpm -q --qf",
         ):

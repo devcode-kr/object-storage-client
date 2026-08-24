@@ -196,7 +196,7 @@ install_local_package() {
 
     case "$KIND" in
         deb) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y "$PACKAGE" ;;
-        rpm) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install "$PACKAGE" ;;
+        rpm) run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf --setopt=tsflags= -y install "$PACKAGE" ;;
     esac
 }
 
@@ -411,7 +411,7 @@ install_from_repository() {
             chmod 0644 /etc/yum.repos.d/object-storage-client.repo
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y clean metadata
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y makecache
-            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install object-storage-client
+            run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf --setopt=tsflags= -y install object-storage-client
             ;;
     esac
 }

@@ -29,6 +29,7 @@ mkdir -p %{buildroot}
 cp -a .%{_prefix} %{buildroot}/
 
 %files
+%dir /usr/share/doc/object-storage-client
 %license /usr/share/doc/object-storage-client/LICENSE
 %doc /usr/share/doc/object-storage-client/README.md
 %doc /usr/share/doc/object-storage-client/PRIVACY.md
