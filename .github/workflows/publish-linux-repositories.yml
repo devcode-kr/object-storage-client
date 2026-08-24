@@ -295,7 +295,7 @@ jobs:
             exit 1
           fi
 
-      - name: Regenerate from latest gh-pages and publish package history
+      - name: Regenerate from latest gh-pages
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
@@ -305,7 +305,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          rm -rf deployment pages
+          rm -rf deployment
           mkdir -p deployment/site
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
@@ -383,24 +383,6 @@ jobs:
           test "${#rpms[@]}" -ge 1
           checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${rpms[@]}")"
           test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#rpms[@]}"
-
-          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
-            git worktree add --detach pages origin/gh-pages
-          else
-            git worktree add --detach pages HEAD
-            (cd pages && git checkout --orphan gh-pages && git rm -rf .)
-          fi
-          rsync -a --delete --exclude .git deployment/site/ pages/
-          test -f pages/.nojekyll
-          git -C pages config user.name github-actions[bot]
-          git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git -C pages add --all
-          if git -C pages diff --cached --quiet; then
-            printf '%s\n' 'Package history already records this deployment; no commit required'
-          else
-            git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
-            (cd pages && git push origin HEAD:gh-pages)
-          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
@@ -769,3 +751,30 @@ jobs:
           rpm --dbpath "$rpm_root/rpmdb" --import "$verify_root/repository-key.asc"
           checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${fetched_rpms[@]}")"
           test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#fetched_rpms[@]}"
+
+      - name: Record verified Pages tree in gh-pages history
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          rm -rf pages
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            git worktree add --detach pages origin/gh-pages
+          else
+            git update-ref -d refs/remotes/origin/gh-pages
+            git worktree add --detach pages HEAD
+            (cd pages && git checkout --orphan gh-pages && git rm -rf .)
+          fi
+          rsync -a --delete --exclude .git deployment/site/ pages/
+          test -f pages/.nojekyll
+          git -C pages config user.name github-actions[bot]
+          git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C pages add --all
+          if git -C pages diff --cached --quiet; then
+            printf '%s\n' 'Package history already records this deployment; no commit required'
+          else
+            git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
+            (cd pages && git push origin HEAD:gh-pages)
+          fi

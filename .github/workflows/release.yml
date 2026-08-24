@@ -17,6 +17,7 @@ jobs:
   verify:
     name: Check version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -51,6 +52,7 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -71,6 +73,7 @@ jobs:
     name: Package ${{ matrix.rid }}
     needs: [verify, test]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     permissions:
       contents: read
     strategy:
@@ -274,6 +277,7 @@ jobs:
     needs: [verify, package, linux_packages, prepare_linux_repositories]
     if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -301,24 +305,51 @@ jobs:
             cd downloaded/linux-release-packages
             sha256sum --check SHA256SUMS
           )
-          test "$(find downloaded/linux-release-packages -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
-          test "$(find downloaded/linux-release-packages -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
 
-          mkdir -p artifacts
-          find downloaded/platform -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
-            -exec mv -- {} artifacts/ \;
-          find downloaded/linux-release-packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) \
-            -exec mv -- {} artifacts/ \;
+          mapfile -d '' sources < <(
+            find downloaded/platform -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0
+            find downloaded/linux-release-packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) -print0
+          )
+          declare -A source_by_basename=()
+          actual=()
+          for source in "${sources[@]}"; do
+            basename="$(basename "$source")"
+            if [[ -n "${source_by_basename[$basename]+present}" ]]; then
+              printf 'duplicate release asset basename: %s\n' "$basename" >&2
+              exit 1
+            fi
+            source_by_basename["$basename"]="$source"
+            actual+=("$basename")
+          done
+          expected=(
+            "ObjectStorageClient-${VERSION}-linux-x64.tar.gz"
+            "ObjectStorageClient-${VERSION}-osx-arm64.zip"
+            "ObjectStorageClient-${VERSION}-osx-x64.zip"
+            "ObjectStorageClient-${VERSION}-1-linux-x64.deb"
+            "ObjectStorageClient-${VERSION}-1-linux-x64.rpm"
+          )
+          mapfile -t actual_sorted < <(printf '%s\n' "${actual[@]}" | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${#actual_sorted[@]}" -ne "${#expected_sorted[@]}" ]] ||
+              ! diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual_sorted[@]}"); then
+            printf '%s\n' 'unexpected release asset set (missing or extra asset)' >&2
+            exit 1
+          fi
 
-          test -f "artifacts/ObjectStorageClient-${VERSION}-linux-x64.tar.gz"
-          test -f "artifacts/ObjectStorageClient-${VERSION}-osx-arm64.zip"
-          test -f "artifacts/ObjectStorageClient-${VERSION}-osx-x64.zip"
-          test "$(find artifacts -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
-          test "$(find artifacts -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          test ! -e artifacts
+          mkdir artifacts
+          for basename in "${expected_sorted[@]}"; do
+            source="${source_by_basename[$basename]}"
+            destination="artifacts/$basename"
+            test ! -e "$destination"
+            mv -n -- "$source" "$destination"
+            test ! -e "$source"
+            test -f "$destination"
+          done
           (
             cd artifacts
             mapfile -d '' assets < <(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\0' | sort -z)
-            test "${#assets[@]}" -ge 5
+            test "${#assets[@]}" -eq 5
             sha256sum -- "${assets[@]}" > SHA256SUMS.txt
             cat SHA256SUMS.txt
           )

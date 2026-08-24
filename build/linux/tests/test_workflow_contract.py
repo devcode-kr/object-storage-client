@@ -286,7 +286,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual("true", upload["with"]["include-hidden-files"])
 
-    def test_publish_regenerates_latest_history_then_deploys_official_pages_artifact(self):
+    def test_publish_deploys_and_reads_back_before_recording_pages_history(self):
         text = self.text()
         for marker in (
             "git worktree add", "origin/gh-pages", "git checkout --orphan gh-pages",
@@ -305,14 +305,28 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("rsync -a --delete --exclude .git candidate/site/", text)
 
         loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
         names = [step["name"] for step in loaded["jobs"]["publish"]["steps"]]
-        history = names.index("Regenerate from latest gh-pages and publish package history")
+        regenerate = names.index("Regenerate from latest gh-pages")
         upload = names.index("Upload Pages artifact")
         deploy = names.index("Deploy Pages artifact")
         readback = names.index("Read back and cryptographically verify every public repository object")
-        self.assertLess(history, upload)
+        history = names.index("Record verified Pages tree in gh-pages history")
+        self.assertLess(regenerate, upload)
         self.assertLess(upload, deploy)
         self.assertLess(deploy, readback)
+        self.assertLess(readback, history)
+
+        steps = loaded["jobs"]["publish"]["steps"]
+        before_history = "\n".join(step.get("run", "") for step in steps[:history])
+        self.assertNotRegex(before_history, r"(?m)^\s*git(?:\s+-C\s+\S+)?\s+push\b")
+        history_script = steps[history]["run"]
+        self.assertIn("git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages", history_script)
+        self.assertIn("rsync -a --delete --exclude .git deployment/site/ pages/", history_script)
+        self.assertIn('git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"', history_script)
+        self.assertIn("git push origin HEAD:gh-pages", history_script)
+        self.assertNotRegex(history_script, r"git push[^\n]*(?:--force|-f\b)")
 
     def test_pages_preconfiguration_is_get_only_and_precedes_publication(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
@@ -321,7 +335,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         steps = loaded["jobs"]["publish"]["steps"]
         names = [step["name"] for step in steps]
         verify_index = names.index("Verify Pages is preconfigured")
-        publish_index = names.index("Regenerate from latest gh-pages and publish package history")
+        publish_index = names.index("Regenerate from latest gh-pages")
         self.assertLess(verify_index, publish_index)
 
         verify = steps[verify_index]["run"]
@@ -563,6 +577,13 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         for name, permissions in expected.items():
             self.assertEqual(permissions, self.loaded["jobs"][name]["permissions"])
 
+    def test_release_executable_jobs_have_bounded_timeouts(self):
+        expected = {"verify": 10, "test": 30, "package": 35, "release": 15}
+        for name, timeout in expected.items():
+            self.assertEqual(timeout, self.loaded["jobs"][name]["timeout-minutes"])
+        for name in ("linux_packages", "prepare_linux_repositories", "publish_linux_repositories"):
+            self.assertIn("uses", self.loaded["jobs"][name])
+
     def test_release_actions_are_immutable_and_local_calls_are_exact(self):
         uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", self.text)
         self.assertTrue(uses)
@@ -584,7 +605,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         }
         self.assertTrue(expected_pins.issubset(set(uses)))
 
-    def test_release_verifies_signed_packages_and_collects_every_asset_type(self):
+    def test_release_verifies_and_collects_the_exact_asset_set_without_overwrite(self):
         release = self.loaded["jobs"]["release"]
         steps = release["steps"]
         downloads = [step for step in steps if step.get("uses", "").startswith("actions/download-artifact@")]
@@ -600,14 +621,71 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             "SHA256SUMS.txt", "ObjectStorageClient-${VERSION}-linux-x64.tar.gz",
             "ObjectStorageClient-${VERSION}-osx-arm64.zip",
             "ObjectStorageClient-${VERSION}-osx-x64.zip",
+            "ObjectStorageClient-${VERSION}-1-linux-x64.deb",
+            "ObjectStorageClient-${VERSION}-1-linux-x64.rpm",
+            "duplicate release asset basename", "unexpected release asset set",
+            "mv -n --", 'test ! -e "$source"', 'test -f "$destination"',
         ):
             self.assertIn(marker, collect)
-        self.assertRegex(collect, r"find .* -name '\*\.deb'.*wc -l.*-eq 1")
-        self.assertRegex(collect, r"find .* -name '\*\.rpm'.*wc -l.*-eq 1")
-        self.assertLess(collect.index("sha256sum --check SHA256SUMS"), collect.index("mkdir -p artifacts"))
+        self.assertIn('test "${#assets[@]}" -eq 5', collect)
+        self.assertLess(collect.index("sha256sum --check SHA256SUMS"), collect.index("mkdir artifacts"))
+        self.assertLess(collect.index("unexpected release asset set"), collect.index("mkdir artifacts"))
+        self.assertLess(collect.index("test ! -e artifacts"), collect.index("mkdir artifacts"))
         self.assertIn("artifacts/*", steps[-1]["run"])
         for marker in ("Build MSIX for the Store", "Upload MSIX", "STORE_URL", "build/release-body.md"):
             self.assertIn(marker, self.text)
+
+    def test_release_collector_rejects_duplicate_missing_and_extra_before_mutation(self):
+        steps = self.loaded["jobs"]["release"]["steps"]
+        collect = next(step["run"] for step in steps if step.get("name") == "Verify and collect release artifacts")
+        version = "9.8.7"
+        expected = [
+            f"ObjectStorageClient-{version}-linux-x64.tar.gz",
+            f"ObjectStorageClient-{version}-osx-arm64.zip",
+            f"ObjectStorageClient-{version}-osx-x64.zip",
+            f"ObjectStorageClient-{version}-1-linux-x64.deb",
+            f"ObjectStorageClient-{version}-1-linux-x64.rpm",
+        ]
+
+        for scenario in ("duplicate", "missing", "extra", "success"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                platform = root / "downloaded/platform"
+                signed = root / "downloaded/linux-release-packages"
+                platform.mkdir(parents=True)
+                signed.mkdir(parents=True)
+                names = list(expected)
+                if scenario == "missing":
+                    names.remove(expected[1])
+                if scenario == "extra":
+                    names.append(f"ObjectStorageClient-{version}-debug.zip")
+                for name in names:
+                    path = signed / name if name.endswith((".deb", ".rpm")) else platform / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(name, encoding="utf-8")
+                if scenario == "duplicate":
+                    duplicate = platform / "duplicate" / expected[1]
+                    duplicate.parent.mkdir(parents=True)
+                    duplicate.write_text("duplicate", encoding="utf-8")
+                checksummed = [path for path in signed.iterdir() if path.suffix in (".deb", ".rpm")]
+                sums = subprocess.run(
+                    ["sha256sum", "--", *[path.name for path in checksummed]],
+                    cwd=signed, check=True, capture_output=True, text=True,
+                ).stdout
+                (signed / "SHA256SUMS").write_text(sums, encoding="utf-8")
+
+                result = subprocess.run(
+                    ["bash", "-c", collect], cwd=root,
+                    env={"PATH": "/usr/bin:/bin", "VERSION": version},
+                    capture_output=True, text=True,
+                )
+                if scenario == "success":
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual(set(expected + ["SHA256SUMS.txt"]), {path.name for path in (root / "artifacts").iterdir()})
+                    self.assertFalse(any(path.is_file() and path.name in expected for path in (root / "downloaded").rglob("*")))
+                else:
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertFalse((root / "artifacts").exists())
 
     def test_gpg_identifiers_are_configured_without_bypass_or_secret_dumping(self):
         combined = self.text + workflow_text(PUBLICATION_WORKFLOW)
