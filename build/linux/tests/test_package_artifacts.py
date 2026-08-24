@@ -971,7 +971,8 @@ class DebianCliTests(unittest.TestCase):
                 )
 
 
-EXPECTED_RPM_SPEC = """Name: object-storage-client
+EXPECTED_RPM_SPEC = """%global debug_package %{nil}
+Name: object-storage-client
 Version: 1.2.3
 Release: 4%{?dist}
 Summary: Desktop client for S3-compatible object storage

@@ -1,3 +1,4 @@
+%global debug_package %{nil}
 Name: object-storage-client
 Version: @VERSION@
 Release: @RELEASE@%{?dist}
