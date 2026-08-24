@@ -445,7 +445,7 @@ jobs:
             exit 1
           fi
 
-      - name: Regenerate from latest gh-pages
+      - name: Regenerate signed repository from latest history
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
@@ -455,12 +455,17 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          rm -rf deployment
-          mkdir -p deployment/site
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+          rm -rf deployment rollback
+          mkdir -p deployment/site rollback/site
+          remote_line="$(git ls-remote --heads origin gh-pages)"
+          if [[ -n "$remote_line" ]]; then
             git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
-            git archive origin/gh-pages | tar -x -C deployment/site
+            git archive origin/gh-pages | tar -x -C rollback/site
+          else
+            touch rollback/site/.nojekyll
           fi
+          test -z "$(find rollback/site -type l -print -quit)"
+          rsync -a --delete rollback/site/ deployment/site/
           test -z "$(find deployment/site -type l -print -quit)"
           deb="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
           rpm="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
@@ -561,10 +566,17 @@ jobs:
               raise SystemExit('current RPM release is not the requested package release with an optional safe dist suffix')
           PY
 
-      - name: Upload Pages artifact
+      - name: Upload current Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
         with:
+          name: github-pages
           path: deployment/site
+
+      - name: Upload rollback Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
+        with:
+          name: github-pages-rollback
+          path: rollback/site
 
       - name: Deploy Pages artifact
         id: deployment
@@ -584,6 +596,7 @@ jobs:
           PY
 
       - name: Read back and cryptographically verify every public repository object
+        id: readback
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
@@ -934,28 +947,71 @@ jobs:
           test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#fetched_rpms[@]}"
 
       - name: Record verified Pages tree in gh-pages history
+        id: audit_history
+        if: steps.readback.outcome == 'success'
+        continue-on-error: true
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
         run: |
           set -euo pipefail
-          rm -rf pages
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
-            git worktree add --detach pages origin/gh-pages
-          else
-            git update-ref -d refs/remotes/origin/gh-pages
-            git worktree add --detach pages HEAD
-            (cd pages && git checkout --orphan gh-pages && git rm -rf .)
-          fi
-          rsync -a --delete --exclude .git deployment/site/ pages/
-          test -f pages/.nojekyll
-          git -C pages config user.name github-actions[bot]
-          git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git -C pages add --all
-          if git -C pages diff --cached --quiet; then
-            printf '%s\n' 'Package history already records this deployment; no commit required'
-          else
-            git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
-            (cd pages && git push origin HEAD:gh-pages)
-          fi
+          git worktree prune
+          for attempt in $(seq 1 5); do
+            git worktree remove --force pages 2>/dev/null || rm -rf pages
+            remote_line="$(git ls-remote --heads origin gh-pages)"
+            remote_sha="${remote_line%%[[:space:]]*}"
+            if [[ -n "$remote_sha" ]]; then
+              git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+              git worktree add --detach pages origin/gh-pages
+            else
+              git update-ref -d refs/remotes/origin/gh-pages
+              git worktree add --detach pages HEAD
+              (cd pages && git checkout --orphan gh-pages && git rm -rf .)
+            fi
+            rsync -a --delete --exclude .git deployment/site/ pages/
+            test -f pages/.nojekyll
+            git -C pages config user.name github-actions[bot]
+            git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git -C pages add --all
+            if git -C pages diff --cached --quiet; then
+              printf '%s\n' 'Package history already records this deployment; no commit required'
+            else
+              git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
+            fi
+            local_sha="$(git -C pages rev-parse HEAD)"
+            if [[ "$remote_sha" == "$local_sha" ]]; then
+              exit 0
+            fi
+            if (cd pages && git push origin HEAD:gh-pages); then
+              printf 'Pages history push attempt %s was accepted; verifying remote SHA.\n' "$attempt"
+            else
+              printf 'Pages history push attempt %s returned an error; verifying remote SHA before retrying.\n' "$attempt" >&2
+            fi
+            verification_line="$(git ls-remote --heads origin gh-pages)"
+            if [[ -n "$verification_line" ]]; then
+              git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            fi
+            remote_sha="$(git ls-remote --heads origin gh-pages | awk 'NR == 1 { print $1 }')"
+            if [[ "$remote_sha" == "$local_sha" ]]; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 5 ]]; then
+              sleep $((attempt * 2))
+            fi
+          done
+          printf '%s\n' 'Failed to record the verified Pages tree after 5 non-force attempts.' >&2
+          exit 1
+
+      - name: Roll back failed Pages publication
+        id: rollback_deployment
+        if: always() && steps.deployment.outcome == 'success' && (failure() || steps.audit_history.outcome == 'failure')
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+        with:
+          artifact_name: github-pages-rollback
+
+      - name: Fail publication when Pages history audit failed
+        if: always() && steps.audit_history.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'The Pages tree was rolled back because its verified history could not be recorded.' >&2
+          exit 1

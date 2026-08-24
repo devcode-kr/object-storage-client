@@ -360,47 +360,103 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual("true", upload["with"]["include-hidden-files"])
 
-    def test_publish_deploys_and_reads_back_before_recording_pages_history(self):
-        text = self.text()
-        for marker in (
-            "git worktree add", "origin/gh-pages", "git checkout --orphan gh-pages",
-            'Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}', "git push origin HEAD:gh-pages",
-            "path: deployment/site", "id: deployment", "steps.deployment.outputs.page_url",
-            "name: linux-release-packages", "path: prepared/release-packages",
-            "name: ${{ inputs.validation_artifact }}", "path: artifacts",
-            "git archive origin/gh-pages | tar -x -C deployment/site",
-            "build/linux/repository.py", "artifacts/linux-native", "cmp -s --",
-            "deployment/site/.nojekyll",
-        ):
-            self.assertIn(marker, text)
-        self.assertIn("actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa", text)
-        self.assertIn("actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e", text)
-        self.assertNotRegex(text, r"git push[^\n]*(?:--force|-f\b)")
-        self.assertNotIn("rsync -a --delete --exclude .git candidate/site/", text)
-
+    def test_publish_compensates_for_post_deploy_and_audit_failures(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
         self.assertIsNotNone(loaded)
         assert loaded is not None
-        names = [step["name"] for step in loaded["jobs"]["publish"]["steps"]]
-        regenerate = names.index("Regenerate from latest gh-pages")
-        upload = names.index("Upload Pages artifact")
+        steps = loaded["jobs"]["publish"]["steps"]
+        names = [step["name"] for step in steps]
+
+        expected_names = {
+            "Regenerate signed repository from latest history",
+            "Upload current Pages artifact",
+            "Upload rollback Pages artifact",
+            "Deploy Pages artifact",
+            "Read back and cryptographically verify every public repository object",
+            "Record verified Pages tree in gh-pages history",
+            "Roll back failed Pages publication",
+            "Fail publication when Pages history audit failed",
+        }
+        self.assertTrue(expected_names.issubset(names), expected_names.difference(names))
+        regenerate = names.index("Regenerate signed repository from latest history")
+        current_upload = names.index("Upload current Pages artifact")
+        rollback_upload = names.index("Upload rollback Pages artifact")
         deploy = names.index("Deploy Pages artifact")
         readback = names.index("Read back and cryptographically verify every public repository object")
-        history = names.index("Record verified Pages tree in gh-pages history")
-        self.assertLess(regenerate, upload)
-        self.assertLess(upload, deploy)
+        audit = names.index("Record verified Pages tree in gh-pages history")
+        rollback = names.index("Roll back failed Pages publication")
+        fail_audit = names.index("Fail publication when Pages history audit failed")
+        self.assertLess(regenerate, current_upload)
+        self.assertLess(current_upload, rollback_upload)
+        self.assertLess(rollback_upload, deploy)
         self.assertLess(deploy, readback)
-        self.assertLess(readback, history)
+        self.assertLess(readback, audit)
+        self.assertLess(audit, rollback)
+        self.assertLess(rollback, fail_audit)
 
-        steps = loaded["jobs"]["publish"]["steps"]
-        before_history = "\n".join(step.get("run", "") for step in steps[:history])
-        self.assertNotRegex(before_history, r"(?m)^\s*git(?:\s+-C\s+\S+)?\s+push\b")
-        history_script = steps[history]["run"]
+        regeneration = steps[regenerate]["run"]
+        archive = "git archive origin/gh-pages | tar -x -C rollback/site"
+        self.assertIn('remote_line="$(git ls-remote --heads origin gh-pages)"', regeneration)
+        self.assertIn('if [[ -n "$remote_line" ]]; then', regeneration)
+        self.assertIn(archive, regeneration)
+        self.assertLess(regeneration.index(archive), regeneration.index("build/linux/repository.py"))
+        self.assertIn("mkdir -p deployment/site rollback/site", regeneration)
+        self.assertIn("touch rollback/site/.nojekyll", regeneration)
+        self.assertIn('find rollback/site -type l -print -quit', regeneration)
+        self.assertRegex(regeneration, r"(?:cp|rsync)[^\n]*rollback/site/[^\n]*deployment/site/")
+        self.assertIn('find deployment/site -type l -print -quit', regeneration)
+
+        uploads = [step for step in steps if step.get("uses", "").startswith("actions/upload-pages-artifact@")]
+        self.assertEqual(2, len(uploads))
+        self.assertEqual(
+            [("github-pages", "deployment/site"), ("github-pages-rollback", "rollback/site")],
+            [(step["with"].get("name"), step["with"]["path"]) for step in uploads],
+        )
+        self.assertTrue(all(
+            step["uses"] == "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa"
+            for step in uploads
+        ))
+
+        deploys = [step for step in steps if step.get("uses", "").startswith("actions/deploy-pages@")]
+        self.assertEqual(2, len(deploys))
+        self.assertTrue(all(
+            step["uses"] == "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e"
+            for step in deploys
+        ))
+        self.assertEqual("deployment", deploys[0]["id"])
+        self.assertNotIn("artifact_name", deploys[0].get("with", {}))
+        self.assertEqual("rollback_deployment", deploys[1]["id"])
+        self.assertEqual("github-pages-rollback", deploys[1]["with"]["artifact_name"])
+        self.assertEqual(
+            "always() && steps.deployment.outcome == 'success' && (failure() || steps.audit_history.outcome == 'failure')",
+            deploys[1]["if"],
+        )
+
+        self.assertEqual("readback", steps[readback]["id"])
+        history = steps[audit]
+        self.assertEqual("audit_history", history["id"])
+        self.assertEqual("true", history["continue-on-error"])
+        self.assertEqual("steps.readback.outcome == 'success'", history["if"])
+        history_script = history["run"]
+        self.assertIn("for attempt in $(seq 1 5)", history_script)
         self.assertIn("git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages", history_script)
+        self.assertIn("git ls-remote --heads origin gh-pages", history_script)
+        self.assertIn("git -C pages rev-parse HEAD", history_script)
+        self.assertIn("git push origin HEAD:gh-pages", history_script)
         self.assertIn("rsync -a --delete --exclude .git deployment/site/ pages/", history_script)
         self.assertIn('git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"', history_script)
-        self.assertIn("git push origin HEAD:gh-pages", history_script)
         self.assertNotRegex(history_script, r"git push[^\n]*(?:--force|-f\b)")
+        self.assertRegex(history_script, r"remote_sha[^\n]*==[^\n]*local_sha")
+        self.assertIn("no commit required", history_script)
+
+        self.assertEqual("always() && steps.audit_history.outcome == 'failure'", steps[fail_audit]["if"])
+        self.assertIn("exit 1", steps[fail_audit]["run"])
+        self.assertNotIn("success()", deploys[1]["if"])
+
+        before_audit = "\n".join(step.get("run", "") for step in steps[:audit])
+        self.assertNotRegex(before_audit, r"(?m)^\s*git(?:\s+-C\s+\S+)?\s+push\b")
+        self.assertNotRegex(self.text(), r"git push[^\n]*(?:--force|-f\b)")
+        self.assertNotIn("rsync -a --delete --exclude .git candidate/site/", self.text())
 
     def test_current_rpm_identity_is_checked_before_pages_upload(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
@@ -408,8 +464,8 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         names = [step["name"] for step in steps]
         validation = next(step for step in steps if step.get("name") == "Validate current RPM identity")
         script = validation["run"]
-        self.assertLess(names.index("Regenerate from latest gh-pages"), names.index("Validate current RPM identity"))
-        self.assertLess(names.index("Validate current RPM identity"), names.index("Upload Pages artifact"))
+        self.assertLess(names.index("Regenerate signed repository from latest history"), names.index("Validate current RPM identity"))
+        self.assertLess(names.index("Validate current RPM identity"), names.index("Upload current Pages artifact"))
         self.assertIn("rpm -qp --qf", script)
         self.assertIn("%{NAME}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n", script)
         self.assertEqual("${{ inputs.package_release }}", validation["env"]["PACKAGE_RELEASE"])
@@ -463,7 +519,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         steps = loaded["jobs"]["publish"]["steps"]
         names = [step["name"] for step in steps]
         verify_index = names.index("Verify Pages is preconfigured")
-        publish_index = names.index("Regenerate from latest gh-pages")
+        publish_index = names.index("Regenerate signed repository from latest history")
         self.assertLess(verify_index, publish_index)
 
         verify = steps[verify_index]["run"]
