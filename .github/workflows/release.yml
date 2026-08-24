@@ -22,6 +22,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      package_release: ${{ steps.version.outputs.package_release }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -36,15 +37,39 @@ jobs:
             echo "::error::No <Version> found in Directory.Build.props"
             exit 1
           fi
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME#v}"
-            if [ "$tag" != "$props" ]; then
-              echo "::error::Tag ${GITHUB_REF_NAME} does not match <Version>$props</Version>"
-              exit 1
-            fi
-          fi
-          echo "version=$props" >> "$GITHUB_OUTPUT"
-          echo "Version: $props"
+          python3 - "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$props" "$GITHUB_OUTPUT" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          from build.linux.package_contract import NativeVersion
+
+          RELEASE_TAG_PATTERN = re.compile(
+              r'^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-(?P<release>[0-9]+))?$'
+          )
+          ref_type, ref_name, props_version, output_path = sys.argv[1:]
+          version = props_version
+          package_release = 1
+          if ref_type == 'tag':
+              match = RELEASE_TAG_PATTERN.fullmatch(ref_name)
+              if match is None:
+                  raise SystemExit(f'invalid release tag: {ref_name!r}')
+              version = match.group('version')
+              package_release = int(match.group('release') or '1')
+          try:
+              native = NativeVersion.parse(version, package_release)
+          except (TypeError, ValueError) as error:
+              raise SystemExit(f'invalid native package version: {error}') from error
+          if native.application != props_version:
+              raise SystemExit(
+                  f'tag application version {native.application!r} does not match '
+                  f'Directory.Build.props version {props_version!r}'
+              )
+          with pathlib.Path(output_path).open('a', encoding='utf-8') as output:
+              output.write(f'version={native.application}\n')
+              output.write(f'package_release={native.package_release}\n')
+          print(f'Version: {native.application}; native package release: {native.package_release}')
+          PY
 
   # The headless tests exercise managed code only — no display, no X11 — so they run identically
   # everywhere. What they catch per-platform is the code that branches on the OS: file modes,
@@ -253,11 +278,12 @@ jobs:
     uses: ./.github/workflows/linux-packages.yml
     with:
       version: ${{ needs.verify.outputs.version }}
-      package_release: '1'
+      package_release: ${{ needs.verify.outputs.package_release }}
 
   # One-time repository setup: create the rhel-9-manual-validation environment with a required reviewer.
   # RHEL9_MANUAL_VALIDATION_VERSION is an environment variable, not a secret, and is
-  # manually updated only after real subscribed RHEL 9 GUI, S3, and native package validation.
+  # manually updated to VERSION-PACKAGE_RELEASE only after real subscribed RHEL 9 GUI, S3,
+  # and native package validation (for example, 1.0.0-2).
   # The tag-only guard leaves workflow_dispatch package-validation artifacts unblocked.
   rhel_release_gate:
     name: Confirm manual RHEL 9 validation
@@ -278,7 +304,7 @@ jobs:
             echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
             exit 1
           }
-          [[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}" ]] || {
+          [[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}-${{ needs.verify.outputs.package_release }}" ]] || {
             echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
             exit 1
           }
@@ -293,7 +319,7 @@ jobs:
     with:
       mode: prepare
       version: ${{ needs.verify.outputs.version }}
-      package_release: '1'
+      package_release: ${{ needs.verify.outputs.package_release }}
       validation_artifact: linux-package-validation
       candidate_artifact: linux-pages-candidate
     secrets:
@@ -327,6 +353,7 @@ jobs:
       - name: Verify and collect release artifacts
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE_RELEASE: ${{ needs.verify.outputs.package_release }}
         run: |
           set -euo pipefail
           (
@@ -353,8 +380,8 @@ jobs:
             "ObjectStorageClient-${VERSION}-linux-x64.tar.gz"
             "ObjectStorageClient-${VERSION}-osx-arm64.zip"
             "ObjectStorageClient-${VERSION}-osx-x64.zip"
-            "ObjectStorageClient-${VERSION}-1-linux-x64.deb"
-            "ObjectStorageClient-${VERSION}-1-linux-x64.rpm"
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
           )
           mapfile -t actual_sorted < <(printf '%s\n' "${actual[@]}" | sort)
           mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
@@ -386,21 +413,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE_RELEASE: ${{ needs.verify.outputs.package_release }}
           STORE_URL: ${{ vars.STORE_URL }}
         run: |
           set -euo pipefail
-          python3 - "$VERSION" "${STORE_URL:-}" <<'PY'
+          python3 - "$VERSION" "$PACKAGE_RELEASE" "${STORE_URL:-}" <<'PY'
           import pathlib
           import sys
 
-          version, store_url = sys.argv[1:]
+          version, package_release, store_url = sys.argv[1:]
           template = pathlib.Path('build/release-body.md').read_text(encoding='utf-8')
           rendered = (
               template.replace('@VERSION@', version)
+              .replace('@PACKAGE_RELEASE@', package_release)
               .replace('@STORE_URL_KO@', store_url or '아직 공개되지 않았다')
               .replace('@STORE_URL_EN@', store_url or 'Not published yet')
           )
-          if '@VERSION@' in rendered or '@STORE_URL_' in rendered:
+          if '@' in rendered:
               raise SystemExit('release body contains an unresolved token')
           pathlib.Path('release-body.md').write_text(rendered, encoding='utf-8')
           PY
@@ -422,7 +451,7 @@ jobs:
     with:
       mode: publish
       version: ${{ needs.verify.outputs.version }}
-      package_release: '1'
+      package_release: ${{ needs.verify.outputs.package_release }}
       validation_artifact: linux-package-validation
       candidate_artifact: linux-pages-candidate
     secrets:

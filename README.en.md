@@ -57,7 +57,9 @@ Native packages carry the .NET runtime and declare their system dependencies. Su
 
 The **first native Linux package release** and every later native release are gated on
 **manual RHEL 9 validation** of the GUI, S3 operations, and package behavior on a subscribed desktop.
-The release workflow enforces an exact per-release **version marker** recorded only after that validation.
+The release workflow enforces an exact `VERSION-PACKAGE_RELEASE` marker (for example, `1.0.0-2`)
+recorded only after that validation. A tag such as `v1.0.0-2` publishes packaging revision 2 for
+application version `1.0.0`; use this suffix for packaging-only fixes without changing the app version.
 The app targets X11 directly and uses XWayland in a Wayland session. On a minimal install, add
 `fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-cjk-fonts` (RPM family) if CJK text is needed.
 

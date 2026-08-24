@@ -328,6 +328,60 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         self.assertIn("git push origin HEAD:gh-pages", history_script)
         self.assertNotRegex(history_script, r"git push[^\n]*(?:--force|-f\b)")
 
+    def test_current_rpm_identity_is_checked_before_pages_upload(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        steps = loaded["jobs"]["publish"]["steps"]
+        names = [step["name"] for step in steps]
+        validation = next(step for step in steps if step.get("name") == "Validate current RPM identity")
+        script = validation["run"]
+        self.assertLess(names.index("Regenerate from latest gh-pages"), names.index("Validate current RPM identity"))
+        self.assertLess(names.index("Validate current RPM identity"), names.index("Upload Pages artifact"))
+        self.assertIn("rpm -qp --qf", script)
+        self.assertIn("%{NAME}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n", script)
+        self.assertEqual("${{ inputs.package_release }}", validation["env"]["PACKAGE_RELEASE"])
+        self.assertEqual("${{ inputs.version }}", validation["env"]["VERSION"])
+        self.assertIn("object-storage-client", script)
+        self.assertIn("x86_64", script)
+        self.assertIn("RPM_RELEASE_WITH_DIST", script)
+
+    def test_public_primary_parser_accepts_only_safe_optional_dist_suffix(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        step = next(
+            step for step in loaded["jobs"]["publish"]["steps"]
+            if step.get("name") == "Read back and cryptographically verify every public repository object"
+        )
+        matches = list(re.finditer(
+            r"python3 - \"\$primary_file\".*?<<'PY'\n(?P<body>.*?)\nPY",
+            step["run"], re.DOTALL,
+        ))
+        self.assertEqual(1, len(matches))
+        parser = matches[0].group("body")
+        self.assertIn("RPM_RELEASE_WITH_DIST", parser)
+        compile(parser, "<primary-parser>", "exec")
+
+        def run(release: str) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                primary = root / "primary.xml"
+                primary.write_text(
+                    f'''<metadata><package><name>object-storage-client</name><arch>x86_64</arch>
+                    <version ver="1.0.0" rel="{release}"/><location href="package.rpm"/>
+                    <checksum type="sha256">{'0' * 64}</checksum><size package="3"/></package></metadata>''',
+                    encoding="utf-8",
+                )
+                return subprocess.run(
+                    ["python3", "-c", parser, str(primary), str(root / "manifest"), "1.0.0", "1"],
+                    capture_output=True, text=True,
+                )
+
+        for release in ("1", "1.fc44"):
+            with self.subTest(release=release):
+                result = run(release)
+                self.assertEqual(0, result.returncode, result.stderr)
+        for release in ("10", "1evil", "1.."):
+            with self.subTest(release=release):
+                self.assertNotEqual(0, run(release).returncode)
+
     def test_pages_preconfiguration_is_get_only_and_precedes_publication(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
         self.assertIsNotNone(loaded)
@@ -515,7 +569,10 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         self.assertEqual("verify", linux["needs"])
         self.assertEqual("./.github/workflows/linux-packages.yml", linux["uses"])
         self.assertEqual(
-            {"version": "${{ needs.verify.outputs.version }}", "package_release": "1"},
+            {
+                "version": "${{ needs.verify.outputs.version }}",
+                "package_release": "${{ needs.verify.outputs.package_release }}",
+            },
             linux["with"],
         )
         self.assertNotIn("if", linux)
@@ -531,7 +588,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
                 {
                     "mode": mode,
                     "version": "${{ needs.verify.outputs.version }}",
-                    "package_release": "1",
+                    "package_release": "${{ needs.verify.outputs.package_release }}",
                     "validation_artifact": "linux-package-validation",
                     "candidate_artifact": "linux-pages-candidate",
                 },
@@ -558,7 +615,7 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         self.assertEqual("set -euo pipefail", script.splitlines()[0])
         self.assertIn('[[ -n "$VALIDATED_VERSION" ]]', script)
         self.assertIn(
-            '[[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}" ]]',
+            '[[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}-${{ needs.verify.outputs.package_release }}" ]]',
             script,
         )
         self.assertNotIn("secrets.", str(gate))
@@ -567,7 +624,59 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         ))
         self.assertIn("required reviewer", self.text.lower())
         self.assertIn("subscribed RHEL 9", self.text)
-        self.assertIn("GUI, S3, and native package", self.text)
+        self.assertIn("GUI, S3,", self.text)
+        self.assertIn("native package validation", self.text)
+        self.assertEqual(
+            "${{ steps.version.outputs.package_release }}",
+            self.loaded["jobs"]["verify"]["outputs"]["package_release"],
+        )
+        self.assertIn(
+            '[[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}-${{ needs.verify.outputs.package_release }}" ]]',
+            script,
+        )
+
+    def test_tag_parser_supports_native_release_suffix_and_manual_defaults_to_one(self):
+        step = self.loaded["jobs"]["verify"]["steps"][-1]
+        script = step["run"]
+        self.assertIn("RELEASE_TAG_PATTERN", script)
+        self.assertIn("NativeVersion.parse", script)
+        match = re.search(r"python3 - .*?<<'PY'\n(?P<body>.*?)\nPY", script, re.DOTALL)
+        self.assertIsNotNone(match)
+        assert match is not None
+        parser = match.group("body")
+        compile(parser, "<release-tag-parser>", "exec")
+        props = ROOT / "Directory.Build.props"
+        props_match = re.search(r"<Version>([^<]+)</Version>", props.read_text(encoding="utf-8"))
+        self.assertIsNotNone(props_match)
+        assert props_match is not None
+        actual = props_match.group(1)
+
+        def run(ref_type: str, ref_name: str, props_version: str = actual):
+            with tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "output"
+                result = subprocess.run(
+                    ["python3", "-c", parser, ref_type, ref_name, props_version, str(output)],
+                    cwd=ROOT, capture_output=True, text=True,
+                )
+                values = dict(
+                    line.split("=", 1)
+                    for line in output.read_text(encoding="utf-8").splitlines()
+                ) if output.exists() else {}
+                return result, values
+
+        for tag, expected_release in ((f"v{actual}", "1"), (f"v{actual}-2", "2")):
+            result, values = run("tag", tag)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual({"version": actual, "package_release": expected_release}, values)
+        result, values = run("branch", "main")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual({"version": actual, "package_release": "1"}, values)
+        for tag in (
+            f"v{actual}-0", f"v{actual}-65536", f"v{actual}-999999999999999999999999",
+            f"v{actual}-x", f"v{actual}-1-2",
+        ):
+            self.assertNotEqual(0, run("tag", tag)[0].returncode, tag)
+        self.assertNotEqual(0, run("tag", "v9.9.9-2")[0].returncode)
 
     def test_dependency_order_tag_guards_and_manual_safety_are_exact(self):
         jobs = self.loaded["jobs"]
@@ -655,13 +764,20 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             "SHA256SUMS.txt", "ObjectStorageClient-${VERSION}-linux-x64.tar.gz",
             "ObjectStorageClient-${VERSION}-osx-arm64.zip",
             "ObjectStorageClient-${VERSION}-osx-x64.zip",
-            "ObjectStorageClient-${VERSION}-1-linux-x64.deb",
-            "ObjectStorageClient-${VERSION}-1-linux-x64.rpm",
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb",
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm",
             "duplicate release asset basename", "unexpected release asset set",
             "mv -n --", 'test ! -e "$source"', 'test -f "$destination"',
         ):
             self.assertIn(marker, collect)
         self.assertIn('test "${#assets[@]}" -eq 5', collect)
+        collect_step = next(
+            step for step in steps if step.get("name") == "Verify and collect release artifacts"
+        )
+        self.assertEqual(
+            "${{ needs.verify.outputs.package_release }}",
+            collect_step["env"]["PACKAGE_RELEASE"],
+        )
         self.assertLess(collect.index("sha256sum --check SHA256SUMS"), collect.index("mkdir artifacts"))
         self.assertLess(collect.index("unexpected release asset set"), collect.index("mkdir artifacts"))
         self.assertLess(collect.index("test ! -e artifacts"), collect.index("mkdir artifacts"))
@@ -670,17 +786,21 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
             self.assertIn(marker, self.text)
         for marker in ("@STORE_URL_KO@", "@STORE_URL_EN@", "Not published yet", "아직 공개되지 않았다"):
             self.assertIn(marker, self.text + (ROOT / "build/release-body.md").read_text(encoding="utf-8"))
+        self.assertIn("@PACKAGE_RELEASE@", (ROOT / "build/release-body.md").read_text(encoding="utf-8"))
+        self.assertIn(".replace('@PACKAGE_RELEASE@', package_release)", self.text)
+        self.assertIn("if '@' in rendered", self.text)
 
     def test_release_collector_rejects_duplicate_missing_and_extra_before_mutation(self):
         steps = self.loaded["jobs"]["release"]["steps"]
         collect = next(step["run"] for step in steps if step.get("name") == "Verify and collect release artifacts")
         version = "9.8.7"
+        package_release = "2"
         expected = [
             f"ObjectStorageClient-{version}-linux-x64.tar.gz",
             f"ObjectStorageClient-{version}-osx-arm64.zip",
             f"ObjectStorageClient-{version}-osx-x64.zip",
-            f"ObjectStorageClient-{version}-1-linux-x64.deb",
-            f"ObjectStorageClient-{version}-1-linux-x64.rpm",
+            f"ObjectStorageClient-{version}-{package_release}-linux-x64.deb",
+            f"ObjectStorageClient-{version}-{package_release}-linux-x64.rpm",
         ]
 
         for scenario in ("duplicate", "missing", "extra", "success"):
@@ -712,7 +832,11 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
 
                 result = subprocess.run(
                     ["bash", "-c", collect], cwd=root,
-                    env={"PATH": "/usr/bin:/bin", "VERSION": version},
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "VERSION": version,
+                        "PACKAGE_RELEASE": package_release,
+                    },
                     capture_output=True, text=True,
                 )
                 if scenario == "success":
@@ -750,6 +874,15 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
                 script.flush()
                 result = subprocess.run(["bash", "-n", script.name], capture_output=True, text=True)
             self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_release_calls_do_not_hardcode_package_release_one(self):
+        for job in ("linux_packages", "prepare_linux_repositories", "publish_linux_repositories"):
+            self.assertEqual(
+                "${{ needs.verify.outputs.package_release }}",
+                self.loaded["jobs"][job]["with"]["package_release"],
+            )
+        self.assertNotRegex(self.text, r"package_release:\s*'1'")
+        self.assertNotIn("-${VERSION}-1-linux-x64", self.text)
 
 
 if __name__ == "__main__":

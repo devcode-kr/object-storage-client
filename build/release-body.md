@@ -5,8 +5,8 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 | 플랫폼 | 파일 |
 | --- | --- |
 | Windows 11 (x64) | Microsoft Store 공개 예정: @STORE_URL_KO@ |
-| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
-| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
+| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.deb` |
+| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.rpm` |
 | 리눅스 휴대용 대안 (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |
@@ -72,8 +72,8 @@ two-pane interface.
 | Platform | File |
 | --- | --- |
 | Windows 11 (x64) | Microsoft Store listing planned: @STORE_URL_EN@ |
-| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
-| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
+| Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.deb` |
+| Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.rpm` |
 | Portable Linux fallback (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
 | macOS (Apple Silicon) | `ObjectStorageClient-@VERSION@-osx-arm64.zip` |
 | macOS (Intel) | `ObjectStorageClient-@VERSION@-osx-x64.zip` |

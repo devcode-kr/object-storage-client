@@ -74,8 +74,12 @@ jobs:
           if native.application != sys.argv[1] or str(native.package_release) != sys.argv[2]:
               raise SystemExit('native version normalization changed the requested values')
           PY
-          test "$GITHUB_REF" = "refs/tags/v${VERSION}"
-          test "$(git tag --points-at HEAD | grep -Fxc "v${VERSION}")" -eq 1
+          if [[ "$GITHUB_REF" == "refs/tags/v${VERSION}" ]]; then
+            test "$PACKAGE_RELEASE" = 1
+          else
+            test "$GITHUB_REF" = "refs/tags/v${VERSION}-${PACKAGE_RELEASE}"
+          fi
+          test "$(git tag --points-at HEAD | grep -Fxc "$GITHUB_REF_NAME")" -eq 1
 
       - name: Install signing and repository tools
         run: |
@@ -219,7 +223,11 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$MODE" == publish ]] || { printf '%s\n' 'mode must be publish' >&2; exit 1; }
-          test "$GITHUB_REF" = "refs/tags/v${VERSION}"
+          if [[ "$GITHUB_REF" == "refs/tags/v${VERSION}" ]]; then
+            test "$PACKAGE_RELEASE" = 1
+          else
+            test "$GITHUB_REF" = "refs/tags/v${VERSION}-${PACKAGE_RELEASE}"
+          fi
           python3 - "$VERSION" "$PACKAGE_RELEASE" <<'PY'
           import sys
           from build.linux.package_contract import NativeVersion
@@ -383,6 +391,33 @@ jobs:
           test "${#rpms[@]}" -ge 1
           checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${rpms[@]}")"
           test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#rpms[@]}"
+
+      - name: Validate current RPM identity
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          current="deployment/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test -f "$current"
+          identity="$(rpm -qp --qf '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n' "$current")"
+          python3 - "$identity" "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import re
+          import sys
+
+          identity, expected_version, package_release = sys.argv[1:]
+          fields = identity.split('\t')
+          if len(fields) != 4:
+              raise SystemExit('current RPM identity query returned malformed output')
+          name, version, release, arch = fields
+          RPM_RELEASE_WITH_DIST = re.compile(
+              rf'^{re.escape(package_release)}(?:\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)?$'
+          )
+          if name != 'object-storage-client' or version != expected_version or arch != 'x86_64':
+              raise SystemExit('current RPM name, version, or architecture is unexpected')
+          if RPM_RELEASE_WITH_DIST.fullmatch(release) is None:
+              raise SystemExit('current RPM release is not the requested package release with an optional safe dist suffix')
+          PY
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
@@ -690,6 +725,9 @@ jobs:
           supported = {'md5': 32, 'sha': 40, 'sha1': 40, 'sha256': 64, 'sha512': 128}
           normalized = {'sha': 'sha1'}
           safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          RPM_RELEASE_WITH_DIST = re.compile(
+              rf'^{re.escape(sys.argv[4])}(?:\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)?$'
+          )
           seen = set()
           rows = []
           current_rpm_found = False
@@ -728,7 +766,8 @@ jobs:
                   raise SystemExit('public primary metadata contains an invalid package size') from error
               if size < 0:
                   raise SystemExit('public primary metadata contains an invalid package size')
-              if version.get('ver') == sys.argv[3] and version.get('rel') == sys.argv[4]:
+              if (version.get('ver') == sys.argv[3]
+                      and RPM_RELEASE_WITH_DIST.fullmatch(version.get('rel') or '') is not None):
                   current_rpm_found = True
               rows.append((relative, str(size), normalized.get(declared, declared), expected))
           if not current_rpm_found:

@@ -25,7 +25,7 @@ _ASCII_WHITESPACE = " \t\n\r\v\f"
 _FINGERPRINT = re.compile(r"[0-9A-F]{40}")
 _KEY_CAPABILITIES = re.compile(r"[escaESCAD]+")
 _UNUSABLE_VALIDITY = frozenset({"r", "d", "i", "e", "n"})
-_APT_METADATA_LIFETIME = dt.timedelta(days=7)
+
 
 
 @dataclass(frozen=True)
@@ -663,9 +663,7 @@ def _validate_release(
     label: str,
     description: str,
     release_root: pathlib.Path,
-    build_instant: dt.datetime,
     expected_date: dt.datetime,
-    expected_valid_until: dt.datetime,
 ) -> None:
     if _CONTROL_CHARACTER.search(text.replace("\n", "")):
         raise RuntimeError("apt-ftparchive Release output contains control characters")
@@ -678,34 +676,17 @@ def _validate_release(
             if name in values:
                 raise RuntimeError(f"apt-ftparchive Release output contains duplicate {name} fields")
             values[name] = value.strip()
-    parsed_dates: dict[str, dt.datetime] = {}
-    for field in ("Date", "Valid-Until"):
-        value = values.get(field)
-        if not value:
-            raise RuntimeError(
-                f"apt-ftparchive Release output has an invalid or missing {field} field"
-            )
-        try:
-            parsed = parsedate_to_datetime(value)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError(
-                f"apt-ftparchive Release output has a malformed {field} field"
-            ) from error
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise RuntimeError(
-                f"apt-ftparchive Release output has a timezone-naive {field} field"
-            )
-        parsed_dates[field] = parsed.astimezone(dt.timezone.utc)
-    if parsed_dates["Valid-Until"] <= parsed_dates["Date"]:
-        raise RuntimeError("apt-ftparchive Release output has invalid Date and Valid-Until ordering")
-    if parsed_dates["Valid-Until"] - parsed_dates["Date"] != _APT_METADATA_LIFETIME:
-        raise RuntimeError("apt-ftparchive Release output freshness window is not exactly seven days")
-    if parsed_dates["Valid-Until"] <= build_instant:
-        raise RuntimeError("apt-ftparchive Release output is already expired at the build instant")
-    if parsed_dates["Date"] != expected_date:
+    value = values.get("Date")
+    if not value:
+        raise RuntimeError("apt-ftparchive Release output has an invalid or missing Date field")
+    try:
+        parsed_date = parsedate_to_datetime(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("apt-ftparchive Release output has a malformed Date field") from error
+    if parsed_date.tzinfo is None or parsed_date.utcoffset() is None:
+        raise RuntimeError("apt-ftparchive Release output has a timezone-naive Date field")
+    if parsed_date.astimezone(dt.timezone.utc) != expected_date:
         raise RuntimeError("apt-ftparchive Release output Date does not match the build instant")
-    if parsed_dates["Valid-Until"] != expected_valid_until:
-        raise RuntimeError("apt-ftparchive Release output Valid-Until is not exactly seven days after Date")
     for name, value in expected.items():
         if values.get(name) != value:
             raise RuntimeError(f"apt-ftparchive Release output has an invalid or missing {name} field")
@@ -1426,7 +1407,6 @@ def _build_apt_repository_locked(
         os.utime(packages_gzip, (0, 0))
 
         description = f"Object Storage Client APT repository at {base_url}"
-        valid_until = instant + _APT_METADATA_LIFETIME
         options = {
             "Origin": origin,
             "Label": label,
@@ -1436,7 +1416,6 @@ def _build_apt_repository_locked(
             "Components": "main",
             "Description": description,
             "Date": format_datetime(instant, usegmt=True),
-            "Valid-Until": format_datetime(valid_until, usegmt=True),
         }
         release_command = [apt_tool]
         for name, value in options.items():
@@ -1454,8 +1433,6 @@ def _build_apt_repository_locked(
             description,
             temporary_release,
             instant,
-            instant,
-            valid_until,
         )
         release_path = temporary_release / "Release"
         release_path.write_text(release_result.stdout, encoding="utf-8", newline="\n")

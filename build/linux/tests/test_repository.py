@@ -126,7 +126,7 @@ for item in args[:-2]:
     if item.startswith("APT::FTPArchive::Release::"):
         key, value = item.split("=", 1)
         fields[key.rsplit("::", 1)[1]] = value
-required = ("Origin", "Label", "Suite", "Codename", "Architectures", "Components", "Description", "Date", "Valid-Until")
+required = ("Origin", "Label", "Suite", "Codename", "Architectures", "Components", "Description", "Date")
 if any(name not in fields for name in required):
     sys.exit(24)
 output_fields = fields.copy()
@@ -1176,21 +1176,17 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(0o600, stat.S_IMODE(lock_files[0].stat().st_mode))
             self.assertEqual(lock_inode, lock_files[0].stat().st_ino)
 
-    def test_release_dates_are_explicit_utc_and_exactly_seven_days_fresh(self):
+    def test_release_date_is_explicit_utc_at_build_instant_without_expiry(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             now = dt.datetime.now(tz=dt.timezone.utc).replace(microsecond=0)
             site = self._build(root, now=now)
             release = (apt_paths(site).release / "Release").read_text(encoding="utf-8")
             self.assertIn(now.strftime("Date: %a, %d %b %Y %H:%M:%S GMT"), release)
-            self.assertIn(
-                (now + dt.timedelta(days=7)).strftime("Valid-Until: %a, %d %b %Y %H:%M:%S GMT"),
-                release,
-            )
+            self.assertNotIn("Valid-Until:", release)
 
-    def test_release_freshness_rejects_missing_malformed_stale_order_and_duplicates(self):
+    def test_release_date_rejects_missing_malformed_inexact_and_duplicate_values(self):
         now = dt.datetime.now(tz=dt.timezone.utc).replace(microsecond=0)
-        formatted_now = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
         day = dt.timedelta(days=1)
 
         def formatted(value: dt.datetime) -> str:
@@ -1198,21 +1194,10 @@ class RepositoryTests(unittest.TestCase):
 
         cases: tuple[tuple[dict[str, Any], str], ...] = (
             ({"omitted_release_fields": ("Date",)}, "Date"),
-            ({"omitted_release_fields": ("Valid-Until",)}, "Valid-Until"),
             ({"release_overrides": (("Date", "not-a-date"),)}, "Date"),
-            ({"release_overrides": (("Valid-Until", "not-a-date"),)}, "Valid-Until"),
             ({"release_overrides": (("Date", "Mon, 24 Aug 2026 00:00:00"),)}, "Date"),
-            ({"release_overrides": (("Valid-Until", formatted_now),)}, "ordering"),
-            (
-                {"release_overrides": (("Valid-Until", formatted(now + 6 * day)),)},
-                "seven days|freshness",
-            ),
-            (
-                {"release_overrides": (("Date", formatted(now - 8 * day)), ("Valid-Until", formatted(now - day))),},
-                "expired",
-            ),
+            ({"release_overrides": (("Date", formatted(now - day)),)}, "build instant"),
             ({"duplicate_release_fields": ("Date",)}, "duplicate Date"),
-            ({"duplicate_release_fields": ("Valid-Until",)}, "duplicate Valid-Until"),
         )
         for index, (tool_options, message) in enumerate(cases):
             with self.subTest(case=index), tempfile.TemporaryDirectory() as temporary:

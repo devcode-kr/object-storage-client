@@ -254,7 +254,7 @@ class PackageContractTests(unittest.TestCase):
                 ("태그와 Pages 배포 전에는", "태그 및 Pages 배포 전에는"),
                 ("404",),
                 ("최신 릴리즈의 `linux-x64.tar.gz`",),
-                ("버전 마커",),
+                ("VERSION-PACKAGE_RELEASE",),
                 ("Store 목록과 인증은 아직 대기 중", "Store 공개 목록과 인증은 아직 대기 중"),
                 ("과거 GitHub 릴리즈의 Windows ZIP",),
                 ("서명되지 않은 레거시 테스트 산출물",),
@@ -270,7 +270,7 @@ class PackageContractTests(unittest.TestCase):
                 ("tag and Pages deployment",),
                 ("404",),
                 ("latest release's `linux-x64.tar.gz`",),
-                ("version marker",),
+                ("VERSION-PACKAGE_RELEASE",),
                 ("Store listing and certification are still pending",),
                 ("Historical Windows ZIPs on GitHub releases",),
                 ("unsigned legacy test artifacts",),
@@ -415,8 +415,8 @@ class PackageContractTests(unittest.TestCase):
     def test_release_body_matches_native_assets_without_platform_bypasses(self):
         text = (ROOT / "build/release-body.md").read_text(encoding="utf-8")
         for marker in (
-            "ObjectStorageClient-@VERSION@-1-linux-x64.deb",
-            "ObjectStorageClient-@VERSION@-1-linux-x64.rpm",
+            "ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.deb",
+            "ObjectStorageClient-@VERSION@-@PACKAGE_RELEASE@-linux-x64.rpm",
             "ObjectStorageClient-@VERSION@-linux-x64.tar.gz",
             "signed APT/DNF",
             "서명된 APT/DNF",
