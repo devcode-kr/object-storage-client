@@ -248,8 +248,9 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
     def test_job_guards_permissions_timeouts_and_concurrency_are_restrictive(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
         self.assertEqual({"contents": "read"}, loaded["permissions"])
-        self.assertEqual({"prepare", "publish"}, set(loaded["jobs"]))
+        self.assertEqual({"prepare", "deployment_smoke", "publish"}, set(loaded["jobs"]))
         self.assertEqual({"contents": "read"}, loaded["jobs"]["prepare"]["permissions"])
+        self.assertEqual({"contents": "read"}, loaded["jobs"]["deployment_smoke"]["permissions"])
         self.assertEqual(
             {"contents": "write", "pages": "write", "id-token": "write"},
             loaded["jobs"]["publish"]["permissions"],
@@ -264,8 +265,81 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             guard = job["if"]
             self.assertIn("github.ref_type == 'tag'", guard)
             self.assertIn("startsWith(github.ref, 'refs/tags/v')", guard)
-            self.assertIn(f"inputs.mode == '{mode}'", guard)
+            expected_mode = "prepare" if mode == "deployment_smoke" else mode
+            self.assertIn(f"inputs.mode == '{expected_mode}'", guard)
             self.assertIn("timeout-minutes", job)
+        self.assertEqual(35, loaded["jobs"]["deployment_smoke"]["timeout-minutes"])
+        self.assertEqual("prepare", loaded["jobs"]["deployment_smoke"]["needs"])
+
+    def test_deployment_smoke_matrix_uses_prepared_production_signed_artifacts(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        job = loaded["jobs"]["deployment_smoke"]
+        include = job["strategy"]["matrix"]["include"]
+        actual = {(entry["image"], entry["slug"], entry["kind"]) for entry in include}
+        self.assertEqual(EXPECTED_MATRIX, actual)
+        self.assertEqual(len(EXPECTED_MATRIX), len(include))
+        self.assertEqual("false", job["strategy"]["fail-fast"])
+        for entry in include:
+            suffix = "deb" if entry["kind"] == "deb" else "rpm"
+            self.assertEqual(
+                f"ObjectStorageClient-${{{{ inputs.version }}}}-${{{{ inputs.package_release }}}}-linux-x64.{suffix}",
+                entry["package"],
+            )
+
+        downloads = [
+            step for step in job["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual(2, len(downloads))
+        candidate = next(
+            step for step in downloads
+            if step["with"].get("name") == "${{ inputs.candidate_artifact }}"
+        )
+        packages = next(
+            step for step in downloads
+            if step["with"].get("name") == "linux-release-packages"
+        )
+        self.assertEqual("artifacts/site", candidate["with"]["path"])
+        self.assertEqual("artifacts/linux-smoke-packages", packages["with"]["path"])
+
+        text = self.text()
+        for marker in (
+            "sha256sum --check SHA256SUMS",
+            "docker network create",
+            "--network-alias repository",
+            "python:3-alpine python3 -m http.server 8000",
+            "REPOSITORY_URL=http://repository:8000",
+            "build/linux/smoke-package.sh",
+            '"/repository"',
+            "if: always()",
+            "docker logs \"$server\"",
+            "docker network rm",
+            "name: linux-deployment-smoke-${{ matrix.slug }}",
+        ):
+            self.assertIn(marker, text)
+        self.assertRegex(text, r"(?s)(?:while|for) .*repository:8000.*sleep")
+
+        job_text = "\n".join(
+            str(value) for step in job["steps"] for value in step.values()
+        )
+        self.assertNotIn("secrets.", job_text)
+        self.assertNotIn("LINUX_REPO_GPG_PRIVATE_KEY", job_text)
+        self.assertNotIn("LINUX_REPO_GPG_PASSPHRASE", job_text)
+
+    def test_throwaway_and_deployment_smoke_matrices_are_distinct_gates(self):
+        validation = load_workflow(WORKFLOW)["jobs"]["smoke"]
+        deployment = load_workflow(PUBLICATION_WORKFLOW)["jobs"]["deployment_smoke"]
+        self.assertEqual("build", validation["needs"])
+        self.assertEqual("prepare", deployment["needs"])
+        validation_downloads = {
+            step.get("with", {}).get("name") for step in validation["steps"]
+        }
+        deployment_downloads = {
+            step.get("with", {}).get("name") for step in deployment["steps"]
+        }
+        self.assertIn("linux-package-validation", validation_downloads)
+        self.assertIn("linux-release-packages", deployment_downloads)
+        self.assertIn("${{ inputs.candidate_artifact }}", deployment_downloads)
 
     def test_prepare_retains_pages_and_builds_release_and_candidate_artifacts(self):
         text = self.text()

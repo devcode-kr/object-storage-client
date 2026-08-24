@@ -170,6 +170,148 @@ jobs:
           retention-days: 14
           include-hidden-files: true
 
+  deployment_smoke:
+    name: Deployment smoke ${{ matrix.image }}
+    needs: prepare
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && inputs.mode == 'prepare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            slug: debian-12
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: ubuntu:22.04
+            slug: ubuntu-22-04
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: ubuntu:24.04
+            slug: ubuntu-24-04
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: fedora:44
+            slug: fedora-44
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: fedora:43
+            slug: fedora-43
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: rockylinux:9
+            slug: rockylinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: almalinux:9
+            slug: almalinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Download complete Pages candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: artifacts/site
+
+      - name: Download deployment-signed release packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release-packages
+          path: artifacts/linux-smoke-packages
+
+      - name: Verify exact deployment-signed package artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          deb="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test "$(find artifacts/linux-smoke-packages -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-smoke-packages -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          test -f "artifacts/linux-smoke-packages/$deb"
+          test -f "artifacts/linux-smoke-packages/$rpm"
+          test -f artifacts/linux-smoke-packages/SHA256SUMS
+          (cd artifacts/linux-smoke-packages && sha256sum --check SHA256SUMS)
+          candidate_deb="artifacts/site/apt/pool/main/o/object-storage-client/$deb"
+          candidate_rpm="artifacts/site/rpm/stable/x86_64/$rpm"
+          test -s artifacts/site/repository-key.asc
+          test -f "$candidate_deb"
+          test -f "$candidate_rpm"
+          cmp -s -- "$candidate_deb" "artifacts/linux-smoke-packages/$deb"
+          cmp -s -- "$candidate_rpm" "artifacts/linux-smoke-packages/$rpm"
+
+      - name: Start isolated deployment repository and run package smoke test
+        env:
+          IMAGE: ${{ matrix.image }}
+          SLUG: ${{ matrix.slug }}
+          KIND: ${{ matrix.kind }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          network="osc-deployment-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-deployment-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-deployment-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          docker network create "$network"
+          docker run -d --name "$server" \
+            --network "$network" --network-alias repository \
+            -v "$PWD/artifacts/site:/srv:ro" \
+            python:3-alpine python3 -m http.server 8000 --directory /srv
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker run --rm --network "$network" python:3-alpine \
+              wget -q -O /dev/null http://repository:8000/repository-key.asc; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" -ne 1 ]]; then
+            mkdir -p artifacts/logs
+            docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+            printf '%s\n' 'Deployment repository HTTP server did not become ready' >&2
+            exit 1
+          fi
+          mkdir -p artifacts/logs
+          docker run --name "$target" --network "$network" \
+            -e REPOSITORY_URL=http://repository:8000 \
+            -v "$PWD:/workspace:ro" \
+            -v "$PWD/artifacts/linux-smoke-packages:/packages:ro" \
+            -v "$PWD/artifacts/site:/repository:ro" \
+            "$IMAGE" \
+            /workspace/build/linux/smoke-package.sh "$KIND" "/packages/$PACKAGE" "/repository" \
+            2>&1 | tee "artifacts/logs/smoke-${SLUG}.log"
+
+      - name: Clean up isolated deployment smoke resources
+        if: always()
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          network="osc-deployment-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-deployment-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-deployment-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          mkdir -p artifacts/logs
+          docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+          docker rm -f "$target" "$server" 2>/dev/null || true
+          docker network rm "$network" 2>/dev/null || true
+
+      - name: Upload deployment smoke logs
+        if: always() && hashFiles(format('artifacts/logs/*-{0}.log', matrix.slug)) != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-deployment-smoke-${{ matrix.slug }}
+          path: artifacts/logs/*-${{ matrix.slug }}.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   publish:
     if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && inputs.mode == 'publish'
     runs-on: ubuntu-latest
