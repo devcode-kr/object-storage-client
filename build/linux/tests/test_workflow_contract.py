@@ -121,8 +121,9 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
         for tool in ("apt-utils", "rpm", "rpmsign", "createrepo-c", "gnupg"):
             self.assertIn(tool, text)
         self.assertRegex(text, r"(?m)^\s+if \[\[ ! \"\$package_release\" =~ \^\[0-9\]\+\$ \]\]")
-        self.assertIn("package_release > 65535", text)
         self.assertIn("NativeVersion.parse", text)
+        self.assertIn("print(native.package_release)", text)
+        self.assertNotIn("10#$package_release", text)
 
     def test_throwaway_signing_repository_and_artifacts_are_present(self):
         text = workflow_text()

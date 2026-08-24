@@ -66,11 +66,6 @@ jobs:
             printf '%s\n' '::error::Package release must be a decimal integer from 1 through 65535'
             exit 1
           fi
-          if (( 10#$package_release < 1 || 10#$package_release > 65535 )); then
-            printf '%s\n' '::error::Package release must be from 1 through 65535'
-            exit 1
-          fi
-          package_release="$((10#$package_release))"
           if [[ -z "$version" ]]; then
             version="$(python3 - <<'PY'
           import pathlib
@@ -84,15 +79,17 @@ jobs:
           PY
           )"
           fi
-          python3 - "$version" "$package_release" <<'PY'
+          package_release="$(python3 - "$version" "$package_release" <<'PY'
           import sys
           from build.linux.package_contract import NativeVersion
 
           try:
-              NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+              native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
           except ValueError as error:
               raise SystemExit(f'invalid native package version: {error}') from error
+          print(native.package_release)
           PY
+          )"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'package_release=%s\n' "$package_release" >> "$GITHUB_OUTPUT"
           printf 'Validated Linux package version %s-%s\n' "$version" "$package_release"
