@@ -245,16 +245,18 @@ jobs:
           GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify \
             candidate/site/rpm/stable/x86_64/repodata/repomd.xml.asc \
             candidate/site/rpm/stable/x86_64/repodata/repomd.xml 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
-          rpm --root "$rpm_root" --initdb
-          rpm --root "$rpm_root" --import candidate/site/repository-key.asc
+          install -d -m 0700 "$rpm_root/rpmdb"
+          rpm --dbpath "$rpm_root/rpmdb" --initdb
+          rpm --dbpath "$rpm_root/rpmdb" --import candidate/site/repository-key.asc
           mapfile -t rpms < <(find candidate/site/rpm/stable/x86_64 -maxdepth 1 -type f -name '*.rpm' -print)
           test "${#rpms[@]}" -ge 1
-          checks="$(rpm --root "$rpm_root" --checksig "${rpms[@]}")"
+          checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${rpms[@]}")"
           test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#rpms[@]}"
           test -f "candidate/site/apt/pool/main/o/object-storage-client/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
           test -f "candidate/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
 
       - name: Publish candidate while preserving gh-pages history
+        id: publish
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
@@ -279,30 +281,75 @@ jobs:
             git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
             (cd pages && git push origin HEAD:gh-pages)
           fi
+          commit=$(git -C pages rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Pages source and wait for exact public URL
+      - name: Require preconfigured Pages and wait for the pushed build
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          PUBLISHED_COMMIT: ${{ steps.publish.outputs.commit }}
         run: |
           set -euo pipefail
-          if gh api "repos/${REPOSITORY}/pages" >/dev/null 2>&1; then
-            gh api --method PUT "repos/${REPOSITORY}/pages" -f build_type=legacy -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null
-          else
-            gh api --method POST "repos/${REPOSITORY}/pages" -f build_type=legacy -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null
+          pages_config="$(mktemp)"
+          cleanup() { rm -f -- "$pages_config"; }
+          trap cleanup EXIT
+          if ! gh api "repos/${REPOSITORY}/pages" >"$pages_config" 2>/dev/null; then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: select legacy deployment from gh-pages at /.' >&2
+            exit 1
           fi
-          ready=0
-          for attempt in $(seq 1 30); do
-            url="$(gh api "repos/${REPOSITORY}/pages" --jq .html_url)"
-            if [[ "$url" == "${PUBLIC_BASE_URL}/" ]]; then
-              ready=1
-              break
+          if ! python3 - "$pages_config" "$PUBLIC_BASE_URL" 2>/dev/null <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              config = json.load(stream)
+          source = config.get('source') or {}
+          actual_url = str(config.get('html_url') or '').rstrip('/')
+          expected_url = sys.argv[2].rstrip('/')
+          if (config.get('build_type') != 'legacy' or source.get('branch') != 'gh-pages'
+                  or source.get('path') != '/' or actual_url != expected_url):
+              raise SystemExit(1)
+          PY
+          then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: use legacy deployment from gh-pages at / with the expected public URL.' >&2
+            exit 1
+          fi
+          [[ "$PUBLISHED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          build_ready=0
+          for attempt in $(seq 1 60); do
+            latest="$(mktemp)"
+            if gh api "repos/${REPOSITORY}/pages/builds/latest" >"$latest" 2>/dev/null; then
+              read -r status build_commit < <(python3 - "$latest" 2>/dev/null <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              build = json.load(stream)
+          print(str(build.get('status') or ''), str(build.get('commit') or ''))
+          PY
+              )
+              rm -f -- "$latest"
+              if [[ "$status" == errored || "$status" == error ]]; then
+                printf '%s\n' 'GitHub Pages reported an error for the published build.' >&2
+                exit 1
+              fi
+              if [[ "$status" == built && "$build_commit" == "$PUBLISHED_COMMIT" ]]; then
+                build_ready=1
+                break
+              fi
+            else
+              rm -f -- "$latest"
+              # A 404 is expected briefly before the first Pages build exists.
             fi
             sleep 10
           done
-          test "$ready" -eq 1
+          if [[ "$build_ready" -ne 1 ]]; then
+            printf '%s\n' 'Timed out waiting for the exact published GitHub Pages build.' >&2
+            exit 1
+          fi
 
-      - name: Read back and cryptographically verify public repository
+      - name: Read back and cryptographically verify every public repository object
         env:
           VERSION: ${{ inputs.version }}
           PACKAGE_RELEASE: ${{ inputs.package_release }}
@@ -311,21 +358,56 @@ jobs:
           set -euo pipefail
           verify_root="$(mktemp -d)"
           public_home="$verify_root/gnupg"
+          rpm_root="$verify_root/rpm-state"
           cleanup() { rm -rf -- "$verify_root"; }
           trap cleanup EXIT
-          install -d -m 0700 "$public_home" "$verify_root/apt" "$verify_root/rpm"
-          deb="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
-          rpm_package="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
-          fetch() { curl --fail --silent --show-error --location --retry 3 --output "$2" "${PUBLIC_BASE_URL}/$1"; }
-          fetch repository-key.asc "$verify_root/repository-key.asc"
+          install -d -m 0700 "$public_home" "$rpm_root/rpmdb"
+          install -d -m 0755 "$verify_root/apt" "$verify_root/rpm" "$verify_root/public"
+
+          fetch() {
+            curl --fail --silent --show-error --location \
+              --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 60 \
+              --output "$2" "${PUBLIC_BASE_URL}/$1"
+          }
+          digest_file() {
+            case "$1" in
+              md5) md5sum -- "$2" | cut -d' ' -f1 ;;
+              sha1) sha1sum -- "$2" | cut -d' ' -f1 ;;
+              sha256) sha256sum -- "$2" | cut -d' ' -f1 ;;
+              sha512) sha512sum -- "$2" | cut -d' ' -f1 ;;
+              *) printf '%s\n' 'Unsupported repository digest algorithm.' >&2; return 1 ;;
+            esac
+          }
+
+          candidate_key_hash="$(sha256sum candidate/site/repository-key.asc | cut -d' ' -f1)"
+          readiness_deadline=$((SECONDS + 600))
+          public_key_hash=''
+          while (( SECONDS < readiness_deadline )); do
+            if curl --fail --silent --show-error --location \
+                --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 20 \
+                --output "$verify_root/readiness-key.asc" "${PUBLIC_BASE_URL}/repository-key.asc"; then
+              public_key_hash="$(sha256sum "$verify_root/readiness-key.asc" | cut -d' ' -f1)"
+              if [[ "$public_key_hash" == "$candidate_key_hash" ]]; then
+                break
+              fi
+            fi
+            # --fail plus --retry-all-errors retries transient failures, including HTTP 404.
+            sleep 10
+          done
+          if [[ "$public_key_hash" != "$candidate_key_hash" ]]; then
+            printf '%s\n' 'Timed out waiting for public repository readiness.' >&2
+            exit 1
+          fi
+          mv -- "$verify_root/readiness-key.asc" "$verify_root/repository-key.asc"
+
           fetch apt/dists/stable/Release "$verify_root/apt/Release"
           fetch apt/dists/stable/InRelease "$verify_root/apt/InRelease"
           fetch apt/dists/stable/Release.gpg "$verify_root/apt/Release.gpg"
+          fetch apt/dists/stable/main/binary-amd64/Packages "$verify_root/apt/Packages"
           fetch apt/dists/stable/main/binary-amd64/Packages.gz "$verify_root/apt/Packages.gz"
           fetch rpm/stable/x86_64/repodata/repomd.xml "$verify_root/rpm/repomd.xml"
           fetch rpm/stable/x86_64/repodata/repomd.xml.asc "$verify_root/rpm/repomd.xml.asc"
-          fetch "apt/pool/main/o/object-storage-client/$deb" "$verify_root/$deb"
-          fetch "rpm/stable/x86_64/$rpm_package" "$verify_root/$rpm_package"
+
           python3 - "$verify_root/repository-key.asc" "$EXPECTED_FINGERPRINT" <<'PY'
           import datetime as dt
           import sys
@@ -336,5 +418,250 @@ jobs:
           GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/apt/InRelease" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
           GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/apt/Release.gpg" "$verify_root/apt/Release" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
           GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/rpm/repomd.xml.asc" "$verify_root/rpm/repomd.xml" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
-          test "$(sha256sum "candidate/site/apt/pool/main/o/object-storage-client/$deb" | cut -d' ' -f1)" = "$(sha256sum "$verify_root/$deb" | cut -d' ' -f1)"
-          test "$(sha256sum "candidate/site/rpm/stable/x86_64/$rpm_package" | cut -d' ' -f1)" = "$(sha256sum "$verify_root/$rpm_package" | cut -d' ' -f1)"
+
+          python3 - "$verify_root/apt/Packages" "$verify_root/apt/Packages.gz" "$verify_root/apt/Release" "$verify_root/apt-packages-manifest.tsv" "$VERSION-$PACKAGE_RELEASE" <<'PY'
+          import gzip
+          import hashlib
+          import pathlib
+          import re
+          import sys
+
+          packages_path, compressed_path, release_path, manifest_path = map(pathlib.Path, sys.argv[1:5])
+          packages_bytes = packages_path.read_bytes()
+          if gzip.decompress(compressed_path.read_bytes()) != packages_bytes:
+              raise SystemExit('public Packages.gz does not decompress to public Packages')
+
+          release_lines = release_path.read_text(encoding='utf-8').splitlines()
+          release_hashes = {}
+          algorithm = None
+          algorithms = {'MD5Sum': 'md5', 'SHA1': 'sha1', 'SHA256': 'sha256', 'SHA512': 'sha512'}
+          for line in release_lines:
+              if line.endswith(':') and line[:-1] in algorithms:
+                  algorithm = algorithms[line[:-1]]
+              elif line and not line[0].isspace():
+                  algorithm = None
+              elif algorithm and len(parts := line.split()) == 3:
+                  digest, size, relative = parts
+                  if relative in ('main/binary-amd64/Packages', 'main/binary-amd64/Packages.gz'):
+                      release_hashes.setdefault(relative, {})[algorithm] = (digest.lower(), int(size))
+          for relative, path in (
+              ('main/binary-amd64/Packages', packages_path),
+              ('main/binary-amd64/Packages.gz', compressed_path),
+          ):
+              entries = release_hashes.get(relative, {})
+              if 'sha256' not in entries:
+                  raise SystemExit(f'signed Release lacks SHA256 for {relative}')
+              data = path.read_bytes()
+              for name, (expected, size) in entries.items():
+                  if len(data) != size or hashlib.new(name, data).hexdigest() != expected:
+                      raise SystemExit(f'signed Release mismatch for {relative}')
+
+          stanzas = []
+          current = {}
+          for line in packages_bytes.decode('utf-8').splitlines():
+              if not line:
+                  if current:
+                      stanzas.append(current)
+                      current = {}
+                  continue
+              if line[0].isspace():
+                  continue
+              if ':' not in line:
+                  raise SystemExit('malformed public Packages field')
+              key, value = line.split(':', 1)
+              if key in current:
+                  raise SystemExit('duplicate public Packages field')
+              current[key] = value.strip()
+          if current:
+              stanzas.append(current)
+          if not stanzas:
+              raise SystemExit('public Packages contains no stanzas')
+
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          hash_fields = {'MD5sum': ('md5', 32), 'SHA1': ('sha1', 40), 'SHA256': ('sha256', 64), 'SHA512': ('sha512', 128)}
+          seen = set()
+          rows = []
+          current_apt_found = False
+          for stanza in stanzas:
+              required = ('Package', 'Architecture', 'Version', 'Filename', 'Size', 'SHA256')
+              if any(not stanza.get(field) for field in required):
+                  raise SystemExit('public Packages stanza lacks a required field')
+              if stanza['Package'] != 'object-storage-client' or stanza['Architecture'] != 'amd64':
+                  raise SystemExit('public Packages contains an unexpected package or architecture')
+              relative = stanza['Filename']
+              pure = pathlib.PurePosixPath(relative)
+              if (pure.is_absolute() or pure.as_posix() != relative or len(pure.parts) < 2
+                      or pure.parts[0] != 'pool' or any(part in ('', '.', '..') or not safe_component.fullmatch(part) for part in pure.parts)
+                      or pure.suffix != '.deb'):
+                  raise SystemExit('public Packages contains an unsafe Filename')
+              if relative in seen:
+                  raise SystemExit('public Packages contains a duplicate Filename')
+              seen.add(relative)
+              try:
+                  size = int(stanza['Size'])
+              except ValueError as error:
+                  raise SystemExit('public Packages contains an invalid Size') from error
+              if size < 0:
+                  raise SystemExit('public Packages contains an invalid Size')
+              hashes = {}
+              for field, (name, length) in hash_fields.items():
+                  value = stanza.get(field, '').lower()
+                  if value and not re.fullmatch(f'[0-9a-f]{{{length}}}', value):
+                      raise SystemExit(f'public Packages contains an invalid {field}')
+                  hashes[name] = value or '-'
+              if stanza['Version'] == sys.argv[5]:
+                  current_apt_found = True
+              public_relative = 'apt/' + relative
+              rows.append((public_relative, str(size), hashes['sha256'], hashes['md5'], hashes['sha1'], hashes['sha512']))
+          if not current_apt_found:
+              raise SystemExit('public Packages does not contain the current package version')
+          manifest_path.write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          while IFS=$'\t' read -r relative size sha256 md5 sha1 sha512; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(stat -c %s "$destination")" -eq "$size"
+            test "$(digest_file sha256 "$destination")" = "$sha256"
+            for pair in "md5:$md5" "sha1:$sha1" "sha512:$sha512"; do
+              algorithm="${pair%%:*}"
+              expected="${pair#*:}"
+              [[ "$expected" == - ]] || test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            done
+            cmp -s -- "candidate/site/$relative" "$destination"
+          done < "$verify_root/apt-packages-manifest.tsv"
+
+          python3 - "$verify_root/rpm/repomd.xml" "$verify_root/repodata-manifest.tsv" <<'PY'
+          import pathlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          repomd_path, manifest_path = map(pathlib.Path, sys.argv[1:3])
+          root = ET.parse(repomd_path).getroot()
+          supported = {'md5': 32, 'sha': 40, 'sha1': 40, 'sha256': 64, 'sha512': 128}
+          normalized = {'sha': 'sha1'}
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          kinds = set()
+          locations = set()
+          rows = []
+          for data in root.findall('{*}data'):
+              kind = data.get('type') or ''
+              location = data.find('{*}location')
+              checksum = data.find('{*}checksum')
+              if (not safe_component.fullmatch(kind) or kind in kinds
+                      or location is None or checksum is None):
+                  raise SystemExit('public repomd.xml contains incomplete or duplicate metadata')
+              kinds.add(kind)
+              relative = location.get('href') or ''
+              pure = pathlib.PurePosixPath(relative)
+              if (pure.is_absolute() or pure.as_posix() != relative or len(pure.parts) != 2
+                      or pure.parts[0] != 'repodata' or not safe_component.fullmatch(pure.parts[1])):
+                  raise SystemExit('public repomd.xml contains an unsafe metadata location')
+              if relative in locations:
+                  raise SystemExit('public repomd.xml contains a duplicate metadata location')
+              locations.add(relative)
+              declared = (checksum.get('type') or '').lower()
+              if declared not in supported:
+                  raise SystemExit('public repomd.xml uses an unsupported checksum type')
+              value = (checksum.text or '').strip().lower()
+              if not re.fullmatch(f'[0-9a-f]{{{supported[declared]}}}', value):
+                  raise SystemExit('public repomd.xml contains an invalid checksum value')
+              rows.append((kind, 'rpm/stable/x86_64/' + relative, normalized.get(declared, declared), value))
+          if not {'primary', 'filelists', 'other'}.issubset(kinds):
+              raise SystemExit('public repomd.xml lacks primary, filelists, or other metadata')
+          manifest_path.write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          primary_file=''
+          while IFS=$'\t' read -r kind relative algorithm expected; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            cmp -s -- "candidate/site/$relative" "$destination"
+            if [[ "$kind" == primary ]]; then
+              primary_file="$destination"
+            fi
+          done < "$verify_root/repodata-manifest.tsv"
+          test -n "$primary_file"
+
+          python3 - "$primary_file" "$verify_root/rpm-packages-manifest.tsv" "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import gzip
+          import pathlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          primary_path = pathlib.Path(sys.argv[1])
+          payload = primary_path.read_bytes()
+          if primary_path.suffix == '.gz':
+              payload = gzip.decompress(payload)
+          elif primary_path.suffix != '.xml':
+              raise SystemExit('public primary metadata uses unsupported compression')
+          root = ET.fromstring(payload)
+          supported = {'md5': 32, 'sha': 40, 'sha1': 40, 'sha256': 64, 'sha512': 128}
+          normalized = {'sha': 'sha1'}
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          seen = set()
+          rows = []
+          current_rpm_found = False
+          packages = root.findall('{*}package')
+          if not packages:
+              raise SystemExit('public primary metadata contains no packages')
+          for package in packages:
+              name = package.findtext('{*}name') or ''
+              arch = package.findtext('{*}arch') or ''
+              version = package.find('{*}version')
+              location = package.find('{*}location')
+              checksum = package.find('{*}checksum')
+              size_node = package.find('{*}size')
+              if name != 'object-storage-client' or arch != 'x86_64':
+                  raise SystemExit('public primary metadata contains an unexpected package or architecture')
+              if version is None or location is None or checksum is None or size_node is None:
+                  raise SystemExit('public primary metadata contains an incomplete package')
+              href = location.get('href') or ''
+              pure = pathlib.PurePosixPath(href)
+              if (pure.is_absolute() or pure.as_posix() != href or len(pure.parts) != 1
+                      or not safe_component.fullmatch(pure.parts[0]) or pure.suffix != '.rpm'):
+                  raise SystemExit('public primary metadata contains an unsafe package location')
+              relative = 'rpm/stable/x86_64/' + href
+              if relative in seen:
+                  raise SystemExit('public primary metadata contains a duplicate package location')
+              seen.add(relative)
+              declared = (checksum.get('type') or '').lower()
+              if declared not in supported:
+                  raise SystemExit('public primary metadata uses an unsupported checksum type')
+              expected = (checksum.text or '').strip().lower()
+              if not re.fullmatch(f'[0-9a-f]{{{supported[declared]}}}', expected):
+                  raise SystemExit('public primary metadata contains an invalid package checksum')
+              try:
+                  size = int(size_node.get('package') or '')
+              except ValueError as error:
+                  raise SystemExit('public primary metadata contains an invalid package size') from error
+              if size < 0:
+                  raise SystemExit('public primary metadata contains an invalid package size')
+              if version.get('ver') == sys.argv[3] and version.get('rel') == sys.argv[4]:
+                  current_rpm_found = True
+              rows.append((relative, str(size), normalized.get(declared, declared), expected))
+          if not current_rpm_found:
+              raise SystemExit('public primary metadata does not contain the current package version')
+          pathlib.Path(sys.argv[2]).write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          fetched_rpms=()
+          while IFS=$'\t' read -r relative size algorithm expected; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(stat -c %s "$destination")" -eq "$size"
+            test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            cmp -s -- "candidate/site/$relative" "$destination"
+            fetched_rpms+=("$destination")
+          done < "$verify_root/rpm-packages-manifest.tsv"
+          test "${#fetched_rpms[@]}" -ge 1
+          rpm --dbpath "$rpm_root/rpmdb" --initdb
+          rpm --dbpath "$rpm_root/rpmdb" --import "$verify_root/repository-key.asc"
+          checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${fetched_rpms[@]}")"
+          test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#fetched_rpms[@]}"

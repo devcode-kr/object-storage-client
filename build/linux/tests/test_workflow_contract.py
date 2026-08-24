@@ -273,18 +273,86 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("rm -rf candidate/site/apt", text)
         self.assertNotIn("rm -rf candidate/site/rpm", text)
 
-    def test_publish_preserves_history_configures_pages_and_reads_back_signatures(self):
+    def test_publish_preserves_history_and_outputs_the_exact_commit(self):
         text = self.text()
         for marker in (
             "git worktree add", "origin/gh-pages", "git checkout --orphan gh-pages",
             'Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}', "git push origin HEAD:gh-pages",
-            "gh api", "/pages", 'source[branch]=gh-pages', 'source[path]=/', "GH_TOKEN:",
-            "repository-key.asc", "InRelease", "Release.gpg", "Packages.gz",
-            "repomd.xml", "repomd.xml.asc", "VALIDSIG", "--checksig", "sha256sum",
-            "curl --fail", "for attempt in $(seq 1", "sleep",
+            "id: publish", 'commit=$(git -C pages rev-parse HEAD)',
+            "printf 'commit=%s\\n' \"$commit\"", 'GITHUB_OUTPUT',
         ):
             self.assertIn(marker, text)
         self.assertNotRegex(text, r"git push[^\n]*(?:--force|-f\b)")
+
+    def test_pages_must_be_preconfigured_and_the_exact_build_is_polled(self):
+        text = self.text()
+        self.assertNotRegex(text, r"gh api\s+--method\s+(?:POST|PUT)[^\n]*pages")
+        self.assertNotIn("-f build_type=legacy", text)
+        self.assertIn('gh api "repos/${REPOSITORY}/pages"', text)
+        self.assertIn("one-time preconfiguration required", text)
+        for marker in (
+            "build_type", "legacy", "source", "gh-pages", "PUBLIC_BASE_URL",
+            'steps.publish.outputs.commit', 'repos/${REPOSITORY}/pages/builds/latest',
+            "status", "built", "commit", "seq 1 60", "sleep 10",
+        ):
+            self.assertIn(marker, text)
+        self.assertRegex(text, r"(?s)builds/latest.*?(?:errored|error).*?exit 1")
+
+    def test_public_readiness_and_fetches_are_strictly_bounded(self):
+        text = self.text()
+        self.assertIn('candidate_key_hash="$(sha256sum candidate/site/repository-key.asc', text)
+        self.assertIn("readiness_deadline=$((SECONDS +", text)
+        self.assertIn("public_key_hash", text)
+        for marker in (
+            "--connect-timeout 5", "--max-time 20", "--retry 3",
+            "--retry-all-errors", "--retry-max-time", "--fail", "404",
+        ):
+            self.assertIn(marker, text)
+        fetch = re.search(r"fetch\(\)\s*\{(?P<body>.*?)\n\s*\}", text, re.DOTALL)
+        self.assertIsNotNone(fetch)
+        assert fetch is not None
+        for marker in ("--connect-timeout", "--max-time", "--retry", "--retry-all-errors", "--retry-max-time"):
+            self.assertIn(marker, fetch.group("body"))
+
+    def test_complete_apt_readback_uses_safe_manifest_and_every_indexed_deb(self):
+        text = self.text()
+        for marker in (
+            "fetch apt/dists/stable/main/binary-amd64/Packages ",
+            "apt/dists/stable/main/binary-amd64/Packages.gz",
+            "gzip.decompress", "apt-packages-manifest.tsv", "Filename",
+            "PurePosixPath", "pool", "Package", "object-storage-client",
+            "Architecture", "amd64", "Version", "Size", "SHA256",
+            "current_apt_found", "while IFS=$'\\t' read -r relative size sha256",
+            'fetch "$relative"', 'candidate/site/$relative',
+        ):
+            self.assertIn(marker, text)
+
+    def test_complete_rpm_readback_validates_all_metadata_and_packages(self):
+        text = self.text()
+        for marker in (
+            "repodata-manifest.tsv", "primary", "filelists", "other",
+            "checksum", "location", "repodata", "rpm-packages-manifest.tsv",
+            "gzip.decompress", "object-storage-client", "x86_64",
+            "rpm/stable/x86_64", "current_rpm_found",
+            "while IFS=$'\\t' read -r kind relative algorithm expected",
+            "while IFS=$'\\t' read -r relative size algorithm expected",
+            'fetch "$relative"', 'candidate/site/$relative',
+            'rpm --dbpath "$rpm_root/rpmdb" --initdb',
+            'rpm --dbpath "$rpm_root/rpmdb" --import',
+            'rpm --dbpath "$rpm_root/rpmdb" --checksig',
+            ": digests signatures OK$",
+        ):
+            self.assertIn(marker, text)
+        self.assertNotIn('rpm --root "$rpm_root"', text)
+        self.assertRegex(text, r'install -d -m 0700[^\n]*"\$rpm_root/rpmdb"')
+
+    def test_public_signatures_are_verified(self):
+        text = self.text()
+        for marker in (
+            "repository-key.asc", "InRelease", "Release.gpg", "repomd.xml.asc",
+            "VALIDSIG", "EXPECTED_FINGERPRINT",
+        ):
+            self.assertIn(marker, text)
 
     def test_gpg_configuration_is_exact_and_secrets_are_not_printed_or_bypassed(self):
         text = self.text()
@@ -321,6 +389,23 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
                 script.flush()
                 result = subprocess.run(["bash", "-n", script.name], capture_output=True, text=True)
             self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_embedded_publication_python_parses(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        snippets = [
+            match.group("body")
+            for job in loaded["jobs"].values()
+            for step in job["steps"]
+            for match in re.finditer(
+                r"<<'PY'\n(?P<body>.*?)\nPY(?:\n|$)", step.get("run", ""), re.DOTALL
+            )
+        ]
+        self.assertTrue(snippets)
+        for snippet in snippets:
+            with self.subTest(snippet=snippet[:80]):
+                compile(snippet, "<workflow-python>", "exec")
 
     def test_release_integration_is_deferred_to_task_6b2(self):
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
