@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1353,6 +1354,33 @@ class SmokePackageScriptTests(unittest.TestCase):
             check=False,
         )
 
+    @staticmethod
+    def process_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def wait_until(predicate, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
+    @staticmethod
+    def parent_pid(pid: int) -> int:
+        status = pathlib.Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        match = re.search(r"^PPid:\s+(\d+)$", status, re.MULTILINE)
+        if match is None:
+            raise AssertionError(f"PPid missing for process {pid}")
+        return int(match.group(1))
+
     def test_selects_distribution_specific_xdpyinfo_package_from_regular_os_release(self):
         expected = {
             "fedora": "xdpyinfo",
@@ -1519,12 +1547,102 @@ class SmokePackageScriptTests(unittest.TestCase):
         for status in (129, 130, 143):
             self.assertIn(f"exit {status}", script)
         self.assertIn("run_with_timeout()", script)
+        self.assertNotIn("--foreground", script)
+        self.assertIn("ACTIVE_COMMAND_PID=", script)
+        self.assertIn('ACTIVE_COMMAND_PID=$!', script)
+        self.assertIn('stop_active_command "$ACTIVE_COMMAND_PID"', script)
+        self.assertIn('timeout --kill-after=10s "$timeout_seconds" "$@" &', script)
         self.assertIn("command -v timeout", script)
         self.assertIn("command -v xdpyinfo", script)
         for operation in ("apt-get update", "apt-get install", "apt-get remove", "dnf -y install", "dnf -y remove", "dnf -y clean", "dnf -y makecache", "gpg --batch", "desktop-file-validate"):
             matching_lines = [line for line in script.splitlines() if operation in line]
             self.assertTrue(matching_lines, operation)
             self.assertTrue(all("run_with_timeout" in line for line in matching_lines), matching_lines)
+
+    def test_term_interrupts_bounded_command_and_removes_processes_and_temp_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            temp_root = temporary / "smoke-root"
+            child_pid_file = temp_root / "child.pid"
+            wrapper = temporary / "wrapper.sh"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "export SMOKE_PACKAGE_LIBRARY_ONLY=1\n"
+                f'. "{self.SCRIPT}"\n'
+                f'TEMP_ROOT="{temp_root}"\n'
+                'mkdir "$TEMP_ROOT"\n'
+                "CLEANED=0\n"
+                f'export CHILD_PID_FILE="{child_pid_file}"\n'
+                "trap cleanup 0\n"
+                "trap handle_hup HUP\n"
+                "trap handle_int INT\n"
+                "trap handle_term TERM\n"
+                "run_with_timeout 300 sh -c 'echo $$ > \"$CHILD_PID_FILE\"; exec sleep 300'\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            process = subprocess.Popen(
+                ["/bin/sh", str(wrapper)],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            child_pid = 0
+            timeout_pid = 0
+            try:
+                self.assertTrue(
+                    self.wait_until(
+                        lambda: child_pid_file.is_file()
+                        and bool(child_pid_file.read_text(encoding="utf-8").strip()),
+                        2.0,
+                    ),
+                    "bounded child did not publish its PID",
+                )
+                child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+                timeout_pid = self.parent_pid(child_pid)
+                self.assertEqual(timeout_pid, os.getpgid(timeout_pid))
+                signal_started = time.monotonic()
+                process.terminate()
+                process.wait(timeout=3.0)
+                elapsed = time.monotonic() - signal_started
+                self.assertEqual(143, process.returncode)
+                self.assertLessEqual(elapsed, 3.0)
+                self.assertTrue(
+                    self.wait_until(
+                        lambda: not self.process_exists(child_pid)
+                        and not self.process_exists(timeout_pid),
+                        1.0,
+                    ),
+                    f"bounded process remains: timeout={timeout_pid}, child={child_pid}",
+                )
+                self.assertFalse(temp_root.exists())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                for pid in (child_pid, timeout_pid):
+                    if pid > 1 and self.process_exists(pid):
+                        try:
+                            os.kill(pid, 9)
+                        except ProcessLookupError:
+                            pass
+                if temp_root.exists():
+                    __import__("shutil").rmtree(temp_root)
+
+    def test_timeout_status_is_retained_without_leaving_child_alive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_file = pathlib.Path(directory) / "timed-out-child.pid"
+            result = self.run_library(
+                "run_with_timeout 0.1 sh -c "
+                f"'echo $$ > \"{child_pid_file}\"; exec sleep 300'"
+            )
+            self.assertEqual(124, result.returncode, result.stderr)
+            child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+            self.assertTrue(
+                self.wait_until(lambda: not self.process_exists(child_pid), 1.0),
+                f"timed-out child remains alive: {child_pid}",
+            )
 
     def test_smoke_script_is_executable_posix_shell_with_required_functions(self):
         script = self.read_script()

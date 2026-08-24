@@ -14,6 +14,7 @@ GPG_TIMEOUT_SECONDS=30
 DESKTOP_VALIDATE_TIMEOUT_SECONDS=30
 APP_PID=
 XVFB_PID=
+ACTIVE_COMMAND_PID=
 TEMP_ROOT=
 GPG_HOME=
 PACKAGE=
@@ -30,7 +31,44 @@ fail() {
 run_with_timeout() {
     timeout_seconds=$1
     shift
-    timeout --foreground "$timeout_seconds" "$@"
+    timeout --kill-after=10s "$timeout_seconds" "$@" &
+    ACTIVE_COMMAND_PID=$!
+    if wait "$ACTIVE_COMMAND_PID"; then
+        timeout_status=0
+    else
+        timeout_status=$?
+    fi
+    ACTIVE_COMMAND_PID=
+    return "$timeout_status"
+}
+
+stop_active_command() {
+    active_pid=$1
+    case "$active_pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    [ "$active_pid" -gt 1 ] || return 0
+    [ "$active_pid" != "$$" ] || return 0
+
+    if ! kill -TERM "-$active_pid" 2>/dev/null; then
+        kill -TERM "$active_pid" 2>/dev/null || :
+    fi
+
+    active_stop_attempt=0
+    while [ "$active_stop_attempt" -lt 20 ]; do
+        if ! kill -0 "-$active_pid" 2>/dev/null && ! kill -0 "$active_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        active_stop_attempt=$((active_stop_attempt + 1))
+    done
+
+    if kill -0 "-$active_pid" 2>/dev/null || kill -0 "$active_pid" 2>/dev/null; then
+        if ! kill -KILL "-$active_pid" 2>/dev/null; then
+            kill -KILL "$active_pid" 2>/dev/null || :
+        fi
+    fi
+    wait "$active_pid" 2>/dev/null || :
 }
 
 stop_process() {
@@ -54,6 +92,8 @@ stop_process() {
 cleanup() {
     [ "$CLEANED" -eq 0 ] || return 0
     CLEANED=1
+    stop_active_command "$ACTIVE_COMMAND_PID"
+    ACTIVE_COMMAND_PID=
     stop_process "$APP_PID"
     APP_PID=
     stop_process "$XVFB_PID"
@@ -64,16 +104,19 @@ cleanup() {
 }
 
 handle_hup() {
+    trap - HUP
     cleanup
     exit 129
 }
 
 handle_int() {
+    trap - INT
     cleanup
     exit 130
 }
 
 handle_term() {
+    trap - TERM
     cleanup
     exit 143
 }
