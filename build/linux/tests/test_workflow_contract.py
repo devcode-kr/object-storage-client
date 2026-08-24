@@ -247,12 +247,18 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
     def test_job_guards_permissions_timeouts_and_concurrency_are_restrictive(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
         self.assertEqual({"contents": "read"}, loaded["permissions"])
-        self.assertIn("concurrency", loaded)
         self.assertEqual({"prepare", "publish"}, set(loaded["jobs"]))
         self.assertEqual({"contents": "read"}, loaded["jobs"]["prepare"]["permissions"])
         self.assertEqual(
-            {"contents": "write", "pages": "write"}, loaded["jobs"]["publish"]["permissions"]
+            {"contents": "write", "pages": "write", "id-token": "write"},
+            loaded["jobs"]["publish"]["permissions"],
         )
+        self.assertEqual("github-pages", loaded["jobs"]["publish"]["environment"]["name"])
+        self.assertEqual(
+            "${{ steps.deployment.outputs.page_url }}",
+            loaded["jobs"]["publish"]["environment"]["url"],
+        )
+        self.assertEqual("false", loaded["jobs"]["publish"]["concurrency"]["cancel-in-progress"])
         for mode, job in loaded["jobs"].items():
             guard = job["if"]
             self.assertIn("github.ref_type == 'tag'", guard)
@@ -272,17 +278,40 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             self.assertIn(marker, text)
         self.assertNotIn("rm -rf candidate/site/apt", text)
         self.assertNotIn("rm -rf candidate/site/rpm", text)
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        upload = next(
+            step for step in loaded["jobs"]["prepare"]["steps"]
+            if step.get("with", {}).get("name") == "${{ inputs.candidate_artifact }}"
+        )
+        self.assertEqual("true", upload["with"]["include-hidden-files"])
 
-    def test_publish_preserves_history_and_outputs_the_exact_commit(self):
+    def test_publish_regenerates_latest_history_then_deploys_official_pages_artifact(self):
         text = self.text()
         for marker in (
             "git worktree add", "origin/gh-pages", "git checkout --orphan gh-pages",
             'Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}', "git push origin HEAD:gh-pages",
-            "id: publish", 'commit=$(git -C pages rev-parse HEAD)',
-            "printf 'commit=%s\\n' \"$commit\"", 'GITHUB_OUTPUT',
+            "path: deployment/site", "id: deployment", "steps.deployment.outputs.page_url",
+            "name: linux-release-packages", "path: prepared/release-packages",
+            "name: ${{ inputs.validation_artifact }}", "path: artifacts",
+            "git archive origin/gh-pages | tar -x -C deployment/site",
+            "build/linux/repository.py", "artifacts/linux-native", "cmp -s --",
+            "deployment/site/.nojekyll",
         ):
             self.assertIn(marker, text)
+        self.assertIn("actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa", text)
+        self.assertIn("actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e", text)
         self.assertNotRegex(text, r"git push[^\n]*(?:--force|-f\b)")
+        self.assertNotIn("rsync -a --delete --exclude .git candidate/site/", text)
+
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        names = [step["name"] for step in loaded["jobs"]["publish"]["steps"]]
+        history = names.index("Regenerate from latest gh-pages and publish package history")
+        upload = names.index("Upload Pages artifact")
+        deploy = names.index("Deploy Pages artifact")
+        readback = names.index("Read back and cryptographically verify every public repository object")
+        self.assertLess(history, upload)
+        self.assertLess(upload, deploy)
+        self.assertLess(deploy, readback)
 
     def test_pages_preconfiguration_is_get_only_and_precedes_publication(self):
         loaded = load_workflow(PUBLICATION_WORKFLOW)
@@ -291,49 +320,38 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         steps = loaded["jobs"]["publish"]["steps"]
         names = [step["name"] for step in steps]
         verify_index = names.index("Verify Pages is preconfigured")
-        publish_index = names.index("Publish candidate while preserving gh-pages history")
+        publish_index = names.index("Regenerate from latest gh-pages and publish package history")
         self.assertLess(verify_index, publish_index)
 
         verify = steps[verify_index]["run"]
         self.assertIn('gh api "repos/${REPOSITORY}/pages"', verify)
         self.assertIn("one-time preconfiguration required", verify)
-        for marker in ("build_type", "legacy", "source", "gh-pages", "PUBLIC_BASE_URL", "html_url"):
+        for marker in ("build_type", "workflow", "PUBLIC_BASE_URL", "html_url"):
             self.assertIn(marker, verify)
+        for legacy in ("legacy", "source", "gh-pages"):
+            self.assertNotIn(legacy, verify)
         self.assertGreaterEqual(verify.count(".rstrip('/')"), 2)
         self.assertNotRegex(verify, r"gh api\s+--method\s+(?:POST|PUT|PATCH|DELETE)")
-        self.assertNotIn("-f build_type=legacy", verify)
+        self.assertNotIn("-f build_type=", verify)
 
         later = "\n".join(step.get("run", "") for step in steps[verify_index + 1 :])
         self.assertEqual(1, self.text().count('gh api "repos/${REPOSITORY}/pages"'))
         self.assertNotIn("one-time preconfiguration required", later)
         self.assertNotRegex(later, r"gh api\s+--method\s+(?:POST|PUT|PATCH|DELETE)[^\n]*pages")
 
-    def test_exact_pages_build_status_is_considered_only_for_published_commit(self):
-        loaded = load_workflow(PUBLICATION_WORKFLOW)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        steps = loaded["jobs"]["publish"]["steps"]
-        wait = next(step["run"] for step in steps if step["name"] == "Wait for the exact published Pages build")
-        for marker in (
-            'steps.publish.outputs.commit', 'repos/${REPOSITORY}/pages/builds/latest',
-            "status", "built", "commit", "seq 1 60", "sleep 10",
-        ):
-            self.assertIn(marker, self.text())
-        expected_guard = 'if [[ "$build_commit" == "$PUBLISHED_COMMIT" ]]; then'
-        guard_index = wait.index(expected_guard)
-        built_index = wait.index('[[ "$status" == built ]]', guard_index)
-        error_index = wait.index('[[ "$status" == errored || "$status" == error ]]', guard_index)
-        guard_end = wait.index("\n    fi", error_index)
-        self.assertLess(guard_index, built_index)
-        self.assertLess(guard_index, error_index)
-        self.assertLess(error_index, guard_end)
-        self.assertNotIn("PUBLISHED_COMMIT", wait[:guard_index].split("builds/latest", 1)[-1])
+    def test_deploy_output_url_is_normalized_and_legacy_build_polling_is_absent(self):
+        text = self.text()
+        self.assertNotIn("builds/latest", text)
+        self.assertNotIn("Wait for the exact published Pages build", text)
+        self.assertIn("DEPLOYED_PAGE_URL: ${{ steps.deployment.outputs.page_url }}", text)
+        self.assertIn("actual = sys.argv[1].rstrip('/')", text)
+        self.assertIn("expected = sys.argv[2].rstrip('/')", text)
 
     def test_public_readiness_requires_coherent_apt_and_rpm_metadata_and_is_bounded(self):
         text = self.text()
         for marker in (
-            'candidate_inrelease_hash="$(sha256sum candidate/site/apt/dists/stable/InRelease',
-            'candidate_repomd_hash="$(sha256sum candidate/site/rpm/stable/x86_64/repodata/repomd.xml',
+            'deployment_inrelease_hash="$(sha256sum deployment/site/apt/dists/stable/InRelease',
+            'deployment_repomd_hash="$(sha256sum deployment/site/rpm/stable/x86_64/repodata/repomd.xml',
             "readiness_deadline=$((SECONDS +", "public_inrelease_hash", "public_repomd_hash",
             'readiness-InRelease', 'readiness-repomd.xml',
             "--connect-timeout 5", "--max-time 20", "--retry 3",
@@ -341,8 +359,8 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, text)
         coherence = re.search(
-            r'if \[\[ "\$public_inrelease_hash" == "\$candidate_inrelease_hash" '
-            r'&& "\$public_repomd_hash" == "\$candidate_repomd_hash" \]\]; then',
+            r'if \[\[ "\$public_inrelease_hash" == "\$deployment_inrelease_hash" '
+            r'&& "\$public_repomd_hash" == "\$deployment_repomd_hash" \]\]; then',
             text,
         )
         self.assertIsNotNone(coherence)
@@ -351,7 +369,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(readiness)
         assert readiness is not None
-        self.assertNotIn("candidate_key_hash", readiness.group())
+        self.assertNotIn("deployment_key_hash", readiness.group())
         self.assertNotIn("public_key_hash", readiness.group())
         self.assertNotRegex(readiness.group(), r'if \[\[ "\$public_key_hash" == "\$candidate_key_hash" \]\]; then\s+break')
         self.assertIn('rm -f -- "$verify_root/readiness-InRelease" "$verify_root/readiness-repomd.xml"', readiness.group())
@@ -370,7 +388,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             "PurePosixPath", "pool", "Package", "object-storage-client",
             "Architecture", "amd64", "Version", "Size", "SHA256",
             "current_apt_found", "while IFS=$'\\t' read -r relative size sha256",
-            'fetch "$relative"', 'candidate/site/$relative',
+            'fetch "$relative"', 'deployment/site/$relative',
         ):
             self.assertIn(marker, text)
 
@@ -383,7 +401,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             "rpm/stable/x86_64", "current_rpm_found",
             "while IFS=$'\\t' read -r kind relative algorithm expected",
             "while IFS=$'\\t' read -r relative size algorithm expected",
-            'fetch "$relative"', 'candidate/site/$relative',
+            'fetch "$relative"', 'deployment/site/$relative',
             'rpm --dbpath "$rpm_root/rpmdb" --initdb',
             'rpm --dbpath "$rpm_root/rpmdb" --import',
             'rpm --dbpath "$rpm_root/rpmdb" --checksig',
@@ -393,13 +411,16 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         self.assertNotIn('rpm --root "$rpm_root"', text)
         self.assertRegex(text, r'install -d -m 0700[^\n]*"\$rpm_root/rpmdb"')
 
-    def test_public_signatures_are_verified(self):
+    def test_public_signatures_are_verified_with_primary_fingerprint_parser(self):
         text = self.text()
         for marker in (
             "repository-key.asc", "InRelease", "Release.gpg", "repomd.xml.asc",
-            "VALIDSIG", "EXPECTED_FINGERPRINT",
+            "VALIDSIG", "EXPECTED_FINGERPRINT", "_validsig_primary_fingerprints",
         ):
             self.assertIn(marker, text)
+        repository = (ROOT / "build/linux/repository.py").read_text(encoding="utf-8")
+        self.assertIn("fields[11]", repository)
+        self.assertNotRegex(text, r"gpg[^\n]*--verify[^\n]*(?:\n[^\n]*)?\|\s*grep[^\n]*VALIDSIG")
 
     def test_gpg_configuration_is_exact_and_secrets_are_not_printed_or_bypassed(self):
         text = self.text()
