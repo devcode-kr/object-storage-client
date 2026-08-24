@@ -122,7 +122,9 @@ handle_term() {
 }
 
 select_xdpyinfo_package() {
-    [ -f "$OS_RELEASE_FILE" ] && [ ! -L "$OS_RELEASE_FILE" ] || fail "os-release must be a regular non-symlink file"
+    if [ ! -f "$OS_RELEASE_FILE" ] || [ -L "$OS_RELEASE_FILE" ]; then
+        fail "os-release must be a regular non-symlink file"
+    fi
     os_id=$(awk -F= '
         $1 == "ID" {
             value = substr($0, index($0, "=") + 1)
@@ -147,11 +149,19 @@ snapshot_inputs() {
     PACKAGE_SNAPSHOT=$TEMP_ROOT/package$snapshot_suffix
     REPOSITORY_KEY_SNAPSHOT=$TEMP_ROOT/repository-key.asc
     install -m 0444 "$PACKAGE" "$PACKAGE_SNAPSHOT"
-    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package source changed while snapshotting"
-    [ -f "$PACKAGE_SNAPSHOT" ] && [ ! -L "$PACKAGE_SNAPSHOT" ] || fail "package snapshot is not a regular file"
+    if [ ! -f "$PACKAGE" ] || [ -L "$PACKAGE" ]; then
+        fail "package source changed while snapshotting"
+    fi
+    if [ ! -f "$PACKAGE_SNAPSHOT" ] || [ -L "$PACKAGE_SNAPSHOT" ]; then
+        fail "package snapshot is not a regular file"
+    fi
     install -m 0600 "$REPOSITORY_KEY" "$REPOSITORY_KEY_SNAPSHOT"
-    [ -f "$REPOSITORY_KEY" ] && [ ! -L "$REPOSITORY_KEY" ] || fail "repository key source changed while snapshotting"
-    [ -f "$REPOSITORY_KEY_SNAPSHOT" ] && [ ! -L "$REPOSITORY_KEY_SNAPSHOT" ] || fail "repository key snapshot is not a regular file"
+    if [ ! -f "$REPOSITORY_KEY" ] || [ -L "$REPOSITORY_KEY" ]; then
+        fail "repository key source changed while snapshotting"
+    fi
+    if [ ! -f "$REPOSITORY_KEY_SNAPSHOT" ] || [ -L "$REPOSITORY_KEY_SNAPSHOT" ]; then
+        fail "repository key snapshot is not a regular file"
+    fi
     PACKAGE=$PACKAGE_SNAPSHOT
     REPOSITORY_KEY=$REPOSITORY_KEY_SNAPSHOT
 }
@@ -202,7 +212,9 @@ validate_entry_metadata() {
     metadata=${metadata#*|}
     entry_gid=${metadata%%|*}
     entry_mode=${metadata##*|}
-    [ "$entry_uid" = 0 ] && [ "$entry_gid" = 0 ] || fail "package path is not root-owned: $installed_path"
+    if [ "$entry_uid" != 0 ] || [ "$entry_gid" != 0 ]; then
+        fail "package path is not root-owned: $installed_path"
+    fi
     case "$entry_type" in
         directory)
             [ "$entry_mode" = 755 ] || fail "unsafe directory mode: $installed_path"
@@ -250,7 +262,9 @@ validate_manifest_entries() {
 require_directory() {
     required_path=$1
     required_directory=$(rooted_path "$required_path")
-    [ -d "$required_directory" ] && [ ! -L "$required_directory" ] || fail "missing package directory: $required_path"
+    if [ ! -d "$required_directory" ] || [ -L "$required_directory" ]; then
+        fail "missing package directory: $required_path"
+    fi
     metadata=$(stat -c '%u|%g|%a' "$required_directory") || fail "cannot stat package directory: $required_path"
     [ "$metadata" = '0|0|755' ] || fail "unexpected directory ownership or mode: $required_path"
 }
@@ -259,7 +273,9 @@ require_file_mode() {
     required_path=$1
     required_mode=$2
     required_file=$(rooted_path "$required_path")
-    [ -f "$required_file" ] && [ ! -L "$required_file" ] || fail "missing package file: $required_path"
+    if [ ! -f "$required_file" ] || [ -L "$required_file" ]; then
+        fail "missing package file: $required_path"
+    fi
     metadata=$(stat -c '%u|%g|%a' "$required_file") || fail "cannot stat package file: $required_path"
     [ "$metadata" = "0|0|$required_mode" ] || fail "unexpected file ownership or mode: $required_path"
 }
@@ -343,9 +359,13 @@ preserve_user_fixture_on_remove() {
         /usr/share/icons/hicolor/256x256/apps/object-storage-client.png \
         /usr/share/doc/object-storage-client
     do
-        [ ! -e "$removed_path" ] && [ ! -L "$removed_path" ] || fail "package path remains after removal: $removed_path"
+        if [ -e "$removed_path" ] || [ -L "$removed_path" ]; then
+            fail "package path remains after removal: $removed_path"
+        fi
     done
-    [ -f "$FIXTURE" ] && [ ! -L "$FIXTURE" ] || fail "user fixture was removed"
+    if [ ! -f "$FIXTURE" ] || [ -L "$FIXTURE" ]; then
+        fail "user fixture was removed"
+    fi
     [ "$(cat "$FIXTURE")" = "$FIXTURE_BYTES" ] || fail "user fixture bytes changed"
 }
 
@@ -410,10 +430,16 @@ main() {
         *) fail "package kind must be deb or rpm" ;;
     esac
 
-    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || fail "package must be a regular non-symlink file"
-    [ -d "$REPOSITORY" ] && [ ! -L "$REPOSITORY" ] || fail "repository must be a non-symlink directory"
+    if [ ! -f "$PACKAGE" ] || [ -L "$PACKAGE" ]; then
+        fail "package must be a regular non-symlink file"
+    fi
+    if [ ! -d "$REPOSITORY" ] || [ -L "$REPOSITORY" ]; then
+        fail "repository must be a non-symlink directory"
+    fi
     REPOSITORY_KEY=$REPOSITORY/repository-key.asc
-    [ -f "$REPOSITORY_KEY" ] && [ ! -L "$REPOSITORY_KEY" ] || fail "repository-key.asc must be a regular non-symlink file"
+    if [ ! -f "$REPOSITORY_KEY" ] || [ -L "$REPOSITORY_KEY" ]; then
+        fail "repository-key.asc must be a regular non-symlink file"
+    fi
 
     case "$REPOSITORY_URL" in
         http://?*|https://?*) ;;
