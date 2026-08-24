@@ -89,12 +89,15 @@ jobs:
       - name: Test managed code
         run: |
           set -euo pipefail
-          dotnet test ObjectStorageClient.sln --configuration Release --nologo
+          mkdir -p artifacts/logs
+          dotnet test ObjectStorageClient.sln --configuration Release --nologo \
+            2>&1 | tee artifacts/logs/managed-tests.log
 
       - name: Test all Linux packaging code
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s build/linux/tests -p 'test_*.py'
+          mkdir -p artifacts/logs
+          python3 -m unittest discover -s build/linux/tests -p 'test_*.py' 2>&1 | tee artifacts/logs/linux-contract-tests.log
 
       - name: Publish Linux application once
         env:

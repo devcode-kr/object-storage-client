@@ -103,6 +103,11 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
         self.assertIn("--output artifacts/publish/linux-x64", text)
         self.assertIn("dotnet test ObjectStorageClient.sln --configuration Release", text)
         self.assertIn("python3 -m unittest discover -s build/linux/tests", text)
+        self.assertIn("artifacts/logs/linux-contract-tests.log", text)
+        self.assertRegex(
+            text,
+            r"python3 -m unittest discover -s build/linux/tests[^\n]*\| tee artifacts/logs/linux-contract-tests\.log",
+        )
         self.assertRegex(text, r"(?s)docker run --rm .*?debian:12 .*?package_deb\.py")
         self.assertRegex(text, r"(?s)docker run --rm .*?fedora:44 .*?package_rpm\.py")
         self.assertIn("build/linux/package_deb.py", text)
