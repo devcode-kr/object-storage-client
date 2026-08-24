@@ -1,0 +1,340 @@
+name: Publish Linux repositories
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Publication phase (prepare or publish)
+        required: true
+        type: string
+      version:
+        description: Application version
+        required: true
+        type: string
+      package_release:
+        description: Native package release
+        required: true
+        type: string
+      validation_artifact:
+        description: Validated unsigned package artifact
+        required: false
+        type: string
+        default: linux-package-validation
+      candidate_artifact:
+        description: Complete signed Pages candidate
+        required: false
+        type: string
+        default: linux-pages-candidate
+    secrets:
+      LINUX_REPO_GPG_PRIVATE_KEY:
+        required: true
+      LINUX_REPO_GPG_PASSPHRASE:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-repositories-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PUBLIC_BASE_URL: https://devcode-kr.github.io/object-storage-client
+
+jobs:
+  prepare:
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && (inputs.mode == 'prepare' || (inputs.mode != 'prepare' && inputs.mode != 'publish'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Download validated native packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.validation_artifact }}
+          path: artifacts
+
+      - name: Validate publication request
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          [[ "$MODE" == prepare ]] || { printf '%s\n' 'mode must be prepare or publish' >&2; exit 1; }
+          python3 - "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import sys
+          from build.linux.package_contract import NativeVersion
+          try:
+              native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+          except (TypeError, ValueError) as error:
+              raise SystemExit(f'invalid native package version: {error}') from error
+          if native.application != sys.argv[1] or str(native.package_release) != sys.argv[2]:
+              raise SystemExit('native version normalization changed the requested values')
+          PY
+          test "$GITHUB_REF" = "refs/tags/v${VERSION}"
+          test "$(git tag --points-at HEAD | grep -Fxc "v${VERSION}")" -eq 1
+
+      - name: Install signing and repository tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils rpm createrepo-c gnupg
+
+      - name: Prepare deployment signing material and retained Pages tree
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+          PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_root="$(mktemp -d)"
+          export GNUPGHOME="$signing_root/gnupg"
+          private_file="$signing_root/private.asc"
+          passphrase_file="$signing_root/passphrase"
+          cleanup() { rm -rf -- "$signing_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s' "$PRIVATE_KEY" > "$private_file"
+          printf '%s' "$PASSPHRASE" > "$passphrase_file"
+          chmod 0600 "$private_file" "$passphrase_file"
+          unset PRIVATE_KEY PASSPHRASE
+          gpg --batch --no-tty --pinentry-mode loopback --passphrase-file "$passphrase_file" --import "$private_file" >/dev/null 2>&1
+          mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="sec" { primary=1; next } primary && $1=="fpr" { print $10; primary=0 }')
+          test "${#fingerprints[@]}" -eq 1
+          fingerprint="${fingerprints[0]}"
+          [[ "$fingerprint" =~ ^[0-9A-F]{40}$ ]]
+          test "$fingerprint" = "$EXPECTED_FINGERPRINT"
+          python3 - "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          verify_public_key_fingerprint(
+              'build/linux/repository-key.asc', sys.argv[1], now=dt.datetime.now(dt.timezone.utc)
+          )
+          PY
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p candidate/site candidate/release-packages
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git archive origin/gh-pages | tar -x -C candidate/site
+          fi
+          test -z "$(find candidate/site -type l -print -quit)"
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          deb="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test -f "$deb"
+          test -f "$rpm"
+          python3 build/linux/repository.py \
+            --site-dir candidate/site \
+            --deb "$deb" \
+            --rpm "$rpm" \
+            --public-key build/linux/repository-key.asc \
+            --expected-fingerprint "$EXPECTED_FINGERPRINT" \
+            --private-key "$private_file" \
+            --passphrase-file "$passphrase_file" \
+            --base-url https://devcode-kr.github.io/object-storage-client
+          signed_deb="candidate/site/apt/pool/main/o/object-storage-client/$(basename "$deb")"
+          signed_rpm="candidate/site/rpm/stable/x86_64/$(basename "$rpm")"
+          test -f "$signed_deb"
+          test -f "$signed_rpm"
+          cp -- "$signed_deb" "$signed_rpm" candidate/release-packages/
+          (cd candidate/release-packages && sha256sum -- *.deb *.rpm > SHA256SUMS)
+
+      - name: Upload signed release packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-release-packages
+          path: candidate/release-packages
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload complete Pages candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: candidate/site
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && inputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Download complete Pages candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: candidate/site
+
+      - name: Install publication verification tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg rpm curl rsync
+
+      - name: Verify candidate with configured deployment identity
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+          PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [[ "$MODE" == prepare || "$MODE" == publish ]] || { printf '%s\n' 'mode must be prepare or publish' >&2; exit 1; }
+          test "$GITHUB_REF" = "refs/tags/v${VERSION}"
+          python3 - "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import sys
+          from build.linux.package_contract import NativeVersion
+          native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+          if native.application != sys.argv[1] or str(native.package_release) != sys.argv[2]:
+              raise SystemExit('native version normalization changed the requested values')
+          PY
+          umask 077
+          signing_root="$(mktemp -d)"
+          public_home="$(mktemp -d)"
+          rpm_root="$(mktemp -d)"
+          private_file="$signing_root/private.asc"
+          passphrase_file="$signing_root/passphrase"
+          cleanup() { rm -rf -- "$signing_root" "$public_home" "$rpm_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$signing_root/gnupg" "$public_home"
+          export GNUPGHOME="$signing_root/gnupg"
+          printf '%s' "$PRIVATE_KEY" > "$private_file"
+          printf '%s' "$PASSPHRASE" > "$passphrase_file"
+          chmod 0600 "$private_file" "$passphrase_file"
+          unset PRIVATE_KEY PASSPHRASE
+          gpg --batch --no-tty --pinentry-mode loopback --passphrase-file "$passphrase_file" --import "$private_file" >/dev/null 2>&1
+          mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="sec" { primary=1; next } primary && $1=="fpr" { print $10; primary=0 }')
+          test "${#fingerprints[@]}" -eq 1
+          test "${fingerprints[0]}" = "$EXPECTED_FINGERPRINT"
+          python3 - "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          now = dt.datetime.now(dt.timezone.utc)
+          for key in ('build/linux/repository-key.asc', 'candidate/site/repository-key.asc'):
+              verify_public_key_fingerprint(key, sys.argv[1], now=now)
+          PY
+          GNUPGHOME="$public_home" gpg --batch --import candidate/site/repository-key.asc >/dev/null 2>&1
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify \
+            candidate/site/apt/dists/stable/InRelease 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify \
+            candidate/site/apt/dists/stable/Release.gpg candidate/site/apt/dists/stable/Release 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify \
+            candidate/site/rpm/stable/x86_64/repodata/repomd.xml.asc \
+            candidate/site/rpm/stable/x86_64/repodata/repomd.xml 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          rpm --root "$rpm_root" --initdb
+          rpm --root "$rpm_root" --import candidate/site/repository-key.asc
+          mapfile -t rpms < <(find candidate/site/rpm/stable/x86_64 -maxdepth 1 -type f -name '*.rpm' -print)
+          test "${#rpms[@]}" -ge 1
+          checks="$(rpm --root "$rpm_root" --checksig "${rpms[@]}")"
+          test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#rpms[@]}"
+          test -f "candidate/site/apt/pool/main/o/object-storage-client/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          test -f "candidate/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+
+      - name: Publish candidate while preserving gh-pages history
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          rm -rf pages
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git worktree add pages origin/gh-pages
+          else
+            git worktree add --detach pages HEAD
+            (cd pages && git checkout --orphan gh-pages && git rm -rf .)
+          fi
+          test -z "$(find candidate/site -type l -print -quit)"
+          rsync -a --delete --exclude .git candidate/site/ pages/
+          git -C pages config user.name github-actions[bot]
+          git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C pages add --all
+          if git -C pages diff --cached --quiet; then
+            printf '%s\n' 'Pages candidate already published; no commit required'
+          else
+            git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
+            (cd pages && git push origin HEAD:gh-pages)
+          fi
+
+      - name: Configure Pages source and wait for exact public URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${REPOSITORY}/pages" >/dev/null 2>&1; then
+            gh api --method PUT "repos/${REPOSITORY}/pages" -f build_type=legacy -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/pages" -f build_type=legacy -f 'source[branch]=gh-pages' -f 'source[path]=/' >/dev/null
+          fi
+          ready=0
+          for attempt in $(seq 1 30); do
+            url="$(gh api "repos/${REPOSITORY}/pages" --jq .html_url)"
+            if [[ "$url" == "${PUBLIC_BASE_URL}/" ]]; then
+              ready=1
+              break
+            fi
+            sleep 10
+          done
+          test "$ready" -eq 1
+
+      - name: Read back and cryptographically verify public repository
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          verify_root="$(mktemp -d)"
+          public_home="$verify_root/gnupg"
+          cleanup() { rm -rf -- "$verify_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$public_home" "$verify_root/apt" "$verify_root/rpm"
+          deb="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm_package="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          fetch() { curl --fail --silent --show-error --location --retry 3 --output "$2" "${PUBLIC_BASE_URL}/$1"; }
+          fetch repository-key.asc "$verify_root/repository-key.asc"
+          fetch apt/dists/stable/Release "$verify_root/apt/Release"
+          fetch apt/dists/stable/InRelease "$verify_root/apt/InRelease"
+          fetch apt/dists/stable/Release.gpg "$verify_root/apt/Release.gpg"
+          fetch apt/dists/stable/main/binary-amd64/Packages.gz "$verify_root/apt/Packages.gz"
+          fetch rpm/stable/x86_64/repodata/repomd.xml "$verify_root/rpm/repomd.xml"
+          fetch rpm/stable/x86_64/repodata/repomd.xml.asc "$verify_root/rpm/repomd.xml.asc"
+          fetch "apt/pool/main/o/object-storage-client/$deb" "$verify_root/$deb"
+          fetch "rpm/stable/x86_64/$rpm_package" "$verify_root/$rpm_package"
+          python3 - "$verify_root/repository-key.asc" "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          verify_public_key_fingerprint(sys.argv[1], sys.argv[2], now=dt.datetime.now(dt.timezone.utc))
+          PY
+          GNUPGHOME="$public_home" gpg --batch --import "$verify_root/repository-key.asc" >/dev/null 2>&1
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/apt/InRelease" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/apt/Release.gpg" "$verify_root/apt/Release" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$verify_root/rpm/repomd.xml.asc" "$verify_root/rpm/repomd.xml" 2>&1 | grep -F "[GNUPG:] VALIDSIG ${EXPECTED_FINGERPRINT} " >/dev/null
+          test "$(sha256sum "candidate/site/apt/pool/main/o/object-storage-client/$deb" | cut -d' ' -f1)" = "$(sha256sum "$verify_root/$deb" | cut -d' ' -f1)"
+          test "$(sha256sum "candidate/site/rpm/stable/x86_64/$rpm_package" | cut -d' ' -f1)" = "$(sha256sum "$verify_root/$rpm_package" | cut -d' ' -f1)"

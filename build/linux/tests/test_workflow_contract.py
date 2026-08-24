@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github" / "workflows" / "linux-packages.yml"
+PUBLICATION_WORKFLOW = ROOT / ".github" / "workflows" / "publish-linux-repositories.yml"
 EXPECTED_MATRIX = {
     ("debian:12", "debian-12", "deb"),
     ("ubuntu:22.04", "ubuntu-22-04", "deb"),
@@ -18,11 +21,11 @@ EXPECTED_MATRIX = {
 ACTION_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 
 
-def workflow_text() -> str:
-    return WORKFLOW.read_text(encoding="utf-8")
+def workflow_text(path: pathlib.Path = WORKFLOW) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def load_workflow():
+def load_workflow(path: pathlib.Path = WORKFLOW):
     """Load YAML when available without YAML 1.1 turning `on` into True."""
     try:
         import yaml
@@ -40,7 +43,7 @@ def load_workflow():
         ]
         for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
     }
-    return yaml.load(workflow_text(), Loader=WorkflowLoader)
+    return yaml.load(workflow_text(path), Loader=WorkflowLoader)
 
 
 class LinuxPackageWorkflowContractTests(unittest.TestCase):
@@ -214,10 +217,114 @@ class LinuxPackageWorkflowContractTests(unittest.TestCase):
                 self.assertTrue(lines and lines[0] == "set -euo pipefail")
                 self.assertNotRegex(snippet, r"(?m)^\s*(?:echo|printf)\s+\$(?:passphrase|private)")
 
-    def test_publication_workflow_is_intentionally_out_of_scope_for_task_6a(self):
-        # Task 6B will add publication/release integration contract tests. This
-        # initial contract deliberately validates only linux-packages.yml.
-        self.assertEqual("linux-packages.yml", WORKFLOW.name)
+
+class LinuxPublicationWorkflowContractTests(unittest.TestCase):
+    def text(self) -> str:
+        return workflow_text(PUBLICATION_WORKFLOW)
+
+    def test_publication_workflow_exists_and_has_exact_call_interface(self):
+        self.assertTrue(PUBLICATION_WORKFLOW.is_file())
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertIsInstance(loaded, dict)
+        self.assertEqual({"workflow_call"}, set(loaded["on"]))
+        call = loaded["on"]["workflow_call"]
+        inputs = call["inputs"]
+        self.assertEqual(
+            {"mode", "version", "package_release", "validation_artifact", "candidate_artifact"},
+            set(inputs),
+        )
+        for name in ("mode", "version", "package_release"):
+            self.assertEqual("string", inputs[name]["type"])
+            self.assertEqual("true", inputs[name]["required"])
+        self.assertEqual("linux-package-validation", inputs["validation_artifact"]["default"])
+        self.assertEqual("linux-pages-candidate", inputs["candidate_artifact"]["default"])
+        self.assertEqual(
+            {"LINUX_REPO_GPG_PRIVATE_KEY", "LINUX_REPO_GPG_PASSPHRASE"},
+            set(call["secrets"]),
+        )
+        self.assertTrue(all(value["required"] == "true" for value in call["secrets"].values()))
+
+    def test_job_guards_permissions_timeouts_and_concurrency_are_restrictive(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertEqual({"contents": "read"}, loaded["permissions"])
+        self.assertIn("concurrency", loaded)
+        self.assertEqual({"prepare", "publish"}, set(loaded["jobs"]))
+        self.assertEqual({"contents": "read"}, loaded["jobs"]["prepare"]["permissions"])
+        self.assertEqual(
+            {"contents": "write", "pages": "write"}, loaded["jobs"]["publish"]["permissions"]
+        )
+        for mode, job in loaded["jobs"].items():
+            guard = job["if"]
+            self.assertIn("github.ref_type == 'tag'", guard)
+            self.assertIn("startsWith(github.ref, 'refs/tags/v')", guard)
+            self.assertIn(f"inputs.mode == '{mode}'", guard)
+            self.assertIn("timeout-minutes", job)
+
+    def test_prepare_retains_pages_and_builds_release_and_candidate_artifacts(self):
+        text = self.text()
+        for marker in (
+            "NativeVersion.parse", 'refs/tags/v${VERSION}', "git fetch origin gh-pages",
+            "git archive origin/gh-pages | tar -x -C candidate/site", "build/linux/repository.py",
+            "--base-url https://devcode-kr.github.io/object-storage-client",
+            "candidate/release-packages", "SHA256SUMS", "name: linux-release-packages",
+            "name: ${{ inputs.candidate_artifact }}", "artifacts/linux-native",
+        ):
+            self.assertIn(marker, text)
+        self.assertNotIn("rm -rf candidate/site/apt", text)
+        self.assertNotIn("rm -rf candidate/site/rpm", text)
+
+    def test_publish_preserves_history_configures_pages_and_reads_back_signatures(self):
+        text = self.text()
+        for marker in (
+            "git worktree add", "origin/gh-pages", "git checkout --orphan gh-pages",
+            'Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}', "git push origin HEAD:gh-pages",
+            "gh api", "/pages", 'source[branch]=gh-pages', 'source[path]=/', "GH_TOKEN:",
+            "repository-key.asc", "InRelease", "Release.gpg", "Packages.gz",
+            "repomd.xml", "repomd.xml.asc", "VALIDSIG", "--checksig", "sha256sum",
+            "curl --fail", "for attempt in $(seq 1", "sleep",
+        ):
+            self.assertIn(marker, text)
+        self.assertNotRegex(text, r"git push[^\n]*(?:--force|-f\b)")
+
+    def test_gpg_configuration_is_exact_and_secrets_are_not_printed_or_bypassed(self):
+        text = self.text()
+        for marker in (
+            "secrets.LINUX_REPO_GPG_PRIVATE_KEY", "secrets.LINUX_REPO_GPG_PASSPHRASE",
+            "vars.LINUX_REPO_GPG_FINGERPRINT", "build/linux/repository-key.asc",
+            "printf '%s' \"$PRIVATE_KEY\"", "printf '%s' \"$PASSPHRASE\"",
+            "chmod 0600", "unset PRIVATE_KEY PASSPHRASE", "--pinentry-mode loopback",
+        ):
+            self.assertIn(marker, text)
+        lowered = text.lower()
+        for marker in ("trusted=yes", "--nogpgcheck", "printenv", "export -p", "cat $", "echo $"):
+            self.assertNotIn(marker, lowered)
+
+    def test_all_publication_actions_are_immutable(self):
+        uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", self.text())
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action, ACTION_SHA)
+
+    def test_multiline_publication_shell_is_strict_and_parses_as_bash(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        snippets = [
+            step["run"]
+            for job in loaded["jobs"].values()
+            for step in job["steps"]
+            if "run" in step
+        ]
+        self.assertTrue(snippets)
+        for body in snippets:
+            self.assertEqual("set -euo pipefail", next(line for line in body.splitlines() if line.strip()))
+            with tempfile.NamedTemporaryFile("w", suffix=".bash", encoding="utf-8") as script:
+                script.write(body)
+                script.flush()
+                result = subprocess.run(["bash", "-n", script.name], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_release_integration_is_deferred_to_task_6b2(self):
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertNotIn("publish-linux-repositories.yml", release)
 
 
 if __name__ == "__main__":
