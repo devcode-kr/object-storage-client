@@ -975,6 +975,7 @@ EXPECTED_RPM_SPEC = """%global debug_package %{nil}
 Name: object-storage-client
 Version: 1.2.3
 Release: 4%{?dist}
+AutoReqProv: no
 Summary: Desktop client for S3-compatible object storage
 License: MIT
 URL: https://github.com/devcode-kr/object-storage-client
@@ -1682,12 +1683,13 @@ class SmokePackageScriptTests(unittest.TestCase):
         for marker in (
             "apt-get update",
             "DEBIAN_FRONTEND=noninteractive apt-get install -y",
+            "zz-object-storage-client-smoke",
             "path-include=/usr/share/doc/object-storage-client/*",
             "libx11-6 libice6 libsm6 libfontconfig1 ca-certificates",
             "xvfb desktop-file-utils curl gnupg procps x11-utils",
             "dnf -y install",
             "libX11 libICE libSM fontconfig ca-certificates",
-            "xorg-x11-server-Xvfb desktop-file-utils curl gnupg2 procps-ng",
+            "xorg-x11-server-Xvfb desktop-file-utils gnupg2 procps-ng",
             'apt-get install -y "$PACKAGE"',
             'dnf -y install "$PACKAGE"',
             "FIXTURE=/root/.devcode/$PROGRAM/preserve-me",
@@ -1706,6 +1708,10 @@ class SmokePackageScriptTests(unittest.TestCase):
             "dnf -y remove object-storage-client",
         ):
             self.assertIn(marker, script)
+        dependency_start = script.index("install_dependencies()")
+        rpm_start = script.index("rpm)", dependency_start)
+        rpm_end = script.index(";;", rpm_start)
+        self.assertNotIn(" curl", script[rpm_start:rpm_end])
 
     def test_smoke_script_has_signed_http_repository_contracts(self):
         script = self.read_script()

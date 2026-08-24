@@ -2,6 +2,7 @@
 Name: object-storage-client
 Version: @VERSION@
 Release: @RELEASE@%{?dist}
+AutoReqProv: no
 Summary: Desktop client for S3-compatible object storage
 License: MIT
 URL: https://github.com/devcode-kr/object-storage-client

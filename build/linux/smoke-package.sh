@@ -171,8 +171,8 @@ install_dependencies() {
         deb)
             install -d -m 0755 /etc/dpkg/dpkg.cfg.d
             printf '%s\n' 'path-include=/usr/share/doc/object-storage-client/*' \
-                > /etc/dpkg/dpkg.cfg.d/99-object-storage-client-smoke
-            chmod 0644 /etc/dpkg/dpkg.cfg.d/99-object-storage-client-smoke
+                > /etc/dpkg/dpkg.cfg.d/zz-object-storage-client-smoke
+            chmod 0644 /etc/dpkg/dpkg.cfg.d/zz-object-storage-client-smoke
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" apt-get update
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 libx11-6 libice6 libsm6 libfontconfig1 ca-certificates \
@@ -182,7 +182,7 @@ install_dependencies() {
             xdpyinfo_package=$(select_xdpyinfo_package)
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" dnf -y install \
                 libX11 libICE libSM fontconfig ca-certificates \
-                xorg-x11-server-Xvfb desktop-file-utils curl gnupg2 procps-ng \
+                xorg-x11-server-Xvfb desktop-file-utils gnupg2 procps-ng \
                 "$xdpyinfo_package"
             ;;
     esac
