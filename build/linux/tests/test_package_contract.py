@@ -214,6 +214,137 @@ class PackageContractTests(unittest.TestCase):
             cache_fixture.unlink(missing_ok=True)
             text_fixture.unlink(missing_ok=True)
 
+    def test_readmes_document_native_linux_package_management(self):
+        data_delete_marker = "rm -rf ~/.devcode" + "/object-storage-client"
+        exact_markers = (
+            "https://devcode-kr.github.io/object-storage-client/apt",
+            "https://devcode-kr.github.io/object-storage-client/rpm/stable/x86_64",
+            "https://devcode-kr.github.io/object-storage-client/repository-key.asc",
+            "signed-by=/etc/apt/keyrings/object-storage-client.gpg",
+            "gpgcheck=1",
+            "repo_gpgcheck=1",
+            "gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client",
+            "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90",
+            "sudo apt install object-storage-client",
+            "sudo dnf install object-storage-client",
+            "sudo apt update && sudo apt upgrade",
+            "sudo dnf upgrade",
+            "sudo apt remove object-storage-client",
+            "sudo dnf remove object-storage-client",
+            data_delete_marker,
+            "Debian 12+",
+            "Ubuntu 22.04+",
+            "Fedora 44",
+            "Fedora 43",
+            "Rocky Linux 9",
+            "AlmaLinux 9",
+            "RHEL 9",
+            "x86-64",
+            "X11",
+            "XWayland",
+            "tar.gz",
+        )
+        language_markers = {
+            "README.md": (
+                ("앱 자체 업데이트 기능은 없다", "앱은 스스로 업데이트하지 않는다"),
+                ("RHEL 9 수동 검증", "RHEL 9에서 수동으로 검증"),
+            ),
+            "README.en.md": (
+                ("The app does not update itself", "The application does not self-update"),
+                ("manual RHEL 9 validation", "manually validated on RHEL 9"),
+            ),
+        }
+
+        for name, alternatives in language_markers.items():
+            text = (ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(readme=name):
+                for marker in exact_markers:
+                    self.assertIn(marker, text)
+                for accepted in alternatives:
+                    self.assertTrue(
+                        any(marker in text for marker in accepted),
+                        f"{name} must contain one of {accepted!r}",
+                    )
+
+                package_remove = min(
+                    text.index("sudo apt remove object-storage-client"),
+                    text.index("sudo dnf remove object-storage-client"),
+                )
+                data_delete = text.index(data_delete_marker)
+                self.assertLess(package_remove, data_delete)
+
+                lowered = text.lower()
+                for forbidden in (
+                    "trusted=yes",
+                    "--nogpgcheck",
+                    "setenforce 0",
+                    "setenforce=0",
+                    "curl |",
+                    "curl|",
+                    "--no-check-certificate",
+                ):
+                    self.assertNotIn(forbidden, lowered)
+
+    def test_signing_policies_document_linux_repository_trust(self):
+        exact_markers = (
+            "InRelease",
+            "Release.gpg",
+            "RPM",
+            "repomd.xml.asc",
+            "SHA256SUMS.txt",
+            "https://devcode-kr.github.io/object-storage-client/repository-key.asc",
+            "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90",
+            "2029-08-22",
+            "3 years",
+            "GitHub Secrets",
+            "/workspace/hermes_home/secure/object-storage-client-linux-repository/",
+            "Microsoft Store",
+            "GitHub Pages",
+        )
+        language_markers = {
+            "CODE_SIGNING_POLICY.md": (
+                ("RPM 패키지 서명", "RPM 패키지를 서명"),
+                ("이전 키와 새 키", "기존 키와 새 키"),
+                ("겹치는 기간", "중첩 기간"),
+                ("태그",),
+                ("PR",),
+                ("임시 키", "일회용 키"),
+                ("서명되지 않은 상태로 대체", "서명 없는 배포로 전환"),
+                ("macOS",),
+                ("tar.gz",),
+            ),
+            "CODE_SIGNING_POLICY.en.md": (
+                ("RPM package signatures", "signs each RPM package"),
+                ("old and new public keys",),
+                ("overlap",),
+                ("tag",),
+                ("PR",),
+                ("throwaway key",),
+                ("no unsigned fallback", "never falls back to unsigned"),
+                ("macOS",),
+                ("tar.gz",),
+            ),
+        }
+
+        for name, alternatives in language_markers.items():
+            text = (ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(policy=name):
+                for marker in exact_markers:
+                    self.assertIn(marker, text)
+                for accepted in alternatives:
+                    self.assertTrue(
+                        any(marker in text for marker in accepted),
+                        f"{name} must contain one of {accepted!r}",
+                    )
+                lowered = text.lower()
+                for forbidden in (
+                    "trusted=yes",
+                    "--nogpgcheck",
+                    "setenforce 0",
+                    "setenforce=0",
+                ):
+                    self.assertNotIn(forbidden, lowered)
+
 
 if __name__ == "__main__":
     unittest.main()

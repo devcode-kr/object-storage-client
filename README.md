@@ -28,21 +28,109 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 ## 설치
 
-**Windows는 Microsoft Store에서 받는다.** Store가 패키지에 서명하고 업데이트도 챙겨주니 경고를
-넘길 일이 없다. 현재 개발자 등록 심사 중이고, 통과하면 이 자리에 링크가 들어간다.
+**Windows는 Microsoft Store로 배포한다.** 개발자 계정은 승인되었고, 현재 Store 인증과 공개 목록
+링크를 기다리고 있다. 목록이 열리기 전까지 존재하지 않는 Store 링크를 안내하지 않는다. 인증을
+통과한 MSIX는 Microsoft가 서명하고 Store가 업데이트를 맡는다.
 
-**macOS와 리눅스는**
-[최신 릴리즈](https://github.com/devcode-kr/object-storage-client/releases/latest)에서 받으면 된다.
-.NET 런타임까지 들어 있어서 따로 설치할 게 없고, 검증용 `SHA256SUMS.txt`도 함께 올라간다. 이 둘은
-서명 없이 나가기 때문에 macOS는 한 단계를 더 거쳐야 한다.
+**macOS는** [최신 릴리즈](https://github.com/devcode-kr/object-storage-client/releases/latest)의
+서명되지 않은 `.zip` 아카이브로 제공한다. `SHA256SUMS.txt`로 내려받은 파일을 확인할 수 있지만
+개발자 서명은 아니므로, 처음 실행할 때 Gatekeeper가 "손상되었기 때문에 열 수 없습니다"라고 할 수
+있다. 앱을 `/Applications`로 옮긴 뒤 격리 속성을 지우면 된다.
 
-- **macOS** — "손상되었기 때문에 열 수 없습니다"라고 나온다. 앱이 망가진 게 아니라, 서명 없이
-  격리된 번들에 Gatekeeper가 붙이는 문구다. 앱을 옮겨놓고 격리 딱지를 떼면 실행된다.
-  `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
-- **리눅스** — 막는 게 없다. 다만 최소 설치 환경이라면 `libx11-6`, `libice6`, `libsm6`,
-  `libfontconfig1`이 필요할 수 있다.
+```bash
+xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"
+```
 
-릴리즈 노트에 각 절차를 더 자세히 적어두었다.
+**리눅스는 서명된 APT/DNF 저장소가 권장 설치 경로다.** 아래 패키지는 .NET 런타임과 필요한 시스템
+의존성을 함께 처리한다. 지원 범위는 모두 **x86-64**이며 다음과 같다.
+
+| 계열 | 지원 버전 |
+| --- | --- |
+| Debian / Ubuntu | Debian 12+, Ubuntu 22.04+ |
+| Fedora | Fedora 44, Fedora 43 (최신 두 버전) |
+| Enterprise Linux | Rocky Linux 9, AlmaLinux 9, RHEL 9 |
+
+RHEL 9는 구독된 데스크톱에서 실제 GUI와 S3 동작을 확인하는 **RHEL 9 수동 검증**을 첫 공개 태그
+전에 통과해야 한다. 앱은 X11을 직접 쓰며 Wayland에서는 XWayland를 거친다. 최소 설치에서 CJK 글자가
+필요하면 `fonts-noto-cjk`(Debian/Ubuntu) 또는 `google-noto-cjk-fonts`(RPM 계열)를 추가한다.
+
+### APT (Debian / Ubuntu)
+
+먼저 `wget`, `gpg`와 CA 인증서를 준비한 뒤 다음 블록 전체를 실행한다. 키 파일에 비밀키가 없고
+기본 공개키가 정확히 하나인지 검사한 다음, 전체 지문이 일치할 때만 로컬 keyring과 저장소 설정을
+설치한다.
+
+```bash
+sudo apt install -y ca-certificates wget gnupg
+set -eu
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" > "$tmpdir/key-info"
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr && $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+gpg --batch --dearmor --output "$tmpdir/object-storage-client.gpg" "$tmpdir/repository-key.asc"
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/object-storage-client.gpg
+printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list > /dev/null
+sudo apt update
+sudo apt install object-storage-client
+```
+
+### DNF (Fedora / Rocky / AlmaLinux / RHEL)
+
+```bash
+sudo dnf install -y ca-certificates wget gnupg2
+set -eu
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" > "$tmpdir/key-info"
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr && $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+sudo install -d -m 0755 /etc/pki/rpm-gpg
+sudo install -m 0644 "$tmpdir/repository-key.asc" /etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client
+printf '%s\n' '[object-storage-client]
+name=Object Storage Client
+baseurl=https://devcode-kr.github.io/object-storage-client/rpm/stable/x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo > /dev/null
+sudo dnf install object-storage-client
+```
+
+패키지 관리자를 쓸 수 없는 환경에서는 최신 릴리즈의 `linux-x64.tar.gz`를 휴대용 대안으로 쓸 수
+있다. 이 tar.gz는 서명되지 않았으며 `SHA256SUMS.txt` 체크섬만 제공한다. 압축을 푼 디렉터리 안에서
+직접 실행하고, 필요한 X11 라이브러리는 운영체제에서 설치해야 한다.
+
+### 업데이트
+
+업데이트는 앱이 아니라 운영체제 패키지 관리자가 맡는다. **앱 자체 업데이트 기능은 없다.** 평소의
+시스템 업데이트에 포함하거나 다음 명령을 직접 실행한다.
+
+```bash
+sudo apt update && sudo apt upgrade
+sudo dnf upgrade
+```
 
 ## 소스에서 빌드하기
 
@@ -216,11 +304,19 @@ build/package-macos.sh osx-arm64 1.0.0 artifacts
 
 ## 제거
 
-설치 관리자가 없으니 제거 절차도 없다. 압축을 푼 폴더를 지우면 되고, macOS라면 앱을 휴지통에 넣으면
-된다. 레지스트리에 쓴 것도, 깔아둔 서비스도, 건드린 시스템 설정도 없다.
+리눅스 네이티브 패키지만 지우려면 설치에 쓴 패키지 관리자를 사용한다. 저장한 사이트와 설정은
+남는다.
 
-저장한 사이트와 설정은 그 폴더 바깥에 있고 **일부러 남겨둔다.** 다시 설치했을 때 잃지 않게 하려는
-것이다. 필요 없으면 직접 지운다.
+```bash
+sudo apt remove object-storage-client
+sudo dnf remove object-storage-client
+```
+
+macOS 앱은 휴지통에 넣고, 휴대용 tar.gz는 압축을 푼 디렉터리를 지우면 된다. 레지스트리나 서비스,
+별도 시스템 설정은 없다.
+
+사용자 데이터까지 없애는 일은 패키지 제거와 **별개의 선택 작업**이다. 다시 설치할 계획이 없다면
+직접 지운다. 이 명령은 저장한 접속 정보와 설정을 되돌릴 수 없게 삭제한다.
 
 ```bash
 rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode\object-storage-client
@@ -228,8 +324,9 @@ rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode
 
 ## 코드 서명과 개인정보
 
-Windows는 Store가 서명하고 macOS와 리눅스는 서명 없이 나간다. 플랫폼별로 어떻게 되는지,
-그 서명이 무엇을 보증하는지는 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)에 있다.
+Windows Store 패키지는 Microsoft가 서명하고, 리눅스 네이티브 패키지와 저장소는 프로젝트 GPG 키로
+서명한다. macOS와 휴대용 tar.gz는 서명 없이 체크섬만 제공한다. 자세한 보증 범위는
+[CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)에 있다.
 
 수집하는 정보는 없다. 자세한 내용은 [개인정보 처리방침](PRIVACY.md)에 적어두었다.
 
