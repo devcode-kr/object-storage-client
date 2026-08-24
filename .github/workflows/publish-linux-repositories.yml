@@ -1004,7 +1004,7 @@ jobs:
 
       - name: Roll back failed Pages publication
         id: rollback_deployment
-        if: always() && steps.deployment.outcome == 'success' && (failure() || steps.audit_history.outcome == 'failure')
+        if: always() && steps.deployment.outcome == 'success' && (failure() || cancelled() || steps.audit_history.outcome == 'failure')
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
         with:
           artifact_name: github-pages-rollback

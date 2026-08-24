@@ -70,8 +70,9 @@ key only when it contains no secret key, exactly one primary public key, and the
 fingerprint; only then does it install the local keyring and repository definition.
 
 ```bash
-sudo apt install -y ca-certificates wget gnupg
+(
 set -eu
+sudo apt install -y ca-certificates wget gnupg
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -93,13 +94,15 @@ sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/objec
 printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list > /dev/null
 sudo apt update
 sudo apt install object-storage-client
+)
 ```
 
 ### DNF (Fedora / Rocky / AlmaLinux / RHEL)
 
 ```bash
-sudo dnf install -y ca-certificates wget gnupg2
+(
 set -eu
+sudo dnf install -y ca-certificates wget gnupg2
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -125,6 +128,7 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo > /dev/null
 sudo dnf install object-storage-client
+)
 ```
 
 Where a package manager cannot be used, the latest release's `linux-x64.tar.gz` is a portable

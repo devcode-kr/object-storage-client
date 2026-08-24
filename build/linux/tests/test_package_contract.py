@@ -313,6 +313,7 @@ class PackageContractTests(unittest.TestCase):
                     "disable gatekeeper",
                 ):
                     self.assertNotIn(forbidden, lowered)
+                self.assertGreaterEqual(text.count("(\nset -eu\n"), 2)
 
     def test_pages_install_blocks_prepare_prerequisites_before_download(self):
         text = (LINUX / "pages-index.html").read_text(encoding="utf-8")
@@ -320,6 +321,10 @@ class PackageContractTests(unittest.TestCase):
         dnf_start = text.index("<h2>DNF")
         apt = text[apt_start:dnf_start]
         dnf = text[dnf_start:]
+        self.assertIn("<pre><code>(\nset -eu", apt)
+        self.assertIn("<pre><code>(\nset -eu", dnf)
+        self.assertIn("sudo apt install object-storage-client\n)</code></pre>", apt)
+        self.assertIn("sudo dnf install object-storage-client\n)</code></pre>", dnf)
 
         apt_trap = apt.index("trap '")
         apt_update = apt.index("sudo apt-get update")

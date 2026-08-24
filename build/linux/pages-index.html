@@ -17,7 +17,8 @@
     <p>Install the stable release from the signed APT or DNF repository.</p>
 
     <h2>APT (Debian and Ubuntu)</h2>
-    <pre><code>set -eu
+    <pre><code>(
+set -eu
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -40,10 +41,12 @@ sudo install -d -m 0755 /etc/apt/keyrings
 sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/object-storage-client.gpg
 printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list &gt; /dev/null
 sudo apt update
-sudo apt install object-storage-client</code></pre>
+sudo apt install object-storage-client
+)</code></pre>
 
     <h2>DNF (Fedora and compatible distributions)</h2>
-    <pre><code>set -eu
+    <pre><code>(
+set -eu
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -69,7 +72,8 @@ enabled=1
 gpgcheck=1
 repo_gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo &gt; /dev/null
-sudo dnf install object-storage-client</code></pre>
+sudo dnf install object-storage-client
+)</code></pre>
 
     <h2>Links</h2>
     <ul>

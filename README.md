@@ -67,8 +67,9 @@ Gatekeeper 보안을 약화하거나 우회하는 방법을 권장하지 않는�
 설치한다.
 
 ```bash
-sudo apt install -y ca-certificates wget gnupg
+(
 set -eu
+sudo apt install -y ca-certificates wget gnupg
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -90,13 +91,15 @@ sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/objec
 printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list > /dev/null
 sudo apt update
 sudo apt install object-storage-client
+)
 ```
 
 ### DNF (Fedora / Rocky / AlmaLinux / RHEL)
 
 ```bash
-sudo dnf install -y ca-certificates wget gnupg2
+(
 set -eu
+sudo dnf install -y ca-certificates wget gnupg2
 umask 077
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
@@ -122,6 +125,7 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo > /dev/null
 sudo dnf install object-storage-client
+)
 ```
 
 패키지 관리자를 쓸 수 없는 환경에서는 최신 릴리즈의 `linux-x64.tar.gz`를 휴대용 대안으로 쓸 수

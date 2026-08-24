@@ -428,7 +428,7 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
         self.assertEqual("rollback_deployment", deploys[1]["id"])
         self.assertEqual("github-pages-rollback", deploys[1]["with"]["artifact_name"])
         self.assertEqual(
-            "always() && steps.deployment.outcome == 'success' && (failure() || steps.audit_history.outcome == 'failure')",
+            "always() && steps.deployment.outcome == 'success' && (failure() || cancelled() || steps.audit_history.outcome == 'failure')",
             deploys[1]["if"],
         )
 
