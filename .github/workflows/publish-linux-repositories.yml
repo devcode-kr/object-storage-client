@@ -255,6 +255,37 @@ jobs:
           test -f "candidate/site/apt/pool/main/o/object-storage-client/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
           test -f "candidate/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
 
+      - name: Verify Pages is preconfigured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pages_config="$(mktemp)"
+          cleanup() { rm -f -- "$pages_config"; }
+          trap cleanup EXIT
+          if ! gh api "repos/${REPOSITORY}/pages" >"$pages_config" 2>/dev/null; then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: select legacy deployment from gh-pages at /.' >&2
+            exit 1
+          fi
+          if ! python3 - "$pages_config" "$PUBLIC_BASE_URL" 2>/dev/null <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              config = json.load(stream)
+          source = config.get('source') or {}
+          actual_url = str(config.get('html_url') or '').rstrip('/')
+          expected_url = sys.argv[2].rstrip('/')
+          if (config.get('build_type') != 'legacy' or source.get('branch') != 'gh-pages'
+                  or source.get('path') != '/' or actual_url != expected_url):
+              raise SystemExit(1)
+          PY
+          then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: use legacy deployment from gh-pages at / with the expected public URL.' >&2
+            exit 1
+          fi
+
       - name: Publish candidate while preserving gh-pages history
         id: publish
         env:
@@ -285,37 +316,13 @@ jobs:
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
-      - name: Require preconfigured Pages and wait for the pushed build
+      - name: Wait for the exact published Pages build
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           PUBLISHED_COMMIT: ${{ steps.publish.outputs.commit }}
         run: |
           set -euo pipefail
-          pages_config="$(mktemp)"
-          cleanup() { rm -f -- "$pages_config"; }
-          trap cleanup EXIT
-          if ! gh api "repos/${REPOSITORY}/pages" >"$pages_config" 2>/dev/null; then
-            printf '%s\n' 'GitHub Pages one-time preconfiguration required: select legacy deployment from gh-pages at /.' >&2
-            exit 1
-          fi
-          if ! python3 - "$pages_config" "$PUBLIC_BASE_URL" 2>/dev/null <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding='utf-8') as stream:
-              config = json.load(stream)
-          source = config.get('source') or {}
-          actual_url = str(config.get('html_url') or '').rstrip('/')
-          expected_url = sys.argv[2].rstrip('/')
-          if (config.get('build_type') != 'legacy' or source.get('branch') != 'gh-pages'
-                  or source.get('path') != '/' or actual_url != expected_url):
-              raise SystemExit(1)
-          PY
-          then
-            printf '%s\n' 'GitHub Pages one-time preconfiguration required: use legacy deployment from gh-pages at / with the expected public URL.' >&2
-            exit 1
-          fi
           [[ "$PUBLISHED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           build_ready=0
           for attempt in $(seq 1 60); do
@@ -330,13 +337,15 @@ jobs:
           PY
               )
               rm -f -- "$latest"
-              if [[ "$status" == errored || "$status" == error ]]; then
-                printf '%s\n' 'GitHub Pages reported an error for the published build.' >&2
-                exit 1
-              fi
-              if [[ "$status" == built && "$build_commit" == "$PUBLISHED_COMMIT" ]]; then
-                build_ready=1
-                break
+              if [[ "$build_commit" == "$PUBLISHED_COMMIT" ]]; then
+                if [[ "$status" == built ]]; then
+                  build_ready=1
+                  break
+                fi
+                if [[ "$status" == errored || "$status" == error ]]; then
+                  printf '%s\n' 'GitHub Pages reported an error for the published build.' >&2
+                  exit 1
+                fi
               fi
             else
               rm -f -- "$latest"
@@ -379,27 +388,43 @@ jobs:
             esac
           }
 
-          candidate_key_hash="$(sha256sum candidate/site/repository-key.asc | cut -d' ' -f1)"
+          candidate_inrelease_hash="$(sha256sum candidate/site/apt/dists/stable/InRelease | cut -d' ' -f1)"
+          candidate_repomd_hash="$(sha256sum candidate/site/rpm/stable/x86_64/repodata/repomd.xml | cut -d' ' -f1)"
           readiness_deadline=$((SECONDS + 600))
-          public_key_hash=''
+          metadata_coherent=0
           while (( SECONDS < readiness_deadline )); do
+            public_inrelease_hash=''
+            public_repomd_hash=''
+            apt_downloaded=0
+            rpm_downloaded=0
             if curl --fail --silent --show-error --location \
                 --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 20 \
-                --output "$verify_root/readiness-key.asc" "${PUBLIC_BASE_URL}/repository-key.asc"; then
-              public_key_hash="$(sha256sum "$verify_root/readiness-key.asc" | cut -d' ' -f1)"
-              if [[ "$public_key_hash" == "$candidate_key_hash" ]]; then
-                break
-              fi
+                --output "$verify_root/readiness-InRelease" "${PUBLIC_BASE_URL}/apt/dists/stable/InRelease"; then
+              apt_downloaded=1
+            fi
+            if curl --fail --silent --show-error --location \
+                --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 20 \
+                --output "$verify_root/readiness-repomd.xml" "${PUBLIC_BASE_URL}/rpm/stable/x86_64/repodata/repomd.xml"; then
+              rpm_downloaded=1
+            fi
+            if [[ "$apt_downloaded" -eq 1 && "$rpm_downloaded" -eq 1 ]]; then
+              public_inrelease_hash="$(sha256sum "$verify_root/readiness-InRelease" | cut -d' ' -f1)"
+              public_repomd_hash="$(sha256sum "$verify_root/readiness-repomd.xml" | cut -d' ' -f1)"
+            fi
+            rm -f -- "$verify_root/readiness-InRelease" "$verify_root/readiness-repomd.xml"
+            if [[ "$public_inrelease_hash" == "$candidate_inrelease_hash" && "$public_repomd_hash" == "$candidate_repomd_hash" ]]; then
+              metadata_coherent=1
+              break
             fi
             # --fail plus --retry-all-errors retries transient failures, including HTTP 404.
             sleep 10
           done
-          if [[ "$public_key_hash" != "$candidate_key_hash" ]]; then
-            printf '%s\n' 'Timed out waiting for public repository readiness.' >&2
+          if [[ "$metadata_coherent" -ne 1 ]]; then
+            printf '%s\n' 'Timed out waiting for coherent public APT and RPM metadata.' >&2
             exit 1
           fi
-          mv -- "$verify_root/readiness-key.asc" "$verify_root/repository-key.asc"
 
+          fetch repository-key.asc "$verify_root/repository-key.asc"
           fetch apt/dists/stable/Release "$verify_root/apt/Release"
           fetch apt/dists/stable/InRelease "$verify_root/apt/InRelease"
           fetch apt/dists/stable/Release.gpg "$verify_root/apt/Release.gpg"

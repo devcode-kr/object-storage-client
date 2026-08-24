@@ -284,30 +284,77 @@ class LinuxPublicationWorkflowContractTests(unittest.TestCase):
             self.assertIn(marker, text)
         self.assertNotRegex(text, r"git push[^\n]*(?:--force|-f\b)")
 
-    def test_pages_must_be_preconfigured_and_the_exact_build_is_polled(self):
-        text = self.text()
-        self.assertNotRegex(text, r"gh api\s+--method\s+(?:POST|PUT)[^\n]*pages")
-        self.assertNotIn("-f build_type=legacy", text)
-        self.assertIn('gh api "repos/${REPOSITORY}/pages"', text)
-        self.assertIn("one-time preconfiguration required", text)
+    def test_pages_preconfiguration_is_get_only_and_precedes_publication(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        steps = loaded["jobs"]["publish"]["steps"]
+        names = [step["name"] for step in steps]
+        verify_index = names.index("Verify Pages is preconfigured")
+        publish_index = names.index("Publish candidate while preserving gh-pages history")
+        self.assertLess(verify_index, publish_index)
+
+        verify = steps[verify_index]["run"]
+        self.assertIn('gh api "repos/${REPOSITORY}/pages"', verify)
+        self.assertIn("one-time preconfiguration required", verify)
+        for marker in ("build_type", "legacy", "source", "gh-pages", "PUBLIC_BASE_URL", "html_url"):
+            self.assertIn(marker, verify)
+        self.assertGreaterEqual(verify.count(".rstrip('/')"), 2)
+        self.assertNotRegex(verify, r"gh api\s+--method\s+(?:POST|PUT|PATCH|DELETE)")
+        self.assertNotIn("-f build_type=legacy", verify)
+
+        later = "\n".join(step.get("run", "") for step in steps[verify_index + 1 :])
+        self.assertEqual(1, self.text().count('gh api "repos/${REPOSITORY}/pages"'))
+        self.assertNotIn("one-time preconfiguration required", later)
+        self.assertNotRegex(later, r"gh api\s+--method\s+(?:POST|PUT|PATCH|DELETE)[^\n]*pages")
+
+    def test_exact_pages_build_status_is_considered_only_for_published_commit(self):
+        loaded = load_workflow(PUBLICATION_WORKFLOW)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        steps = loaded["jobs"]["publish"]["steps"]
+        wait = next(step["run"] for step in steps if step["name"] == "Wait for the exact published Pages build")
         for marker in (
-            "build_type", "legacy", "source", "gh-pages", "PUBLIC_BASE_URL",
             'steps.publish.outputs.commit', 'repos/${REPOSITORY}/pages/builds/latest',
             "status", "built", "commit", "seq 1 60", "sleep 10",
         ):
-            self.assertIn(marker, text)
-        self.assertRegex(text, r"(?s)builds/latest.*?(?:errored|error).*?exit 1")
+            self.assertIn(marker, self.text())
+        expected_guard = 'if [[ "$build_commit" == "$PUBLISHED_COMMIT" ]]; then'
+        guard_index = wait.index(expected_guard)
+        built_index = wait.index('[[ "$status" == built ]]', guard_index)
+        error_index = wait.index('[[ "$status" == errored || "$status" == error ]]', guard_index)
+        guard_end = wait.index("\n    fi", error_index)
+        self.assertLess(guard_index, built_index)
+        self.assertLess(guard_index, error_index)
+        self.assertLess(error_index, guard_end)
+        self.assertNotIn("PUBLISHED_COMMIT", wait[:guard_index].split("builds/latest", 1)[-1])
 
-    def test_public_readiness_and_fetches_are_strictly_bounded(self):
+    def test_public_readiness_requires_coherent_apt_and_rpm_metadata_and_is_bounded(self):
         text = self.text()
-        self.assertIn('candidate_key_hash="$(sha256sum candidate/site/repository-key.asc', text)
-        self.assertIn("readiness_deadline=$((SECONDS +", text)
-        self.assertIn("public_key_hash", text)
         for marker in (
+            'candidate_inrelease_hash="$(sha256sum candidate/site/apt/dists/stable/InRelease',
+            'candidate_repomd_hash="$(sha256sum candidate/site/rpm/stable/x86_64/repodata/repomd.xml',
+            "readiness_deadline=$((SECONDS +", "public_inrelease_hash", "public_repomd_hash",
+            'readiness-InRelease', 'readiness-repomd.xml',
             "--connect-timeout 5", "--max-time 20", "--retry 3",
             "--retry-all-errors", "--retry-max-time", "--fail", "404",
         ):
             self.assertIn(marker, text)
+        coherence = re.search(
+            r'if \[\[ "\$public_inrelease_hash" == "\$candidate_inrelease_hash" '
+            r'&& "\$public_repomd_hash" == "\$candidate_repomd_hash" \]\]; then',
+            text,
+        )
+        self.assertIsNotNone(coherence)
+        readiness = re.search(
+            r"readiness_deadline=.*?(?=\n\s+fetch apt/dists/stable/Release )", text, re.DOTALL
+        )
+        self.assertIsNotNone(readiness)
+        assert readiness is not None
+        self.assertNotIn("candidate_key_hash", readiness.group())
+        self.assertNotIn("public_key_hash", readiness.group())
+        self.assertNotRegex(readiness.group(), r'if \[\[ "\$public_key_hash" == "\$candidate_key_hash" \]\]; then\s+break')
+        self.assertIn('rm -f -- "$verify_root/readiness-InRelease" "$verify_root/readiness-repomd.xml"', readiness.group())
         fetch = re.search(r"fetch\(\)\s*\{(?P<body>.*?)\n\s*\}", text, re.DOTALL)
         self.assertIsNotNone(fetch)
         assert fetch is not None
