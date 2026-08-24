@@ -328,8 +328,10 @@ rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode
 
 ## 코드 서명과 개인정보
 
-Windows Store 패키지는 Microsoft가 서명하고, 리눅스 네이티브 패키지와 저장소는 프로젝트 GPG 키로
-서명한다. macOS와 휴대용 tar.gz는 서명 없이 체크섬만 제공한다. 자세한 보증 범위는
+Windows Store 패키지는 Microsoft가 서명한다. 리눅스에서는 RPM 패키지 자체와 APT/DNF 저장소
+메타데이터를 프로젝트 GPG 키로 서명한다. `.deb`는 APT의 서명된 메타데이터와 checksum chain으로
+검증하며, GitHub Release에서 단독으로 받은 `.deb`는 `SHA256SUMS.txt`도 직접 확인한다. macOS와
+휴대용 tar.gz는 서명 없이 체크섬만 제공한다. 자세한 보증 범위는
 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)에 있다.
 
 수집하는 정보는 없다. 자세한 내용은 [개인정보 처리방침](PRIVACY.md)에 적어두었다.

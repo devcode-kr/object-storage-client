@@ -668,6 +668,8 @@ class ReleaseWorkflowIntegrationContractTests(unittest.TestCase):
         self.assertIn("artifacts/*", steps[-1]["run"])
         for marker in ("Build MSIX for the Store", "Upload MSIX", "STORE_URL", "build/release-body.md"):
             self.assertIn(marker, self.text)
+        for marker in ("@STORE_URL_KO@", "@STORE_URL_EN@", "Not published yet", "아직 공개되지 않았다"):
+            self.assertIn(marker, self.text + (ROOT / "build/release-body.md").read_text(encoding="utf-8"))
 
     def test_release_collector_rejects_duplicate_missing_and_extra_before_mutation(self):
         steps = self.loaded["jobs"]["release"]["steps"]

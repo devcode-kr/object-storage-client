@@ -337,8 +337,10 @@ rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode
 
 ## Code signing and privacy
 
-Microsoft signs the Windows Store package, while the project's GPG key signs native Linux packages
-and repositories. macOS and the portable tar.gz remain unsigned with checksum-only verification.
+Microsoft signs the Windows Store package. On Linux, the project GPG key signs each RPM package and
+the APT/DNF repository metadata. A `.deb` is authenticated through APT's signed metadata and
+checksum chain; when downloading a standalone `.deb` from GitHub Releases, also verify
+`SHA256SUMS.txt` directly. macOS and the portable tar.gz remain unsigned with checksum-only verification.
 [CODE_SIGNING_POLICY.en.md](CODE_SIGNING_POLICY.en.md) explains what each mechanism vouches for.
 
 Nothing is collected — see the [privacy policy](PRIVACY.en.md).

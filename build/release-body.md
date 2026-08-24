@@ -4,7 +4,7 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 | 플랫폼 | 파일 |
 | --- | --- |
-| Windows 11 (x64) | Microsoft Store 공개 예정: @STORE_URL@ |
+| Windows 11 (x64) | Microsoft Store 공개 예정: @STORE_URL_KO@ |
 | Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
 | Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
 | 리눅스 휴대용 대안 (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
@@ -20,8 +20,9 @@ S3 호환 오브젝트 스토리지용 데스크톱 클라이언트다. 화면�
 
 ## macOS와 리눅스 서명
 
-리눅스 네이티브 패키지와 서명된 APT/DNF 저장소는 프로젝트 GPG 키로 검증한다. 휴대용 tar.gz와
-macOS ZIP은 서명되지 않았고 체크섬만 제공한다. 체크섬은 파일 손상은 찾지만 출처는 증명하지 않는다.
+RPM 패키지 자체와 서명된 APT/DNF 저장소 메타데이터는 프로젝트 GPG 키로 검증한다. `.deb`는 APT의
+서명된 metadata checksum chain으로 인증한다. Release에서 단독으로 받은 `.deb`, 휴대용 tar.gz와
+macOS ZIP은 `SHA256SUMS.txt`도 확인해야 한다. 체크섬만으로는 출처를 증명할 수 없다.
 
 ### macOS
 
@@ -70,7 +71,7 @@ two-pane interface.
 
 | Platform | File |
 | --- | --- |
-| Windows 11 (x64) | Microsoft Store listing planned: @STORE_URL@ |
+| Windows 11 (x64) | Microsoft Store listing planned: @STORE_URL_EN@ |
 | Debian / Ubuntu (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.deb` |
 | Fedora / Rocky / AlmaLinux / RHEL (x86-64) | `ObjectStorageClient-@VERSION@-1-linux-x64.rpm` |
 | Portable Linux fallback (x86-64) | `ObjectStorageClient-@VERSION@-linux-x64.tar.gz` |
@@ -87,9 +88,10 @@ legacy test artifacts.
 
 ## macOS and Linux signatures
 
-Native Linux packages and the signed APT/DNF repositories are verified with the project GPG key.
-The portable tar.gz and macOS ZIP remain unsigned and have checksums only. A checksum detects file
-damage but does not authenticate where a file came from.
+Each RPM package and the signed APT/DNF repository metadata are verified with the project GPG key.
+A `.deb` is authenticated by APT's signed metadata checksum chain. For a standalone release `.deb`,
+the portable tar.gz, or a macOS ZIP, also verify `SHA256SUMS.txt`; a checksum alone does not prove
+where a file came from.
 
 ### macOS
 

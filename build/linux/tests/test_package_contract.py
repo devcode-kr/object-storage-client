@@ -420,11 +420,17 @@ class PackageContractTests(unittest.TestCase):
             "ObjectStorageClient-@VERSION@-linux-x64.tar.gz",
             "signed APT/DNF",
             "서명된 APT/DNF",
+            "RPM package",
+            "RPM 패키지",
+            "SHA256SUMS.txt",
+            "@STORE_URL_KO@",
+            "@STORE_URL_EN@",
         ):
             self.assertIn(marker, text)
         lowered = text.lower()
         self.assertNotIn("xattr -dr com.apple.quarantine", lowered)
         self.assertNotIn("remove the quarantine", lowered)
+        self.assertNotIn("@STORE_URL@", text)
 
 
 if __name__ == "__main__":

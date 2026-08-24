@@ -389,10 +389,21 @@ jobs:
           STORE_URL: ${{ vars.STORE_URL }}
         run: |
           set -euo pipefail
-          # Until the listing is live there is no link to give, so say so rather than ship a dead one.
-          store="${STORE_URL:-아직 심사 중이다. 공개되면 이 자리에 링크가 들어간다.}"
-          sed -e "s/@VERSION@/$VERSION/g" -e "s|@STORE_URL@|$store|g" \
-            build/release-body.md > release-body.md
+          python3 - "$VERSION" "${STORE_URL:-}" <<'PY'
+          import pathlib
+          import sys
+
+          version, store_url = sys.argv[1:]
+          template = pathlib.Path('build/release-body.md').read_text(encoding='utf-8')
+          rendered = (
+              template.replace('@VERSION@', version)
+              .replace('@STORE_URL_KO@', store_url or '아직 공개되지 않았다')
+              .replace('@STORE_URL_EN@', store_url or 'Not published yet')
+          )
+          if '@VERSION@' in rendered or '@STORE_URL_' in rendered:
+              raise SystemExit('release body contains an unresolved token')
+          pathlib.Path('release-body.md').write_text(rendered, encoding='utf-8')
+          PY
           gh release create "$GITHUB_REF_NAME" \
             --title "v$VERSION" \
             --notes-file release-body.md \
