@@ -122,8 +122,8 @@ handle_term() {
 }
 
 select_xdpyinfo_package() {
-    if [ ! -f "$OS_RELEASE_FILE" ] || [ -L "$OS_RELEASE_FILE" ]; then
-        fail "os-release must be a regular non-symlink file"
+    if [ ! -f "$OS_RELEASE_FILE" ]; then
+        fail "os-release must resolve to a regular file"
     fi
     os_id=$(awk -F= '
         $1 == "ID" {
@@ -169,6 +169,10 @@ snapshot_inputs() {
 install_dependencies() {
     case "$KIND" in
         deb)
+            install -d -m 0755 /etc/dpkg/dpkg.cfg.d
+            printf '%s\n' 'path-include=/usr/share/doc/object-storage-client/*' \
+                > /etc/dpkg/dpkg.cfg.d/99-object-storage-client-smoke
+            chmod 0644 /etc/dpkg/dpkg.cfg.d/99-object-storage-client-smoke
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" apt-get update
             run_with_timeout "$PACKAGE_MANAGER_TIMEOUT_SECONDS" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 libx11-6 libice6 libsm6 libfontconfig1 ca-certificates \

@@ -1401,18 +1401,34 @@ class SmokePackageScriptTests(unittest.TestCase):
                     self.assertEqual(0, result.returncode, result.stderr)
                     self.assertEqual(package, result.stdout.strip())
 
-    def test_xdpyinfo_selector_rejects_unknown_missing_and_symlink_os_release(self):
+    def test_xdpyinfo_selector_accepts_regular_file_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
             os_release = temporary / "os-release"
-            os_release.write_text("ID=centos\n", encoding="utf-8")
-            cases = [os_release, temporary / "missing"]
+            os_release.write_text("ID=fedora\n", encoding="utf-8")
             link = temporary / "os-release-link"
             try:
                 link.symlink_to(os_release)
             except OSError as error:
                 self.skipTest(f"symlinks unavailable: {error}")
-            cases.append(link)
+            result = self.run_library(
+                "select_xdpyinfo_package",
+                env={"OS_RELEASE_FILE": str(link)},
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("xdpyinfo", result.stdout.strip())
+
+    def test_xdpyinfo_selector_rejects_unknown_missing_and_broken_os_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            os_release = temporary / "os-release"
+            os_release.write_text("ID=centos\n", encoding="utf-8")
+            broken = temporary / "broken-os-release"
+            try:
+                broken.symlink_to(temporary / "missing-target")
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            cases = [os_release, temporary / "missing", broken]
             for path in cases:
                 with self.subTest(path=path):
                     result = self.run_library(
@@ -1666,6 +1682,7 @@ class SmokePackageScriptTests(unittest.TestCase):
         for marker in (
             "apt-get update",
             "DEBIAN_FRONTEND=noninteractive apt-get install -y",
+            "path-include=/usr/share/doc/object-storage-client/*",
             "libx11-6 libice6 libsm6 libfontconfig1 ca-certificates",
             "xvfb desktop-file-utils curl gnupg procps x11-utils",
             "dnf -y install",
