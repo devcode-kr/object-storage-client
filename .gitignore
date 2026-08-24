@@ -16,6 +16,8 @@ publish/
 *.snupkg
 
 ## Test / coverage
+__pycache__/
+*.py[cod]
 TestResults/
 coverage*.json
 coverage*.xml

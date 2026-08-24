@@ -4,7 +4,7 @@
 
 A cross-platform desktop client for S3-compatible object storage, with a FileZilla-style
 two-pane interface. Built with [Avalonia UI](https://avaloniaui.net) on .NET 9, and runs on
-Windows 11, Debian-family Linux, and macOS from one codebase.
+Windows 11, Debian-family and RPM-family Linux, and macOS from one codebase.
 
 ## Features
 
@@ -30,22 +30,120 @@ Windows 11, Debian-family Linux, and macOS from one codebase.
 
 ## Install
 
-**Windows comes from the Microsoft Store.** The Store signs the package and handles updates, so
-there is no warning to click past. Developer registration is under review; the link goes here
-once it clears.
+**Windows will be distributed through the Microsoft Store.** The developer account is approved, but
+the Store listing and certification are still pending, so there is no current official Windows
+download channel. Once approved, Microsoft will sign the certified MSIX and the Store will own its
+updates. Historical Windows ZIPs on GitHub releases are not the current official Store channel;
+they are unsigned legacy test artifacts and are not recommended as an installation path.
 
-**macOS and Linux** come from the
-[latest release](https://github.com/devcode-kr/object-storage-client/releases/latest) — builds are
-self-contained, so no .NET runtime installation is needed, and each release ships `SHA256SUMS.txt`
-for verification. These two ship unsigned, which costs macOS one extra step:
+**macOS** release archives are unsigned and not notarised. Gatekeeper may therefore block them.
+The safest choices are to build from source or wait for a signed and notarised distribution; this
+documentation does not recommend weakening or circumventing Gatekeeper. `SHA256SUMS.txt` can detect
+a changed download. **A checksum does not establish provenance** or replace developer signing.
 
-- **macOS** — the app is reported as *"damaged"*; that is Gatekeeper's message for an unsigned
-  quarantined bundle. Clear the attribute after installing:
-  `xattr -dr com.apple.quarantine "/Applications/Object Storage Client.app"`
-- **Linux** — nothing in the way. A minimal install may still need
-  `libx11-6`, `libice6`, `libsm6` and `libfontconfig1`.
+**Availability note:** the signed APT/DNF repositories are staged and become available with the
+**first native Linux package release**. Their URLs may return **404** until that release's `v*` tag
+and Pages deployment complete. Until then, use the latest release's `linux-x64.tar.gz` manual asset
+or build from source. Once published, the commands below are the canonical installation path.
 
-The release notes spell each of these out in full.
+Native packages carry the .NET runtime and declare their system dependencies. Support is
+**x86-64** only:
+
+| Family | Supported releases |
+| --- | --- |
+| Debian / Ubuntu | Debian 12+, Ubuntu 22.04+ |
+| Fedora | Fedora 44, Fedora 43 (the latest two releases) |
+| Enterprise Linux | Rocky Linux 9, AlmaLinux 9, RHEL 9 |
+
+The **first native Linux package release** and every later native release are gated on
+**manual RHEL 9 validation** of the GUI, S3 operations, and package behavior on a subscribed desktop.
+The release workflow enforces an exact `VERSION-PACKAGE_RELEASE` marker (for example, `1.0.0-2`)
+recorded only after that validation. A tag such as `v1.0.0-2` publishes packaging revision 2 for
+application version `1.0.0`; use this suffix for packaging-only fixes without changing the app version.
+The app targets X11 directly and uses XWayland in a Wayland session. On a minimal install, add
+`fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-cjk-fonts` (RPM family) if CJK text is needed.
+
+### APT (Debian / Ubuntu)
+
+Install `wget`, `gpg`, and CA certificates, then run the complete block. It accepts the downloaded
+key only when it contains no secret key, exactly one primary public key, and the expected full
+fingerprint; only then does it install the local keyring and repository definition.
+
+```bash
+(
+set -eu
+sudo apt install -y ca-certificates wget gnupg
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" > "$tmpdir/key-info"
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr && $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+gpg --batch --dearmor --output "$tmpdir/object-storage-client.gpg" "$tmpdir/repository-key.asc"
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo install -m 0644 "$tmpdir/object-storage-client.gpg" /etc/apt/keyrings/object-storage-client.gpg
+printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/object-storage-client.gpg] https://devcode-kr.github.io/object-storage-client/apt stable main' | sudo tee /etc/apt/sources.list.d/object-storage-client.list > /dev/null
+sudo apt update
+sudo apt install object-storage-client
+)
+```
+
+### DNF (Fedora / Rocky / AlmaLinux / RHEL)
+
+```bash
+(
+set -eu
+sudo dnf install -y ca-certificates wget gnupg2
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+wget -O "$tmpdir/repository-key.asc" https://devcode-kr.github.io/object-storage-client/repository-key.asc
+gpg --batch --show-keys --with-colons "$tmpdir/repository-key.asc" > "$tmpdir/key-info"
+fingerprint=$(awk -F: '
+$1 == "sec" || $1 == "ssb" { secret++; want_fpr = 0 }
+$1 == "pub" { primary++; want_fpr = 1; next }
+$1 == "sub" { want_fpr = 0 }
+want_fpr && $1 == "fpr" { fingerprints++; fingerprint = $10; want_fpr = 0 }
+END {
+  if (secret != 0 || primary != 1 || fingerprints != 1) exit 1
+  print fingerprint
+}' "$tmpdir/key-info")
+test "$fingerprint" = "843B0BB9F1A4488C8C7B60133F8AC712C8C56B90"
+sudo install -d -m 0755 /etc/pki/rpm-gpg
+sudo install -m 0644 "$tmpdir/repository-key.asc" /etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client
+printf '%s\n' '[object-storage-client]
+name=Object Storage Client
+baseurl=https://devcode-kr.github.io/object-storage-client/rpm/stable/x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-object-storage-client' | sudo tee /etc/yum.repos.d/object-storage-client.repo > /dev/null
+sudo dnf install object-storage-client
+)
+```
+
+Where a package manager cannot be used, the latest release's `linux-x64.tar.gz` is a portable
+fallback. This tar.gz is unsigned and has checksum-only verification through `SHA256SUMS.txt`;
+run it from the extracted directory and install the required X11 libraries through the OS.
+
+### Updating
+
+The OS package manager owns updates. **The app does not update itself.** Let it update with the
+rest of the system, or run:
+
+```bash
+sudo apt update && sudo apt upgrade
+sudo dnf upgrade
+```
 
 ## Building from source
 
@@ -225,12 +323,19 @@ the key never touches the disk, copying these files to another machine does not 
 
 ## Uninstalling
 
-There is no installer, so there is nothing to uninstall — delete the folder you extracted, and
-on macOS drag the app to the Trash. Nothing was written to the registry, no service was
-installed, and no system configuration was changed.
+Remove only the native Linux package with the package manager used to install it. Saved sites and
+settings remain in place.
 
-Your saved sites and settings live outside that folder and are left behind on purpose, so that
-reinstalling does not lose them. Delete the directory yourself if you want them gone:
+```bash
+sudo apt remove object-storage-client
+sudo dnf remove object-storage-client
+```
+
+On macOS, drag the app to the Trash; for the portable tar.gz, delete its extracted directory.
+There is no registry entry, service, or separate system configuration.
+
+Deleting user data is a **separate, optional action** from removing the package. Run this only when
+the saved connections and settings are no longer wanted; it cannot be undone:
 
 ```bash
 rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode\object-storage-client
@@ -238,9 +343,11 @@ rm -rf ~/.devcode/object-storage-client        # Windows: %USERPROFILE%\.devcode
 
 ## Code signing and privacy
 
-Windows is signed by the Store; macOS and Linux ship unsigned.
-[CODE_SIGNING_POLICY.en.md](CODE_SIGNING_POLICY.en.md) covers what that means per platform and
-what a signature vouches for.
+Microsoft signs the Windows Store package. On Linux, the project GPG key signs each RPM package and
+the APT/DNF repository metadata. A `.deb` is authenticated through APT's signed metadata and
+checksum chain; when downloading a standalone `.deb` from GitHub Releases, also verify
+`SHA256SUMS.txt` directly. macOS and the portable tar.gz remain unsigned with checksum-only verification.
+[CODE_SIGNING_POLICY.en.md](CODE_SIGNING_POLICY.en.md) explains what each mechanism vouches for.
 
 Nothing is collected — see the [privacy policy](PRIVACY.en.md).
 

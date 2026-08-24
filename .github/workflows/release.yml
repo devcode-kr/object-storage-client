@@ -11,16 +11,20 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
     name: Check version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      package_release: ${{ steps.version.outputs.package_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       # The tag and <Version> must agree, or the release would ship assemblies stamped with a
       # different version than the tag advertises.
@@ -33,15 +37,39 @@ jobs:
             echo "::error::No <Version> found in Directory.Build.props"
             exit 1
           fi
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME#v}"
-            if [ "$tag" != "$props" ]; then
-              echo "::error::Tag ${GITHUB_REF_NAME} does not match <Version>$props</Version>"
-              exit 1
-            fi
-          fi
-          echo "version=$props" >> "$GITHUB_OUTPUT"
-          echo "Version: $props"
+          python3 - "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$props" "$GITHUB_OUTPUT" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          from build.linux.package_contract import NativeVersion
+
+          RELEASE_TAG_PATTERN = re.compile(
+              r'^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-(?P<release>[0-9]+))?$'
+          )
+          ref_type, ref_name, props_version, output_path = sys.argv[1:]
+          version = props_version
+          package_release = 1
+          if ref_type == 'tag':
+              match = RELEASE_TAG_PATTERN.fullmatch(ref_name)
+              if match is None:
+                  raise SystemExit(f'invalid release tag: {ref_name!r}')
+              version = match.group('version')
+              package_release = int(match.group('release') or '1')
+          try:
+              native = NativeVersion.parse(version, package_release)
+          except (TypeError, ValueError) as error:
+              raise SystemExit(f'invalid native package version: {error}') from error
+          if native.application != props_version:
+              raise SystemExit(
+                  f'tag application version {native.application!r} does not match '
+                  f'Directory.Build.props version {props_version!r}'
+              )
+          with pathlib.Path(output_path).open('a', encoding='utf-8') as output:
+              output.write(f'version={native.application}\n')
+              output.write(f'package_release={native.package_release}\n')
+          print(f'Version: {native.application}; native package release: {native.package_release}')
+          PY
 
   # The headless tests exercise managed code only — no display, no X11 — so they run identically
   # everywhere. What they catch per-platform is the code that branches on the OS: file modes,
@@ -49,14 +77,17 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           global-json-file: global.json
 
@@ -67,6 +98,9 @@ jobs:
     name: Package ${{ matrix.rid }}
     needs: [verify, test]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -80,9 +114,9 @@ jobs:
           - os: macos-latest
             rid: osx-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           global-json-file: global.json
 
@@ -223,55 +257,203 @@ jobs:
       # Separate from the release assets: this goes to Partner Center by hand, not to the release.
       - name: Upload MSIX
         if: matrix.rid == 'win-x64' && vars.MSIX_IDENTITY_NAME != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: msix-store
           path: msix/*.msix
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: matrix.rid != 'win-x64'
         with:
           name: release-${{ matrix.rid }}
           path: artifacts/*
           if-no-files-found: error
 
-  release:
-    name: Publish release
-    needs: [verify, package]
-    if: github.ref_type == 'tag'
+  linux_packages:
+    name: Validate Linux packages
+    needs: verify
+    permissions:
+      contents: read
+    uses: ./.github/workflows/linux-packages.yml
+    with:
+      version: ${{ needs.verify.outputs.version }}
+      package_release: ${{ needs.verify.outputs.package_release }}
+
+  # One-time repository setup: create the rhel-9-manual-validation environment with a required reviewer.
+  # RHEL9_MANUAL_VALIDATION_VERSION is an environment variable, not a secret, and is
+  # manually updated to VERSION-PACKAGE_RELEASE only after real subscribed RHEL 9 GUI, S3,
+  # and native package validation (for example, 1.0.0-2).
+  # The tag-only guard leaves workflow_dispatch package-validation artifacts unblocked.
+  rhel_release_gate:
+    name: Confirm manual RHEL 9 validation
+    needs: verify
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    environment: rhel-9-manual-validation
     steps:
-      - uses: actions/checkout@v4
-
-      # release-* only: the MSIX is uploaded separately and belongs in Partner Center, not here.
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: downloaded
-
-      - name: Collect artifacts and checksums
+      - name: Require the exact manually validated release version
+        env:
+          VALIDATED_VERSION: ${{ vars.RHEL9_MANUAL_VALIDATION_VERSION }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          find downloaded -type f -exec mv {} artifacts/ \;
-          cd artifacts
-          sha256sum ObjectStorageClient-* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          [[ -n "$VALIDATED_VERSION" ]] || {
+            echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
+            exit 1
+          }
+          [[ "$VALIDATED_VERSION" == "${{ needs.verify.outputs.version }}-${{ needs.verify.outputs.package_release }}" ]] || {
+            echo "::error::RHEL 9 manual validation gate is not satisfied for this release."
+            exit 1
+          }
+
+  prepare_linux_repositories:
+    name: Prepare signed Linux repositories
+    needs: [verify, linux_packages, rhel_release_gate]
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-linux-repositories.yml
+    with:
+      mode: prepare
+      version: ${{ needs.verify.outputs.version }}
+      package_release: ${{ needs.verify.outputs.package_release }}
+      validation_artifact: linux-package-validation
+      candidate_artifact: linux-pages-candidate
+    secrets:
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+
+  release:
+    name: Publish release
+    needs: [verify, package, linux_packages, prepare_linux_repositories]
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # release-* only: the MSIX is uploaded separately and belongs in Partner Center, not here.
+      - name: Download platform release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: downloaded/platform
+
+      - name: Download signed Linux release packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release-packages
+          path: downloaded/linux-release-packages
+
+      - name: Verify and collect release artifacts
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE_RELEASE: ${{ needs.verify.outputs.package_release }}
+        run: |
+          set -euo pipefail
+          (
+            cd downloaded/linux-release-packages
+            sha256sum --check SHA256SUMS
+          )
+
+          mapfile -d '' sources < <(
+            find downloaded/platform -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0
+            find downloaded/linux-release-packages -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) -print0
+          )
+          declare -A source_by_basename=()
+          actual=()
+          for source in "${sources[@]}"; do
+            basename="$(basename "$source")"
+            if [[ -n "${source_by_basename[$basename]+present}" ]]; then
+              printf 'duplicate release asset basename: %s\n' "$basename" >&2
+              exit 1
+            fi
+            source_by_basename["$basename"]="$source"
+            actual+=("$basename")
+          done
+          expected=(
+            "ObjectStorageClient-${VERSION}-linux-x64.tar.gz"
+            "ObjectStorageClient-${VERSION}-osx-arm64.zip"
+            "ObjectStorageClient-${VERSION}-osx-x64.zip"
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+            "ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          )
+          mapfile -t actual_sorted < <(printf '%s\n' "${actual[@]}" | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${#actual_sorted[@]}" -ne "${#expected_sorted[@]}" ]] ||
+              ! diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${actual_sorted[@]}"); then
+            printf '%s\n' 'unexpected release asset set (missing or extra asset)' >&2
+            exit 1
+          fi
+
+          test ! -e artifacts
+          mkdir artifacts
+          for basename in "${expected_sorted[@]}"; do
+            source="${source_by_basename[$basename]}"
+            destination="artifacts/$basename"
+            test ! -e "$destination"
+            mv -n -- "$source" "$destination"
+            test ! -e "$source"
+            test -f "$destination"
+          done
+          (
+            cd artifacts
+            mapfile -d '' assets < <(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\0' | sort -z)
+            test "${#assets[@]}" -eq 5
+            sha256sum -- "${assets[@]}" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE_RELEASE: ${{ needs.verify.outputs.package_release }}
           STORE_URL: ${{ vars.STORE_URL }}
         run: |
           set -euo pipefail
-          # Until the listing is live there is no link to give, so say so rather than ship a dead one.
-          store="${STORE_URL:-아직 심사 중이다. 공개되면 이 자리에 링크가 들어간다.}"
-          sed -e "s/@VERSION@/$VERSION/g" -e "s|@STORE_URL@|$store|g" \
-            build/release-body.md > release-body.md
+          python3 - "$VERSION" "$PACKAGE_RELEASE" "${STORE_URL:-}" <<'PY'
+          import pathlib
+          import sys
+
+          version, package_release, store_url = sys.argv[1:]
+          template = pathlib.Path('build/release-body.md').read_text(encoding='utf-8')
+          rendered = (
+              template.replace('@VERSION@', version)
+              .replace('@PACKAGE_RELEASE@', package_release)
+              .replace('@STORE_URL_KO@', store_url or '아직 공개되지 않았다')
+              .replace('@STORE_URL_EN@', store_url or 'Not published yet')
+          )
+          if '@' in rendered:
+              raise SystemExit('release body contains an unresolved token')
+          pathlib.Path('release-body.md').write_text(rendered, encoding='utf-8')
+          PY
           gh release create "$GITHUB_REF_NAME" \
             --title "v$VERSION" \
             --notes-file release-body.md \
             --generate-notes \
             artifacts/*
+
+  publish_linux_repositories:
+    name: Publish signed Linux repositories
+    needs: [release, prepare_linux_repositories, verify]
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && needs.release.result == 'success'
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-linux-repositories.yml
+    with:
+      mode: publish
+      version: ${{ needs.verify.outputs.version }}
+      package_release: ${{ needs.verify.outputs.package_release }}
+      validation_artifact: linux-package-validation
+      candidate_artifact: linux-pages-candidate
+    secrets:
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}

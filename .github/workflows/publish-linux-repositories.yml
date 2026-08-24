@@ -1,0 +1,1017 @@
+name: Publish Linux repositories
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Publication phase (prepare or publish)
+        required: true
+        type: string
+      version:
+        description: Application version
+        required: true
+        type: string
+      package_release:
+        description: Native package release
+        required: true
+        type: string
+      validation_artifact:
+        description: Validated unsigned package artifact
+        required: false
+        type: string
+        default: linux-package-validation
+      candidate_artifact:
+        description: Complete signed Pages candidate
+        required: false
+        type: string
+        default: linux-pages-candidate
+    secrets:
+      LINUX_REPO_GPG_PRIVATE_KEY:
+        required: true
+      LINUX_REPO_GPG_PASSPHRASE:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PUBLIC_BASE_URL: https://devcode-kr.github.io/object-storage-client
+
+jobs:
+  prepare:
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && (inputs.mode == 'prepare' || (inputs.mode != 'prepare' && inputs.mode != 'publish'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Download validated native packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.validation_artifact }}
+          path: artifacts
+
+      - name: Validate publication request
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          [[ "$MODE" == prepare ]] || { printf '%s\n' 'mode must be prepare or publish' >&2; exit 1; }
+          python3 - "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import sys
+          from build.linux.package_contract import NativeVersion
+          try:
+              native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+          except (TypeError, ValueError) as error:
+              raise SystemExit(f'invalid native package version: {error}') from error
+          if native.application != sys.argv[1] or str(native.package_release) != sys.argv[2]:
+              raise SystemExit('native version normalization changed the requested values')
+          PY
+          if [[ "$GITHUB_REF" == "refs/tags/v${VERSION}" ]]; then
+            test "$PACKAGE_RELEASE" = 1
+          else
+            test "$GITHUB_REF" = "refs/tags/v${VERSION}-${PACKAGE_RELEASE}"
+          fi
+          test "$(git tag --points-at HEAD | grep -Fxc "$GITHUB_REF_NAME")" -eq 1
+
+      - name: Install signing and repository tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils rpm createrepo-c gnupg
+
+      - name: Prepare deployment signing material and retained Pages tree
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+          PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_root="$(mktemp -d)"
+          export GNUPGHOME="$signing_root/gnupg"
+          private_file="$signing_root/private.asc"
+          passphrase_file="$signing_root/passphrase"
+          cleanup() { rm -rf -- "$signing_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s' "$PRIVATE_KEY" > "$private_file"
+          printf '%s' "$PASSPHRASE" > "$passphrase_file"
+          chmod 0600 "$private_file" "$passphrase_file"
+          unset PRIVATE_KEY PASSPHRASE
+          gpg --batch --no-tty --pinentry-mode loopback --passphrase-file "$passphrase_file" --import "$private_file" >/dev/null 2>&1
+          mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="sec" { primary=1; next } primary && $1=="fpr" { print $10; primary=0 }')
+          test "${#fingerprints[@]}" -eq 1
+          fingerprint="${fingerprints[0]}"
+          [[ "$fingerprint" =~ ^[0-9A-F]{40}$ ]]
+          test "$fingerprint" = "$EXPECTED_FINGERPRINT"
+          python3 - "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          verify_public_key_fingerprint(
+              'build/linux/repository-key.asc', sys.argv[1], now=dt.datetime.now(dt.timezone.utc)
+          )
+          PY
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mkdir -p candidate/site candidate/release-packages
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git archive origin/gh-pages | tar -x -C candidate/site
+          fi
+          test -z "$(find candidate/site -type l -print -quit)"
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          deb="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test -f "$deb"
+          test -f "$rpm"
+          python3 build/linux/repository.py \
+            --site-dir candidate/site \
+            --deb "$deb" \
+            --rpm "$rpm" \
+            --public-key build/linux/repository-key.asc \
+            --expected-fingerprint "$EXPECTED_FINGERPRINT" \
+            --private-key "$private_file" \
+            --passphrase-file "$passphrase_file" \
+            --base-url https://devcode-kr.github.io/object-storage-client
+          touch candidate/site/.nojekyll
+          test -f candidate/site/.nojekyll
+          signed_deb="candidate/site/apt/pool/main/o/object-storage-client/$(basename "$deb")"
+          signed_rpm="candidate/site/rpm/stable/x86_64/$(basename "$rpm")"
+          test -f "$signed_deb"
+          test -f "$signed_rpm"
+          cp -- "$signed_deb" "$signed_rpm" candidate/release-packages/
+          (cd candidate/release-packages && sha256sum -- *.deb *.rpm > SHA256SUMS)
+
+      - name: Upload signed release packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-release-packages
+          path: candidate/release-packages
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload complete Pages candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: candidate/site
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
+
+  deployment_smoke:
+    name: Deployment smoke ${{ matrix.image }}
+    needs: prepare
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && inputs.mode == 'prepare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            slug: debian-12
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: ubuntu:22.04
+            slug: ubuntu-22-04
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: ubuntu:24.04
+            slug: ubuntu-24-04
+            kind: deb
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.deb
+          - image: fedora:44
+            slug: fedora-44
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: fedora:43
+            slug: fedora-43
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: rockylinux:9
+            slug: rockylinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+          - image: almalinux:9
+            slug: almalinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ inputs.version }}-${{ inputs.package_release }}-linux-x64.rpm
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Download complete Pages candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: artifacts/site
+
+      - name: Download deployment-signed release packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release-packages
+          path: artifacts/linux-smoke-packages
+
+      - name: Verify exact deployment-signed package artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          deb="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test "$(find artifacts/linux-smoke-packages -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-smoke-packages -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          test -f "artifacts/linux-smoke-packages/$deb"
+          test -f "artifacts/linux-smoke-packages/$rpm"
+          test -f artifacts/linux-smoke-packages/SHA256SUMS
+          (cd artifacts/linux-smoke-packages && sha256sum --check SHA256SUMS)
+          candidate_deb="artifacts/site/apt/pool/main/o/object-storage-client/$deb"
+          candidate_rpm="artifacts/site/rpm/stable/x86_64/$rpm"
+          test -s artifacts/site/repository-key.asc
+          test -f "$candidate_deb"
+          test -f "$candidate_rpm"
+          cmp -s -- "$candidate_deb" "artifacts/linux-smoke-packages/$deb"
+          cmp -s -- "$candidate_rpm" "artifacts/linux-smoke-packages/$rpm"
+
+      - name: Start isolated deployment repository and run package smoke test
+        env:
+          IMAGE: ${{ matrix.image }}
+          SLUG: ${{ matrix.slug }}
+          KIND: ${{ matrix.kind }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          network="osc-deployment-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-deployment-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-deployment-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          docker network create "$network"
+          docker run -d --name "$server" \
+            --network "$network" --network-alias repository \
+            -v "$PWD/artifacts/site:/srv:ro" \
+            python:3-alpine python3 -m http.server 8000 --directory /srv
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker run --rm --network "$network" python:3-alpine \
+              wget -q -O /dev/null http://repository:8000/repository-key.asc; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" -ne 1 ]]; then
+            mkdir -p artifacts/logs
+            docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+            printf '%s\n' 'Deployment repository HTTP server did not become ready' >&2
+            exit 1
+          fi
+          mkdir -p artifacts/logs
+          docker run --name "$target" --network "$network" \
+            -e REPOSITORY_URL=http://repository:8000 \
+            -v "$PWD:/workspace:ro" \
+            -v "$PWD/artifacts/linux-smoke-packages:/packages:ro" \
+            -v "$PWD/artifacts/site:/repository:ro" \
+            "$IMAGE" \
+            /workspace/build/linux/smoke-package.sh "$KIND" "/packages/$PACKAGE" "/repository" \
+            2>&1 | tee "artifacts/logs/smoke-${SLUG}.log"
+
+      - name: Clean up isolated deployment smoke resources
+        if: always()
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          network="osc-deployment-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-deployment-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-deployment-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          mkdir -p artifacts/logs
+          docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+          docker rm -f "$target" "$server" 2>/dev/null || true
+          docker network rm "$network" 2>/dev/null || true
+
+      - name: Upload deployment smoke logs
+        if: always() && hashFiles(format('artifacts/logs/*-{0}.log', matrix.slug)) != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-deployment-smoke-${{ matrix.slug }}
+          path: artifacts/logs/*-${{ matrix.slug }}.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && inputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: linux-repositories-publish-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Download complete Pages candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: candidate/site
+
+      - name: Download validated unsigned native packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.validation_artifact }}
+          path: artifacts
+
+      - name: Download prepared signed release packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release-packages
+          path: prepared/release-packages
+
+      - name: Install publication verification tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apt-utils createrepo-c gnupg rpm curl rsync
+
+      - name: Validate downloaded publication artifacts
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          [[ "$MODE" == publish ]] || { printf '%s\n' 'mode must be publish' >&2; exit 1; }
+          if [[ "$GITHUB_REF" == "refs/tags/v${VERSION}" ]]; then
+            test "$PACKAGE_RELEASE" = 1
+          else
+            test "$GITHUB_REF" = "refs/tags/v${VERSION}-${PACKAGE_RELEASE}"
+          fi
+          python3 - "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import sys
+          from build.linux.package_contract import NativeVersion
+          native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+          if native.application != sys.argv[1] or str(native.package_release) != sys.argv[2]:
+              raise SystemExit('native version normalization changed the requested values')
+          PY
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          test "$(find prepared/release-packages -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find prepared/release-packages -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          (cd prepared/release-packages && sha256sum --check SHA256SUMS)
+          python3 - "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          now = dt.datetime.now(dt.timezone.utc)
+          for key in ('build/linux/repository-key.asc', 'candidate/site/repository-key.asc'):
+              verify_public_key_fingerprint(key, sys.argv[1], now=now)
+          PY
+          candidate_home="$(mktemp -d)"
+          cleanup() { rm -rf -- "$candidate_home"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$candidate_home"
+          GNUPGHOME="$candidate_home" gpg --batch --import candidate/site/repository-key.asc >/dev/null 2>&1
+          verify_candidate_signature() {
+            local status_file="$1"
+            shift
+            GNUPGHOME="$candidate_home" gpg --batch --status-fd 1 --verify "$@" >"$status_file" 2>&1
+            python3 - "$status_file" "$EXPECTED_FINGERPRINT" <<'PY'
+          import pathlib
+          import sys
+          from build.linux.repository import _validsig_primary_fingerprints
+          status = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          if sys.argv[2] not in _validsig_primary_fingerprints(status):
+              raise SystemExit('candidate signature did not produce VALIDSIG for the expected primary fingerprint')
+          PY
+          }
+          verify_candidate_signature "$candidate_home/InRelease.status" candidate/site/apt/dists/stable/InRelease
+          verify_candidate_signature "$candidate_home/Release.status" candidate/site/apt/dists/stable/Release.gpg candidate/site/apt/dists/stable/Release
+          verify_candidate_signature "$candidate_home/repomd.status" candidate/site/rpm/stable/x86_64/repodata/repomd.xml.asc candidate/site/rpm/stable/x86_64/repodata/repomd.xml
+          candidate_deb="candidate/site/apt/pool/main/o/object-storage-client/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          candidate_rpm="candidate/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          cmp -s -- "$candidate_deb" "prepared/release-packages/$(basename "$candidate_deb")"
+          cmp -s -- "$candidate_rpm" "prepared/release-packages/$(basename "$candidate_rpm")"
+          test -f candidate/site/.nojekyll
+
+      - name: Verify Pages is preconfigured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pages_config="$(mktemp)"
+          cleanup() { rm -f -- "$pages_config"; }
+          trap cleanup EXIT
+          if ! gh api "repos/${REPOSITORY}/pages" >"$pages_config" 2>/dev/null; then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: set Build and deployment Source to GitHub Actions and confirm the expected public URL.' >&2
+            exit 1
+          fi
+          if ! python3 - "$pages_config" "$PUBLIC_BASE_URL" 2>/dev/null <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              config = json.load(stream)
+          actual_url = str(config.get('html_url') or '').rstrip('/')
+          expected_url = sys.argv[2].rstrip('/')
+          if config.get('build_type') != 'workflow' or actual_url != expected_url:
+              raise SystemExit(1)
+          PY
+          then
+            printf '%s\n' 'GitHub Pages one-time preconfiguration required: set Build and deployment Source to GitHub Actions and confirm the expected public URL.' >&2
+            exit 1
+          fi
+
+      - name: Regenerate signed repository from latest history
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+          PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -rf deployment rollback
+          mkdir -p deployment/site rollback/site
+          remote_line="$(git ls-remote --heads origin gh-pages)"
+          if [[ -n "$remote_line" ]]; then
+            git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            git archive origin/gh-pages | tar -x -C rollback/site
+          else
+            touch rollback/site/.nojekyll
+          fi
+          test -z "$(find rollback/site -type l -print -quit)"
+          rsync -a --delete rollback/site/ deployment/site/
+          test -z "$(find deployment/site -type l -print -quit)"
+          deb="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          prepared_deb="prepared/release-packages/$(basename "$deb")"
+          prepared_rpm="prepared/release-packages/$(basename "$rpm")"
+          test -f "$deb"; test -f "$rpm"; test -f "$prepared_deb"; test -f "$prepared_rpm"
+
+          signing_root="$(mktemp -d)"
+          public_home="$(mktemp -d)"
+          rpm_root="$(mktemp -d)"
+          private_file="$signing_root/private.asc"
+          passphrase_file="$signing_root/passphrase"
+          cleanup() { rm -rf -- "$signing_root" "$public_home" "$rpm_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$signing_root/gnupg" "$public_home"
+          export GNUPGHOME="$signing_root/gnupg"
+          printf '%s' "$PRIVATE_KEY" > "$private_file"
+          printf '%s' "$PASSPHRASE" > "$passphrase_file"
+          chmod 0600 "$private_file" "$passphrase_file"
+          unset PRIVATE_KEY PASSPHRASE
+          gpg --batch --no-tty --pinentry-mode loopback --passphrase-file "$passphrase_file" --import "$private_file" >/dev/null 2>&1
+          mapfile -t fingerprints < <(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="sec" { primary=1; next } primary && $1=="fpr" { print $10; primary=0 }')
+          test "${#fingerprints[@]}" -eq 1
+          test "${fingerprints[0]}" = "$EXPECTED_FINGERPRINT"
+          python3 build/linux/repository.py \
+            --site-dir deployment/site \
+            --deb "$deb" \
+            --rpm "$rpm" \
+            --public-key build/linux/repository-key.asc \
+            --expected-fingerprint "$EXPECTED_FINGERPRINT" \
+            --private-key "$private_file" \
+            --passphrase-file "$passphrase_file" \
+            --base-url https://devcode-kr.github.io/object-storage-client
+          touch deployment/site/.nojekyll
+          test -f deployment/site/.nojekyll
+
+          deployed_deb="deployment/site/apt/pool/main/o/object-storage-client/$(basename "$deb")"
+          deployed_rpm="deployment/site/rpm/stable/x86_64/$(basename "$rpm")"
+          cmp -s -- "$deployed_deb" "$prepared_deb"
+          cmp -s -- "$deployed_rpm" "$prepared_rpm"
+          test "$(sha256sum "$deployed_deb" | cut -d' ' -f1)" = "$(sha256sum "$prepared_deb" | cut -d' ' -f1)"
+          test "$(sha256sum "$deployed_rpm" | cut -d' ' -f1)" = "$(sha256sum "$prepared_rpm" | cut -d' ' -f1)"
+          python3 - "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          verify_public_key_fingerprint('deployment/site/repository-key.asc', sys.argv[1], now=dt.datetime.now(dt.timezone.utc))
+          PY
+          GNUPGHOME="$public_home" gpg --batch --import deployment/site/repository-key.asc >/dev/null 2>&1
+          verify_primary_signature() {
+            local status_file="$1"
+            shift
+            GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$@" >"$status_file" 2>&1
+            python3 - "$status_file" "$EXPECTED_FINGERPRINT" <<'PY'
+          import pathlib
+          import sys
+          from build.linux.repository import _validsig_primary_fingerprints
+          status = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          if sys.argv[2] not in _validsig_primary_fingerprints(status):
+              raise SystemExit('signature did not produce VALIDSIG for the expected primary fingerprint')
+          PY
+          }
+          verify_primary_signature "$signing_root/InRelease.status" deployment/site/apt/dists/stable/InRelease
+          verify_primary_signature "$signing_root/Release.status" deployment/site/apt/dists/stable/Release.gpg deployment/site/apt/dists/stable/Release
+          verify_primary_signature "$signing_root/repomd.status" deployment/site/rpm/stable/x86_64/repodata/repomd.xml.asc deployment/site/rpm/stable/x86_64/repodata/repomd.xml
+          install -d -m 0700 "$rpm_root/rpmdb"
+          rpm --dbpath "$rpm_root/rpmdb" --initdb
+          rpm --dbpath "$rpm_root/rpmdb" --import deployment/site/repository-key.asc
+          mapfile -t rpms < <(find deployment/site/rpm/stable/x86_64 -maxdepth 1 -type f -name '*.rpm' -print)
+          test "${#rpms[@]}" -ge 1
+          checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${rpms[@]}")"
+          test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#rpms[@]}"
+
+      - name: Validate current RPM identity
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          current="deployment/site/rpm/stable/x86_64/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          test -f "$current"
+          identity="$(rpm -qp --qf '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n' "$current")"
+          python3 - "$identity" "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import re
+          import sys
+
+          identity, expected_version, package_release = sys.argv[1:]
+          fields = identity.split('\t')
+          if len(fields) != 4:
+              raise SystemExit('current RPM identity query returned malformed output')
+          name, version, release, arch = fields
+          RPM_RELEASE_WITH_DIST = re.compile(
+              rf'^{re.escape(package_release)}(?:\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)?$'
+          )
+          if name != 'object-storage-client' or version != expected_version or arch != 'x86_64':
+              raise SystemExit('current RPM name, version, or architecture is unexpected')
+          if RPM_RELEASE_WITH_DIST.fullmatch(release) is None:
+              raise SystemExit('current RPM release is not the requested package release with an optional safe dist suffix')
+          PY
+
+      - name: Upload current Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
+        with:
+          name: github-pages
+          path: deployment/site
+
+      - name: Upload rollback Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
+        with:
+          name: github-pages-rollback
+          path: rollback/site
+
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+
+      - name: Verify deployed Pages URL
+        env:
+          DEPLOYED_PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          python3 - "$DEPLOYED_PAGE_URL" "$PUBLIC_BASE_URL" <<'PY'
+          import sys
+          actual = sys.argv[1].rstrip('/')
+          expected = sys.argv[2].rstrip('/')
+          if actual != expected:
+              raise SystemExit(f'deployed Pages URL mismatch: {actual!r} != {expected!r}')
+          PY
+
+      - name: Read back and cryptographically verify every public repository object
+        id: readback
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+          EXPECTED_FINGERPRINT: ${{ vars.LINUX_REPO_GPG_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          verify_root="$(mktemp -d)"
+          public_home="$verify_root/gnupg"
+          rpm_root="$verify_root/rpm-state"
+          cleanup() { rm -rf -- "$verify_root"; }
+          trap cleanup EXIT
+          install -d -m 0700 "$public_home" "$rpm_root/rpmdb"
+          install -d -m 0755 "$verify_root/apt" "$verify_root/rpm" "$verify_root/public"
+
+          fetch() {
+            curl --fail --silent --show-error --location \
+              --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 60 \
+              --output "$2" "${PUBLIC_BASE_URL}/$1"
+          }
+          digest_file() {
+            case "$1" in
+              md5) md5sum -- "$2" | cut -d' ' -f1 ;;
+              sha1) sha1sum -- "$2" | cut -d' ' -f1 ;;
+              sha256) sha256sum -- "$2" | cut -d' ' -f1 ;;
+              sha512) sha512sum -- "$2" | cut -d' ' -f1 ;;
+              *) printf '%s\n' 'Unsupported repository digest algorithm.' >&2; return 1 ;;
+            esac
+          }
+
+          deployment_inrelease_hash="$(sha256sum deployment/site/apt/dists/stable/InRelease | cut -d' ' -f1)"
+          deployment_repomd_hash="$(sha256sum deployment/site/rpm/stable/x86_64/repodata/repomd.xml | cut -d' ' -f1)"
+          readiness_deadline=$((SECONDS + 600))
+          metadata_coherent=0
+          while (( SECONDS < readiness_deadline )); do
+            public_inrelease_hash=''
+            public_repomd_hash=''
+            apt_downloaded=0
+            rpm_downloaded=0
+            if curl --fail --silent --show-error --location \
+                --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 20 \
+                --output "$verify_root/readiness-InRelease" "${PUBLIC_BASE_URL}/apt/dists/stable/InRelease"; then
+              apt_downloaded=1
+            fi
+            if curl --fail --silent --show-error --location \
+                --connect-timeout 5 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 20 \
+                --output "$verify_root/readiness-repomd.xml" "${PUBLIC_BASE_URL}/rpm/stable/x86_64/repodata/repomd.xml"; then
+              rpm_downloaded=1
+            fi
+            if [[ "$apt_downloaded" -eq 1 && "$rpm_downloaded" -eq 1 ]]; then
+              public_inrelease_hash="$(sha256sum "$verify_root/readiness-InRelease" | cut -d' ' -f1)"
+              public_repomd_hash="$(sha256sum "$verify_root/readiness-repomd.xml" | cut -d' ' -f1)"
+            fi
+            rm -f -- "$verify_root/readiness-InRelease" "$verify_root/readiness-repomd.xml"
+            if [[ "$public_inrelease_hash" == "$deployment_inrelease_hash" && "$public_repomd_hash" == "$deployment_repomd_hash" ]]; then
+              metadata_coherent=1
+              break
+            fi
+            # --fail plus --retry-all-errors retries transient failures, including HTTP 404.
+            sleep 10
+          done
+          if [[ "$metadata_coherent" -ne 1 ]]; then
+            printf '%s\n' 'Timed out waiting for coherent public APT and RPM metadata.' >&2
+            exit 1
+          fi
+
+          fetch repository-key.asc "$verify_root/repository-key.asc"
+          fetch apt/dists/stable/Release "$verify_root/apt/Release"
+          fetch apt/dists/stable/InRelease "$verify_root/apt/InRelease"
+          fetch apt/dists/stable/Release.gpg "$verify_root/apt/Release.gpg"
+          fetch apt/dists/stable/main/binary-amd64/Packages "$verify_root/apt/Packages"
+          fetch apt/dists/stable/main/binary-amd64/Packages.gz "$verify_root/apt/Packages.gz"
+          fetch rpm/stable/x86_64/repodata/repomd.xml "$verify_root/rpm/repomd.xml"
+          fetch rpm/stable/x86_64/repodata/repomd.xml.asc "$verify_root/rpm/repomd.xml.asc"
+
+          python3 - "$verify_root/repository-key.asc" "$EXPECTED_FINGERPRINT" <<'PY'
+          import datetime as dt
+          import sys
+          from build.linux.repository import verify_public_key_fingerprint
+          verify_public_key_fingerprint(sys.argv[1], sys.argv[2], now=dt.datetime.now(dt.timezone.utc))
+          PY
+          GNUPGHOME="$public_home" gpg --batch --import "$verify_root/repository-key.asc" >/dev/null 2>&1
+          verify_primary_signature() {
+            local status_file="$1"
+            shift
+            GNUPGHOME="$public_home" gpg --batch --status-fd 1 --verify "$@" >"$status_file" 2>&1
+            python3 - "$status_file" "$EXPECTED_FINGERPRINT" <<'PY'
+          import pathlib
+          import sys
+          from build.linux.repository import _validsig_primary_fingerprints
+          status = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          if sys.argv[2] not in _validsig_primary_fingerprints(status):
+              raise SystemExit('public signature did not produce VALIDSIG for the expected primary fingerprint')
+          PY
+          }
+          verify_primary_signature "$verify_root/InRelease.status" "$verify_root/apt/InRelease"
+          verify_primary_signature "$verify_root/Release.status" "$verify_root/apt/Release.gpg" "$verify_root/apt/Release"
+          verify_primary_signature "$verify_root/repomd.status" "$verify_root/rpm/repomd.xml.asc" "$verify_root/rpm/repomd.xml"
+
+          python3 - "$verify_root/apt/Packages" "$verify_root/apt/Packages.gz" "$verify_root/apt/Release" "$verify_root/apt-packages-manifest.tsv" "$VERSION-$PACKAGE_RELEASE" <<'PY'
+          import gzip
+          import hashlib
+          import pathlib
+          import re
+          import sys
+
+          packages_path, compressed_path, release_path, manifest_path = map(pathlib.Path, sys.argv[1:5])
+          packages_bytes = packages_path.read_bytes()
+          if gzip.decompress(compressed_path.read_bytes()) != packages_bytes:
+              raise SystemExit('public Packages.gz does not decompress to public Packages')
+
+          release_lines = release_path.read_text(encoding='utf-8').splitlines()
+          release_hashes = {}
+          algorithm = None
+          algorithms = {'MD5Sum': 'md5', 'SHA1': 'sha1', 'SHA256': 'sha256', 'SHA512': 'sha512'}
+          for line in release_lines:
+              if line.endswith(':') and line[:-1] in algorithms:
+                  algorithm = algorithms[line[:-1]]
+              elif line and not line[0].isspace():
+                  algorithm = None
+              elif algorithm and len(parts := line.split()) == 3:
+                  digest, size, relative = parts
+                  if relative in ('main/binary-amd64/Packages', 'main/binary-amd64/Packages.gz'):
+                      release_hashes.setdefault(relative, {})[algorithm] = (digest.lower(), int(size))
+          for relative, path in (
+              ('main/binary-amd64/Packages', packages_path),
+              ('main/binary-amd64/Packages.gz', compressed_path),
+          ):
+              entries = release_hashes.get(relative, {})
+              if 'sha256' not in entries:
+                  raise SystemExit(f'signed Release lacks SHA256 for {relative}')
+              data = path.read_bytes()
+              for name, (expected, size) in entries.items():
+                  if len(data) != size or hashlib.new(name, data).hexdigest() != expected:
+                      raise SystemExit(f'signed Release mismatch for {relative}')
+
+          stanzas = []
+          current = {}
+          for line in packages_bytes.decode('utf-8').splitlines():
+              if not line:
+                  if current:
+                      stanzas.append(current)
+                      current = {}
+                  continue
+              if line[0].isspace():
+                  continue
+              if ':' not in line:
+                  raise SystemExit('malformed public Packages field')
+              key, value = line.split(':', 1)
+              if key in current:
+                  raise SystemExit('duplicate public Packages field')
+              current[key] = value.strip()
+          if current:
+              stanzas.append(current)
+          if not stanzas:
+              raise SystemExit('public Packages contains no stanzas')
+
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          hash_fields = {'MD5sum': ('md5', 32), 'SHA1': ('sha1', 40), 'SHA256': ('sha256', 64), 'SHA512': ('sha512', 128)}
+          seen = set()
+          rows = []
+          current_apt_found = False
+          for stanza in stanzas:
+              required = ('Package', 'Architecture', 'Version', 'Filename', 'Size', 'SHA256')
+              if any(not stanza.get(field) for field in required):
+                  raise SystemExit('public Packages stanza lacks a required field')
+              if stanza['Package'] != 'object-storage-client' or stanza['Architecture'] != 'amd64':
+                  raise SystemExit('public Packages contains an unexpected package or architecture')
+              relative = stanza['Filename']
+              pure = pathlib.PurePosixPath(relative)
+              if (pure.is_absolute() or pure.as_posix() != relative or len(pure.parts) < 2
+                      or pure.parts[0] != 'pool' or any(part in ('', '.', '..') or not safe_component.fullmatch(part) for part in pure.parts)
+                      or pure.suffix != '.deb'):
+                  raise SystemExit('public Packages contains an unsafe Filename')
+              if relative in seen:
+                  raise SystemExit('public Packages contains a duplicate Filename')
+              seen.add(relative)
+              try:
+                  size = int(stanza['Size'])
+              except ValueError as error:
+                  raise SystemExit('public Packages contains an invalid Size') from error
+              if size < 0:
+                  raise SystemExit('public Packages contains an invalid Size')
+              hashes = {}
+              for field, (name, length) in hash_fields.items():
+                  value = stanza.get(field, '').lower()
+                  if value and not re.fullmatch(f'[0-9a-f]{{{length}}}', value):
+                      raise SystemExit(f'public Packages contains an invalid {field}')
+                  hashes[name] = value or '-'
+              if stanza['Version'] == sys.argv[5]:
+                  current_apt_found = True
+              public_relative = 'apt/' + relative
+              rows.append((public_relative, str(size), hashes['sha256'], hashes['md5'], hashes['sha1'], hashes['sha512']))
+          if not current_apt_found:
+              raise SystemExit('public Packages does not contain the current package version')
+          manifest_path.write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          while IFS=$'\t' read -r relative size sha256 md5 sha1 sha512; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(stat -c %s "$destination")" -eq "$size"
+            test "$(digest_file sha256 "$destination")" = "$sha256"
+            for pair in "md5:$md5" "sha1:$sha1" "sha512:$sha512"; do
+              algorithm="${pair%%:*}"
+              expected="${pair#*:}"
+              [[ "$expected" == - ]] || test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            done
+            cmp -s -- "deployment/site/$relative" "$destination"
+          done < "$verify_root/apt-packages-manifest.tsv"
+
+          python3 - "$verify_root/rpm/repomd.xml" "$verify_root/repodata-manifest.tsv" <<'PY'
+          import pathlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          repomd_path, manifest_path = map(pathlib.Path, sys.argv[1:3])
+          root = ET.parse(repomd_path).getroot()
+          supported = {'md5': 32, 'sha': 40, 'sha1': 40, 'sha256': 64, 'sha512': 128}
+          normalized = {'sha': 'sha1'}
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          kinds = set()
+          locations = set()
+          rows = []
+          for data in root.findall('{*}data'):
+              kind = data.get('type') or ''
+              location = data.find('{*}location')
+              checksum = data.find('{*}checksum')
+              if (not safe_component.fullmatch(kind) or kind in kinds
+                      or location is None or checksum is None):
+                  raise SystemExit('public repomd.xml contains incomplete or duplicate metadata')
+              kinds.add(kind)
+              relative = location.get('href') or ''
+              pure = pathlib.PurePosixPath(relative)
+              if (pure.is_absolute() or pure.as_posix() != relative or len(pure.parts) != 2
+                      or pure.parts[0] != 'repodata' or not safe_component.fullmatch(pure.parts[1])):
+                  raise SystemExit('public repomd.xml contains an unsafe metadata location')
+              if relative in locations:
+                  raise SystemExit('public repomd.xml contains a duplicate metadata location')
+              locations.add(relative)
+              declared = (checksum.get('type') or '').lower()
+              if declared not in supported:
+                  raise SystemExit('public repomd.xml uses an unsupported checksum type')
+              value = (checksum.text or '').strip().lower()
+              if not re.fullmatch(f'[0-9a-f]{{{supported[declared]}}}', value):
+                  raise SystemExit('public repomd.xml contains an invalid checksum value')
+              rows.append((kind, 'rpm/stable/x86_64/' + relative, normalized.get(declared, declared), value))
+          if not {'primary', 'filelists', 'other'}.issubset(kinds):
+              raise SystemExit('public repomd.xml lacks primary, filelists, or other metadata')
+          manifest_path.write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          primary_file=''
+          while IFS=$'\t' read -r kind relative algorithm expected; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            cmp -s -- "deployment/site/$relative" "$destination"
+            if [[ "$kind" == primary ]]; then
+              primary_file="$destination"
+            fi
+          done < "$verify_root/repodata-manifest.tsv"
+          test -n "$primary_file"
+
+          python3 - "$primary_file" "$verify_root/rpm-packages-manifest.tsv" "$VERSION" "$PACKAGE_RELEASE" <<'PY'
+          import gzip
+          import pathlib
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          primary_path = pathlib.Path(sys.argv[1])
+          payload = primary_path.read_bytes()
+          if primary_path.suffix == '.gz':
+              payload = gzip.decompress(payload)
+          elif primary_path.suffix != '.xml':
+              raise SystemExit('public primary metadata uses unsupported compression')
+          root = ET.fromstring(payload)
+          supported = {'md5': 32, 'sha': 40, 'sha1': 40, 'sha256': 64, 'sha512': 128}
+          normalized = {'sha': 'sha1'}
+          safe_component = re.compile(r'^[A-Za-z0-9._+-]+$')
+          RPM_RELEASE_WITH_DIST = re.compile(
+              rf'^{re.escape(sys.argv[4])}(?:\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)?$'
+          )
+          seen = set()
+          rows = []
+          current_rpm_found = False
+          packages = root.findall('{*}package')
+          if not packages:
+              raise SystemExit('public primary metadata contains no packages')
+          for package in packages:
+              name = package.findtext('{*}name') or ''
+              arch = package.findtext('{*}arch') or ''
+              version = package.find('{*}version')
+              location = package.find('{*}location')
+              checksum = package.find('{*}checksum')
+              size_node = package.find('{*}size')
+              if name != 'object-storage-client' or arch != 'x86_64':
+                  raise SystemExit('public primary metadata contains an unexpected package or architecture')
+              if version is None or location is None or checksum is None or size_node is None:
+                  raise SystemExit('public primary metadata contains an incomplete package')
+              href = location.get('href') or ''
+              pure = pathlib.PurePosixPath(href)
+              if (pure.is_absolute() or pure.as_posix() != href or len(pure.parts) != 1
+                      or not safe_component.fullmatch(pure.parts[0]) or pure.suffix != '.rpm'):
+                  raise SystemExit('public primary metadata contains an unsafe package location')
+              relative = 'rpm/stable/x86_64/' + href
+              if relative in seen:
+                  raise SystemExit('public primary metadata contains a duplicate package location')
+              seen.add(relative)
+              declared = (checksum.get('type') or '').lower()
+              if declared not in supported:
+                  raise SystemExit('public primary metadata uses an unsupported checksum type')
+              expected = (checksum.text or '').strip().lower()
+              if not re.fullmatch(f'[0-9a-f]{{{supported[declared]}}}', expected):
+                  raise SystemExit('public primary metadata contains an invalid package checksum')
+              try:
+                  size = int(size_node.get('package') or '')
+              except ValueError as error:
+                  raise SystemExit('public primary metadata contains an invalid package size') from error
+              if size < 0:
+                  raise SystemExit('public primary metadata contains an invalid package size')
+              if (version.get('ver') == sys.argv[3]
+                      and RPM_RELEASE_WITH_DIST.fullmatch(version.get('rel') or '') is not None):
+                  current_rpm_found = True
+              rows.append((relative, str(size), normalized.get(declared, declared), expected))
+          if not current_rpm_found:
+              raise SystemExit('public primary metadata does not contain the current package version')
+          pathlib.Path(sys.argv[2]).write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='utf-8')
+          PY
+
+          fetched_rpms=()
+          while IFS=$'\t' read -r relative size algorithm expected; do
+            destination="$verify_root/public/$relative"
+            mkdir -p -- "$(dirname "$destination")"
+            fetch "$relative" "$destination"
+            test "$(stat -c %s "$destination")" -eq "$size"
+            test "$(digest_file "$algorithm" "$destination")" = "$expected"
+            cmp -s -- "deployment/site/$relative" "$destination"
+            fetched_rpms+=("$destination")
+          done < "$verify_root/rpm-packages-manifest.tsv"
+          test "${#fetched_rpms[@]}" -ge 1
+          rpm --dbpath "$rpm_root/rpmdb" --initdb
+          rpm --dbpath "$rpm_root/rpmdb" --import "$verify_root/repository-key.asc"
+          checks="$(rpm --dbpath "$rpm_root/rpmdb" --checksig "${fetched_rpms[@]}")"
+          test "$(printf '%s\n' "$checks" | grep -Ec ': digests signatures OK$')" -eq "${#fetched_rpms[@]}"
+
+      - name: Record verified Pages tree in gh-pages history
+        id: audit_history
+        if: steps.readback.outcome == 'success'
+        continue-on-error: true
+        env:
+          VERSION: ${{ inputs.version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          git worktree prune
+          for attempt in $(seq 1 5); do
+            git worktree remove --force pages 2>/dev/null || rm -rf pages
+            remote_line="$(git ls-remote --heads origin gh-pages)"
+            remote_sha="${remote_line%%[[:space:]]*}"
+            if [[ -n "$remote_sha" ]]; then
+              git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+              git worktree add --detach pages origin/gh-pages
+            else
+              git update-ref -d refs/remotes/origin/gh-pages
+              git worktree add --detach pages HEAD
+              (cd pages && git checkout --orphan gh-pages && git rm -rf .)
+            fi
+            rsync -a --delete --exclude .git deployment/site/ pages/
+            test -f pages/.nojekyll
+            git -C pages config user.name github-actions[bot]
+            git -C pages config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git -C pages add --all
+            if git -C pages diff --cached --quiet; then
+              printf '%s\n' 'Package history already records this deployment; no commit required'
+            else
+              git -C pages commit -m "Publish Linux packages ${VERSION}-${PACKAGE_RELEASE}"
+            fi
+            local_sha="$(git -C pages rev-parse HEAD)"
+            if [[ "$remote_sha" == "$local_sha" ]]; then
+              exit 0
+            fi
+            if (cd pages && git push origin HEAD:gh-pages); then
+              printf 'Pages history push attempt %s was accepted; verifying remote SHA.\n' "$attempt"
+            else
+              printf 'Pages history push attempt %s returned an error; verifying remote SHA before retrying.\n' "$attempt" >&2
+            fi
+            verification_line="$(git ls-remote --heads origin gh-pages)"
+            if [[ -n "$verification_line" ]]; then
+              git fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            fi
+            remote_sha="$(git ls-remote --heads origin gh-pages | awk 'NR == 1 { print $1 }')"
+            if [[ "$remote_sha" == "$local_sha" ]]; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 5 ]]; then
+              sleep $((attempt * 2))
+            fi
+          done
+          printf '%s\n' 'Failed to record the verified Pages tree after 5 non-force attempts.' >&2
+          exit 1
+
+      - name: Roll back failed Pages publication
+        id: rollback_deployment
+        if: always() && steps.deployment.outcome == 'success' && (failure() || cancelled() || steps.audit_history.outcome == 'failure')
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+        with:
+          artifact_name: github-pages-rollback
+
+      - name: Fail publication when Pages history audit failed
+        if: always() && steps.audit_history.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'The Pages tree was rolled back because its verified history could not be recorded.' >&2
+          exit 1

@@ -1,0 +1,351 @@
+name: Linux package validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Application version override
+        required: false
+        type: string
+        default: ''
+      package_release:
+        description: Native package release
+        required: false
+        type: string
+        default: '1'
+  workflow_call:
+    inputs:
+      version:
+        description: Application version override
+        required: false
+        type: string
+        default: ''
+      package_release:
+        description: Native package release
+        required: false
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux validation packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package_release: ${{ steps.version.outputs.package_release }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          global-json-file: global.json
+
+      - name: Resolve and validate native version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PACKAGE_RELEASE: ${{ inputs.package_release }}
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          package_release="${REQUESTED_PACKAGE_RELEASE:-1}"
+          if [[ ! "$package_release" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' '::error::Package release must be a decimal integer from 1 through 65535'
+            exit 1
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(python3 - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(pathlib.Path('Directory.Build.props')).getroot()
+          versions = [node.text.strip() for node in root.iter('Version') if node.text and node.text.strip()]
+          if len(versions) != 1:
+              raise SystemExit('Directory.Build.props must contain exactly one non-empty Version')
+          print(versions[0])
+          PY
+          )"
+          fi
+          package_release="$(python3 - "$version" "$package_release" <<'PY'
+          import sys
+          from build.linux.package_contract import NativeVersion
+
+          try:
+              native = NativeVersion.parse(sys.argv[1], int(sys.argv[2]))
+          except ValueError as error:
+              raise SystemExit(f'invalid native package version: {error}') from error
+          print(native.package_release)
+          PY
+          )"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'package_release=%s\n' "$package_release" >> "$GITHUB_OUTPUT"
+          printf 'Validated Linux package version %s-%s\n' "$version" "$package_release"
+
+      - name: Test managed code
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/logs
+          dotnet test ObjectStorageClient.sln --configuration Release --nologo \
+            2>&1 | tee artifacts/logs/managed-tests.log
+
+      - name: Test all Linux packaging code
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/logs
+          python3 -m unittest discover -s build/linux/tests -p 'test_*.py' 2>&1 | tee artifacts/logs/linux-contract-tests.log
+
+      - name: Upload failed test logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-test-failure-logs
+          path: |
+            artifacts/logs/managed-tests.log
+            artifacts/logs/linux-contract-tests.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish Linux application once
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/publish
+          dotnet publish src/ObjectStorageClient.App \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained true \
+            --output artifacts/publish/linux-x64 \
+            -p:Version="$VERSION" \
+            --nologo
+
+      - name: Install repository validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            apt-utils rpm createrepo-c gnupg
+          command -v dpkg-scanpackages
+          command -v rpmsign
+          command -v createrepo_c
+          command -v gpg
+
+      - name: Build unsigned native packages in baseline containers
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_RELEASE: ${{ steps.version.outputs.package_release }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/linux-native artifacts/logs
+          docker run --rm \
+            -e VERSION -e PACKAGE_RELEASE \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            debian:12 \
+            bash -c 'set -euo pipefail; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y python3 dpkg-dev; python3 build/linux/package_deb.py --version "$VERSION" --release "$PACKAGE_RELEASE" --publish-dir artifacts/publish/linux-x64 --output-dir artifacts/linux-native' \
+            2>&1 | tee artifacts/logs/package-deb.log
+          docker run --rm \
+            -e VERSION -e PACKAGE_RELEASE \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            fedora:44 \
+            bash -c 'set -euo pipefail; dnf -y install python3 rpm-build; python3 build/linux/package_rpm.py --version "$VERSION" --release "$PACKAGE_RELEASE" --publish-dir artifacts/publish/linux-x64 --output-dir artifacts/linux-native' \
+            2>&1 | tee artifacts/logs/package-rpm.log
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find artifacts/linux-native -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+          sudo rm -rf obj/linux-packages
+
+      - name: Generate signed local repositories with a throwaway key
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_RELEASE: ${{ steps.version.outputs.package_release }}
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_root="$(mktemp -d)"
+          export GNUPGHOME="$signing_root/gnupg"
+          passphrase_file="$signing_root/passphrase"
+          public_key="$signing_root/public.asc"
+          private_key="$signing_root/private.asc"
+          cleanup_signing_material() {
+            rm -rf -- "$signing_root"
+          }
+          trap cleanup_signing_material EXIT
+          install -d -m 0700 "$GNUPGHOME"
+          python3 - "$passphrase_file" <<'PY'
+          import pathlib
+          import secrets
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          path.write_text(secrets.token_urlsafe(48), encoding='ascii')
+          path.chmod(0o600)
+          PY
+          gpg --batch --no-tty --pinentry-mode loopback \
+            --passphrase-file "$passphrase_file" \
+            --quick-generate-key 'Object Storage Client CI <ci@example.invalid>' rsa2048 sign 1d
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys \
+            'Object Storage Client CI <ci@example.invalid>' | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [[ "$fingerprint" =~ ^[0-9A-F]{40}$ ]]
+          gpg --batch --armor --export "$fingerprint" > "$public_key"
+          gpg --batch --no-tty --pinentry-mode loopback \
+            --passphrase-file "$passphrase_file" --armor \
+            --export-secret-keys "$fingerprint" > "$private_key"
+          chmod 0600 "$private_key" "$passphrase_file"
+          mkdir -p artifacts/site artifacts/linux-smoke-packages artifacts/logs
+          deb="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.deb"
+          rpm="artifacts/linux-native/ObjectStorageClient-${VERSION}-${PACKAGE_RELEASE}-linux-x64.rpm"
+          python3 build/linux/repository.py \
+            --site-dir artifacts/site \
+            --deb "$deb" \
+            --rpm "$rpm" \
+            --public-key "$public_key" \
+            --expected-fingerprint "$fingerprint" \
+            --private-key "$private_key" \
+            --passphrase-file "$passphrase_file" \
+            --base-url http://repository:8000 \
+            > artifacts/logs/repository.log 2>&1
+          cp -- "artifacts/site/apt/pool/main/o/object-storage-client/$(basename "$deb")" \
+            artifacts/linux-smoke-packages/
+          cp -- "artifacts/site/rpm/stable/x86_64/$(basename "$rpm")" \
+            artifacts/linux-smoke-packages/
+          test -s artifacts/site/repository-key.asc
+          test -s "artifacts/linux-smoke-packages/$(basename "$deb")"
+          test -s "artifacts/linux-smoke-packages/$(basename "$rpm")"
+
+      - name: Upload Linux package validation bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-package-validation
+          path: |
+            artifacts/linux-native
+            artifacts/linux-smoke-packages
+            artifacts/site
+            artifacts/logs
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: Smoke ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            slug: debian-12
+            kind: deb
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.deb
+          - image: ubuntu:22.04
+            slug: ubuntu-22-04
+            kind: deb
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.deb
+          - image: ubuntu:24.04
+            slug: ubuntu-24-04
+            kind: deb
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.deb
+          - image: fedora:44
+            slug: fedora-44
+            kind: rpm
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.rpm
+          - image: fedora:43
+            slug: fedora-43
+            kind: rpm
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.rpm
+          - image: rockylinux:9
+            slug: rockylinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.rpm
+          - image: almalinux:9
+            slug: almalinux-9
+            kind: rpm
+            package: ObjectStorageClient-${{ needs.build.outputs.version }}-${{ needs.build.outputs.package_release }}-linux-x64.rpm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Download Linux package validation bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-package-validation
+          path: artifacts
+
+      - name: Start isolated repository server and run package smoke test
+        env:
+          IMAGE: ${{ matrix.image }}
+          SLUG: ${{ matrix.slug }}
+          KIND: ${{ matrix.kind }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          network="osc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          docker network create "$network"
+          docker run -d --name "$server" \
+            --network "$network" --network-alias repository \
+            -v "$PWD/artifacts/site:/srv:ro" \
+            python:3-alpine python3 -m http.server 8000 --directory /srv
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker run --rm --network "$network" python:3-alpine \
+              wget -q -O /dev/null http://repository:8000/repository-key.asc; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" -ne 1 ]]; then
+            docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+            printf '%s\n' 'Repository HTTP server did not become ready' >&2
+            exit 1
+          fi
+          mkdir -p artifacts/logs
+          docker run --name "$target" --network "$network" \
+            -e REPOSITORY_URL=http://repository:8000 \
+            -v "$PWD:/workspace:ro" \
+            -v "$PWD/artifacts/linux-smoke-packages:/packages:ro" \
+            -v "$PWD/artifacts/site:/repository:ro" \
+            "$IMAGE" \
+            /workspace/build/linux/smoke-package.sh "$KIND" "/packages/$PACKAGE" "/repository" \
+            2>&1 | tee "artifacts/logs/smoke-${SLUG}.log"
+
+      - name: Clean up isolated smoke resources
+        if: always()
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          network="osc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          server="osc-repository-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          target="osc-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SLUG}"
+          mkdir -p artifacts/logs
+          docker logs "$server" > "artifacts/logs/server-${SLUG}.log" 2>&1 || true
+          docker rm -f "$target" "$server" 2>/dev/null || true
+          docker network rm "$network" 2>/dev/null || true
+
+      - name: Upload smoke logs
+        if: always() && hashFiles(format('artifacts/logs/*-{0}.log', matrix.slug)) != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-package-smoke-${{ matrix.slug }}
+          path: artifacts/logs/*-${{ matrix.slug }}.log
+          if-no-files-found: ignore
+          retention-days: 14
